@@ -28,5 +28,5 @@ The MiniMax H3 agreement contains territorial, acceptable-use, downstream-user,
 commercial and attribution requirements. Its complete text is shipped locally;
 the short root `NOTICE` is the redistribution notice required by Section III.4.
 
-The project owner must select a license for X-MinimaxH3's original code before
-the public GitHub repository is published. See `LICENSE-DECISION-REQUIRED.md`.
+X-MinimaxH3's original code is released under the root `LICENSE`. Third-party
+components remain governed by the licenses listed in this document.
