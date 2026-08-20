@@ -2,6 +2,17 @@
 
 面向单张 RTX 4090 的 MiniMax H3 本地音视频生成工具。
 
+> 当前发布的是 **RTX 4090 尝鲜版**。面向其他显卡型号的通用版本正在开发中。
+
+## 交流与反馈
+
+欢迎加入交流群讨论安装、使用和生成效果，也可以添加作者微信直接反馈问题。
+
+| 添加作者 | 加入微信群 |
+|:---:|:---:|
+| <img src="assets/community/wechat-contact.jpg" width="260" alt="作者微信二维码"> | <img src="assets/community/wechat-group.jpg" width="260" alt="X-MinimaxH3 微信交流群二维码"> |
+| 请备注 `X-MinimaxH3` | 群二维码过期后会在这里更新 |
+
 支持：
 
 - FL2VA 首尾帧生成视频
