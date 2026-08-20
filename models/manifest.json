@@ -1,0 +1,127 @@
+{
+  "schema_version": 2,
+  "artifacts": [
+    {
+      "role": "diffusion_model",
+      "repo": "Comfy-Org/MiniMax-H3",
+      "revision": "014cd40f7e177756c6b2473c0d93b1c89a790dd2",
+      "filename": "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+      "install_path": "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+      "bytes": 20970379616,
+      "sha256": "e889202c41dafb67b10d67b97f0d8541508036a6090af23425a5c2615d03c47a",
+      "profile": "both",
+      "modelscope_repo": "Comfy-Org/MiniMax-H3",
+      "modelscope_revision": "master"
+    },
+    {
+      "role": "reference_diffusion_model",
+      "repo": "Comfy-Org/MiniMax-H3",
+      "revision": "014cd40f7e177756c6b2473c0d93b1c89a790dd2",
+      "filename": "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+      "install_path": "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+      "bytes": 20970379616,
+      "sha256": "9255f52b6677845ad238f20dfaafa94727053694127ab7f255c048f0f9365779",
+      "profile": "reference",
+      "modelscope_repo": "Comfy-Org/MiniMax-H3",
+      "modelscope_revision": "master"
+    },
+    {
+      "role": "text_encoder",
+      "repo": "Comfy-Org/MiniMax-H3",
+      "revision": "014cd40f7e177756c6b2473c0d93b1c89a790dd2",
+      "filename": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "install_path": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "bytes": 15687142551,
+      "sha256": "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6",
+      "profile": "both",
+      "modelscope_repo": "Comfy-Org/MiniMax-H3",
+      "modelscope_revision": "master"
+    },
+    {
+      "role": "video_vae",
+      "repo": "Comfy-Org/MiniMax-H3",
+      "revision": "014cd40f7e177756c6b2473c0d93b1c89a790dd2",
+      "filename": "vae/minimax_h3_video_vae_fp16.safetensors",
+      "install_path": "vae/minimax_h3_video_vae_fp16.safetensors",
+      "bytes": 5207808496,
+      "sha256": "7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522",
+      "profile": "both",
+      "modelscope_repo": "Comfy-Org/MiniMax-H3",
+      "modelscope_revision": "master"
+    },
+    {
+      "role": "audio_vae",
+      "repo": "Comfy-Org/MiniMax-H3",
+      "revision": "014cd40f7e177756c6b2473c0d93b1c89a790dd2",
+      "filename": "vae/minimax_h3_audio_vae_fp32.safetensors",
+      "install_path": "vae/minimax_h3_audio_vae_fp32.safetensors",
+      "bytes": 605254808,
+      "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48",
+      "profile": "both",
+      "modelscope_repo": "Comfy-Org/MiniMax-H3",
+      "modelscope_revision": "master"
+    },
+    {
+      "role": "turbo_lora",
+      "repo": "larryvrh/MiniMax-H3-Turbo-Lora",
+      "revision": "afc0346516372a17162c14df3c5264de1d9aa1c0",
+      "filename": "minimax_h3_turbo_v4_step600_ema.safetensors",
+      "install_path": "loras/minimax_h3_turbo_v4_step600_ema.safetensors",
+      "bytes": 779849816,
+      "sha256": "5f3a626cd72c93a8b9318d6760c510bc5092d2ab13aaba1f932c5bab07a416d3",
+      "profile": "turbo"
+    },
+    {
+      "role": "flashvsr_diffusion",
+      "repo": "JunhaoZhuang/FlashVSR-v1.1",
+      "revision": "63a588528f1e25de6c3ebd5fdade4481dce2bbf1",
+      "filename": "diffusion_pytorch_model_streaming_dmd.safetensors",
+      "install_path": "upscalers/flashvsr-v1.1/diffusion_pytorch_model_streaming_dmd.safetensors",
+      "bytes": 5676070392,
+      "sha256": "bd28180edcf3446c028e32fc6b731a80bf7e4da2ab4caac3186b9499964d37be",
+      "profile": "upscaler",
+      "modelscope_repo": "kuohao/FlashVSR-v1.1",
+      "modelscope_revision": "master",
+      "modelscope_filename": "diffusion_pytorch_model_streaming_dmd.safetensors"
+    },
+    {
+      "role": "flashvsr_lq_projection",
+      "repo": "JunhaoZhuang/FlashVSR-v1.1",
+      "revision": "63a588528f1e25de6c3ebd5fdade4481dce2bbf1",
+      "filename": "LQ_proj_in.ckpt",
+      "install_path": "upscalers/flashvsr-v1.1/LQ_proj_in.ckpt",
+      "bytes": 575694948,
+      "sha256": "d6d011cdaaba6a52645086caa08fa04124e746f6ca568140a24007591142bfd2",
+      "profile": "upscaler",
+      "modelscope_repo": "kuohao/FlashVSR-v1.1",
+      "modelscope_revision": "master",
+      "modelscope_filename": "LQ_proj_in.ckpt"
+    },
+    {
+      "role": "flashvsr_temporal_decoder",
+      "repo": "JunhaoZhuang/FlashVSR-v1.1",
+      "revision": "63a588528f1e25de6c3ebd5fdade4481dce2bbf1",
+      "filename": "TCDecoder.ckpt",
+      "install_path": "upscalers/flashvsr-v1.1/TCDecoder.ckpt",
+      "bytes": 189018333,
+      "sha256": "e224bdcf2f52745cbf4d393ff5374c2ba09e90285d5d19062d2bf63b915b6161",
+      "profile": "upscaler",
+      "modelscope_repo": "kuohao/FlashVSR-v1.1",
+      "modelscope_revision": "master",
+      "modelscope_filename": "TCDecoder.ckpt"
+    },
+    {
+      "role": "flashvsr_prompt_embedding",
+      "repo": "JunhaoZhuang/FlashVSR-v1.1",
+      "revision": "63a588528f1e25de6c3ebd5fdade4481dce2bbf1",
+      "filename": "prompt_tensor/posi_prompt.pth",
+      "install_path": "upscalers/flashvsr-v1.1/posi_prompt.pth",
+      "bytes": 4195504,
+      "sha256": "4601107a11e4e11a936a6b79df579e54dbc99872132bf542151f0ffd65b4b1ef",
+      "profile": "upscaler",
+      "modelscope_repo": "kuohao/FlashVSR-v1.1",
+      "modelscope_revision": "master",
+      "modelscope_filename": "posi_prompt.pth"
+    }
+  ]
+}

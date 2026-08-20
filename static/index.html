@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>X-MinimaxH3</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20260814-conversation-studio">
+  <link rel="stylesheet" href="/static/fixed-engine.css?v=20260816-two-family-preview">
+  <link rel="stylesheet" href="/static/product-ui.css?v=20260814-conversation-studio">
+  <link rel="stylesheet" href="/static/storyboard.css?v=20260820-dual-prompt-editor">
+  <link rel="stylesheet" href="/static/memory-ui.css?v=20260820-compact-settings-type">
+  <link rel="stylesheet" href="/static/conversation-ui.css?v=20260814-square-submit">
+  <link rel="stylesheet" href="/static/composer-controls.css?v=20260820-drawer-layout">
+  <link rel="stylesheet" href="/static/workspace.css?v=20260820-workspace">
+  <style>.dropzone video{width:100%;height:100%;object-fit:cover;display:none}.dropzone.has-image video{display:block}</style>
+</head>
+<body>
+  <div class="ambient ambient-a"></div><div class="ambient ambient-b"></div>
+  <header class="topbar product-topbar">
+    <div class="brand"><div class="brand-mark">X</div><div><strong>X-MinimaxH3</strong><span id="brandSubtitle">4090 accelerated video generation</span></div></div>
+    <nav class="workspace-tabs" aria-label="工作区" hidden>
+      <button data-page="create">创作台</button>
+      <button class="active" data-page="tasks">任务管理 <b id="navTaskCount">0</b></button>
+    </nav>
+    <div class="topbar-actions">
+      <div class="server-state"><i></i><span id="healthText">连接服务中</span></div>
+      <button type="button" id="exitEngine" class="topbar-exit" hidden>切换模型</button>
+      <button id="settingsButton" class="icon-button" title="API设置">⚙</button>
+    </div>
+  </header>
+
+  <main class="product-shell">
+    <section id="engineLobby" class="engine-lobby panel">
+      <div class="lobby-copy"><span class="eyebrow">ENGINE CONTROL</span><h1>选择生成模式</h1><p>同一时间只加载一个 H3 引擎。进入模式后保持热态；退出或切换会完整释放当前引擎。</p></div>
+      <section class="workspace-picker" aria-label="工作空间">
+        <span class="workspace-picker-icon">⌂</span>
+        <span class="workspace-picker-copy"><small>当前工作空间</small><strong id="workspaceName">默认工作空间</strong><code id="workspacePath">读取中…</code></span>
+        <button type="button" id="chooseWorkspace" class="secondary-button">选择文件夹</button>
+      </section>
+      <div id="engineChoices" class="engine-choice-grid"></div>
+      <div id="engineLobbyMessage" class="message" hidden></div>
+    </section>
+    <section class="workspace-page active" id="createPage" hidden>
+      <div class="create-stack">
+      <section class="conversation-history panel">
+        <div class="section-heading">
+          <div><span class="eyebrow">CREATION HISTORY</span><h1>创作记录</h1><p>已发送的任务、生成进度和最终成片都会保留在这里。</p></div>
+        </div>
+        <div id="conversationFeed" class="conversation-feed" aria-live="polite"></div>
+      </section>
+        <form id="generationForm" class="conversation-composer panel">
+          <div class="composer-heading"><span><b>新建视频</b><small>编辑分镜、增强提示词并发送到当前引擎</small></span><button class="submit-button composer-submit" type="submit" title="发送生成任务" aria-label="发送生成任务">↑</button></div>
+          <section class="engine-banner" id="engineBanner" data-engine="original">
+            <span class="engine-icon original" id="engineIcon">F</span>
+            <span><small>当前固定服务</small><strong id="engineName">H3 Native 高保真</strong><em id="engineDescription">原始权重 · 能力、台词与画面稳定优先</em></span>
+            <b id="engineBadge">高保真</b>
+          </section>
+
+          <fieldset id="keyframeFieldset"><legend>关键帧 <em>可选</em></legend><div class="frame-grid">
+            <label class="dropzone" id="firstDrop"><input type="file" name="first_frame" accept="image/png,image/jpeg,image/webp"><img alt="首帧预览"><span class="drop-copy"><b>＋</b><strong>添加首帧</strong><small>点击选择或直接拖入图片</small></span><button type="button" class="remove-frame">×</button></label>
+            <label class="dropzone" id="lastDrop"><input type="file" name="last_frame" accept="image/png,image/jpeg,image/webp"><img alt="尾帧预览"><span class="drop-copy"><b>＋</b><strong>添加尾帧</strong><small>点击选择或直接拖入图片</small></span><button type="button" class="remove-frame">×</button></label>
+          </div></fieldset>
+          <fieldset id="referenceFieldset" class="reference-attachments" hidden><legend>参考素材 <em>至少添加一项</em></legend>
+            <div class="attachment-controls">
+              <label class="reference-file-drop" id="referenceFileDrop"><input id="referenceFiles" type="file" accept="image/png,image/jpeg,image/webp,video/mp4,video/quicktime,video/x-matroska,video/webm,video/x-msvideo,.mp4,.mov,.mkv,.webm,.avi,audio/wav,audio/mpeg,audio/flac,audio/mp4,audio/ogg,.opus" multiple><span>＋ 添加文件</span></label>
+              <small>图片≤9 · 视频≤3（2–15秒，音轨不作为参考） · 音频≤3</small>
+              <small id="referenceMediaPolicyHint">自动等比降分辨率：图片720P · 视频360P</small>
+            </div>
+            <div hidden><input id="referenceImages" type="file" accept="image/png,image/jpeg,image/webp" multiple><input id="referenceVideos" type="file" accept="video/mp4,video/quicktime,video/x-matroska,video/webm,video/x-msvideo,.mp4,.mov,.mkv,.webm,.avi" multiple><input id="referenceAudios" type="file" accept="audio/wav,audio/mpeg,audio/flac,audio/mp4,audio/ogg,.opus" multiple></div>
+            <div id="referenceAttachmentTray" class="reference-attachment-tray"><div id="referencePreview" class="reference-role-list"></div><div id="referenceVideoPreview" class="reference-role-list"></div><div id="referenceAudioPreview" class="reference-role-list"></div></div>
+          </fieldset>
+
+          <section class="storyboard-section" aria-labelledby="storyboardTitle">
+            <div class="storyboard-head prompt-workbench-head">
+              <div><span class="eyebrow">PROMPT WORKBENCH</span><h2 id="storyboardTitle">提示词</h2></div>
+              <div class="prompt-mode-switch" role="tablist" aria-label="提示词输入方式"><button type="button" class="active" data-prompt-mode="structured">模块化</button><button type="button" data-prompt-mode="freeform">自由输入</button></div>
+            </div>
+
+            <div id="structuredPromptEditor">
+              <div class="structured-prompt-meta"><span>官方结构与分镜编辑</span><span class="storyboard-duration"><small id="storyboardTimingHint">目标时长</small><strong id="storyboardTotal">5.0 秒</strong></span></div>
+            <section id="referencePromptBlock" class="prompt-block reference-prompt-block" hidden>
+              <header class="prompt-block-head"><span><i>01</i><b>参考对象</b><small>建立素材对象与保留规则</small></span><div><button type="button" id="undoReferenceEnhancement" class="toolbar-undo" hidden>撤销</button><button type="button" id="enhanceReferences" class="mimo-button"><span>✦</span> 润色参考对象</button></div></header>
+              <div class="reference-contract-grid">
+                <label class="prompt-field"><span>对象定义 · subject_definitions</span><textarea id="referenceDefinitions" rows="5" maxlength="12000" placeholder="写什么：定义目标视频中需要反复引用的人物、物体、场景或声音，以及它来自哪个素材。&#10;怎么写：建议使用英文；每个对象单独一行，使用 &lt;Subject N&gt;、&lt;Picture N&gt;、&lt;Video N&gt; 或 &lt;Audio N&gt;。&#10;示例：&lt;Subject 1&gt; is the young girl from &lt;Picture 1&gt;, preserving her face, hairstyle and clothing."></textarea><div class="reference-mention-menu" hidden></div></label>
+                <label class="prompt-field"><span>保留规则 · retention_analysis</span><textarea id="referenceRetention" rows="5" maxlength="12000" placeholder="写什么：说明每个参考对象在目标视频中保留、改变或借鉴到什么程度。&#10;怎么写：建议使用英文；每个标签单独一行，并选用 fully_preserved、partially_preserved、attribute_transfer 或 weak_reference。&#10;示例：&lt;Subject 1&gt; (appears throughout): fully_preserved - preserve identity, hairstyle and clothing."></textarea><div class="reference-mention-menu" hidden></div></label>
+              </div>
+              <div id="referenceEnhancementMessage" class="enhancement-message" hidden></div>
+            </section>
+
+            <section class="prompt-block visual-prompt-block">
+              <header class="prompt-block-head"><span><i>02</i><b>画面内容</b><small>总体摘要、画面连续性与分镜</small></span><div><button type="button" id="undoVisualEnhancement" class="toolbar-undo" hidden>撤销</button><button type="button" id="enhanceVisuals" class="mimo-button"><span>✦</span> 润色画面内容</button></div></header>
+              <div id="referenceVisualOverview" class="visual-overview" hidden>
+                <label class="prompt-field"><span>总体摘要 · summary</span><textarea id="referenceSummary" rows="3" maxlength="4000" placeholder="写什么：简要概括要生成什么视频，以及主要参考素材分别起什么作用。&#10;怎么写：建议使用英文；以 [reference generation]、[video editing] 等任务类型开头，只概括目标，不展开分镜细节。&#10;示例：[reference generation] Generate an 8-second scene in which &lt;Subject 1&gt; enters the room and speaks using &lt;Audio 1&gt; as the voice reference."></textarea><div class="reference-mention-menu" hidden></div></label>
+              </div>
+              <div class="storyboard-subhead"><b>分镜列表</b><div class="storyboard-head-actions"><button type="button" id="addShot" class="secondary-button">＋ 添加分镜</button></div></div>
+              <div id="shotList" class="shot-list"></div>
+              <div id="visualEnhancementMessage" class="enhancement-message" hidden></div>
+            </section>
+
+            <section class="prompt-block sound-prompt-block">
+              <header class="prompt-block-head"><span><i>03</i><b>声音设计</b><small>画面内声音与画外配乐</small></span><div><button type="button" id="undoSoundEnhancement" class="toolbar-undo" hidden>撤销</button><button type="button" id="enhanceSound" class="mimo-button"><span>✦</span> 润色声音设计</button></div></header>
+              <label class="prompt-field"><span>画面内声音 · overall_soundscape</span><textarea id="overallSoundscape" rows="3" maxlength="4000" placeholder="写什么：概括整个视频中真实存在于场景里的环境声和动作音效。&#10;怎么写：建议使用英文；写清声音来源，声音发生时应与画面动作对应；可以输入 @ 引用音频素材。&#10;示例：Quiet corridor ambience, approaching footsteps, restrained breathing, and subtle backpack-fabric friction."></textarea><div class="reference-mention-menu" hidden></div></label>
+              <div class="storyboard-music">
+                <div class="inline-tool-row"><span><b>画外背景音乐 · non_diegetic_music</b><small id="bgmStateText">关闭 · N/A</small></span><label class="compact-toggle" aria-label="背景音乐"><input id="bgmEnabled" type="checkbox"><i></i></label></div>
+                <label class="field compact-bgm-style" id="bgmStyleField" hidden><span>配乐描述或 @ 引用音频素材</span><textarea id="bgmStyle" rows="3" maxlength="1000" placeholder="写什么：描述只有观众能听见的画外配乐。&#10;怎么写：建议使用英文；说明风格、情绪、节奏和音量，也可以输入 @ 引用音频素材。&#10;示例：A restrained slow piano score, warm and melancholic, mixed quietly below the dialogue."></textarea><div class="reference-mention-menu" hidden></div></label>
+              </div>
+              <div id="soundEnhancementMessage" class="enhancement-message" hidden></div>
+            </section>
+            <input type="hidden" name="prompt" id="compiledPrompt" required>
+            <div id="enhancementMessage" class="enhancement-message" hidden></div>
+            <details class="compiled-prompt-preview"><summary>查看最终发送给 H3 的提示词</summary><pre id="compiledPromptPreview"></pre></details>
+            </div>
+
+            <div id="freeformPromptEditor" class="freeform-prompt-editor" hidden>
+              <div class="freeform-writing-guide">
+                <b>撰写建议</b>
+                <p><strong>1. 参考关系</strong><span>仅多参考模式需要：说明 <code>&lt;Subject N&gt;</code> 来自哪个 <code>&lt;Picture N&gt;</code>、<code>&lt;Video N&gt;</code> 或 <code>&lt;Audio N&gt;</code>，以及需要保留什么。</span></p>
+                <p><strong>2. 画面内容</strong><span>按播放顺序写主体、环境、动作、台词、运镜和分镜时间。</span></p>
+                <p><strong>3. 声音设计</strong><span><code>overall_soundscape:</code> 场景内声音；<code>non_diegetic_music:</code> N/A 或具体配乐描述。</span></p>
+              </div>
+              <textarea id="freeformPrompt" maxlength="30000" rows="16" placeholder="输入要直接发送给 H3 的完整提示词……"></textarea>
+              <div class="reference-mention-menu" hidden></div>
+            </div>
+          </section>
+
+          <section id="basicControls" class="mode-panel active settings-drawers" aria-label="生成设置">
+            <details class="config-drawer" id="inferenceDrawer">
+              <summary><span class="drawer-title"><i>⚡</i><span><b>推理设置</b><small>模型、步数、加速与断点预览</small></span></span><output id="inferenceSummary">原始权重 · 20步 · Dense</output></summary>
+              <div class="drawer-content">
+                <div class="settings-grid inference-settings-grid">
+                  <label class="compact-field"><span>推理路线</span><select name="model_variant"><option value="base" selected>INT8 原始权重</option><option value="lora">LoRA 极速</option></select></label>
+                  <label class="compact-field range-field"><span>总采样步数 <output id="samplingStepsValue">20 步</output></span><input name="sampling_steps" type="range" min="5" max="30" step="1" value="20" aria-label="总采样步数"><small id="samplingStepsHint">完整去噪轨迹</small></label>
+                  <label class="compact-field acceleration-field" id="accelerationAdvanced"><span>加速档位 <output id="accelerationValue">0 · Dense</output></span><input name="acceleration" type="range" min="0" max="100" step="1" value="0" aria-label="加速档位"><small id="accelerationSafety">0 为 Dense；数值越大，内部加速越强。</small></label>
+                  <label class="compact-field"><span>断点预览</span><select name="execution_mode" id="executionMode"><option value="complete" selected>关闭 · 直接跑完</option><option value="checkpoint">开启 · 中途保存并预览</option></select></label>
+                </div>
+                <div class="checkpoint-settings" id="checkpointSettings" hidden>
+                  <label class="compact-field range-field"><span>断点位置 <output id="checkpointStepValue">第 6 步</output></span><input name="checkpoint_step" id="checkpointStep" type="range" min="1" max="19" step="1" value="6" disabled><small>之后可恢复正式轨迹</small></label>
+                  <label class="compact-field checkpoint-preview-option"><span>预览分辨率</span><select name="checkpoint_preview_resolution" disabled><option value="source">原分辨率</option><option value="360p">360p</option><option value="480p">480p</option><option value="720p">720p</option></select></label>
+                  <label class="compact-field range-field checkpoint-preview-option"><span>LoRA 预览步数 <output id="checkpointPreviewStepsValue">4 步</output></span><input name="checkpoint_preview_steps" type="range" min="1" max="8" step="1" value="4" disabled><small>仅用于快速预览分支</small></label>
+                  <input name="checkpoint_retain" id="checkpointRetain" type="checkbox" value="true" checked hidden disabled>
+                  <input name="checkpoint_preview" id="checkpointPreview" type="checkbox" value="true" checked hidden disabled>
+                </div>
+              </div>
+            </details>
+            <details class="config-drawer" id="videoSettingsDrawer">
+              <summary><span class="drawer-title"><i>▣</i><span><b>画面与输出</b><small>尺寸、比例与生成后超分</small></span></span><output id="videoSettingsSummary">480P · 16:9 · 不超分</output></summary>
+              <div class="drawer-content">
+                <div class="settings-grid video-settings-grid">
+                  <label class="compact-field"><span>尺寸模式</span><select name="size_mode" id="sizeMode"><option value="preset" selected>常用分辨率</option><option value="custom">自定义尺寸</option></select></label>
+                  <label class="compact-field preset-size-field"><span>分辨率</span><select name="resolution" data-basic-param><option>360p</option><option selected>480p</option><option>720p</option><option>1080p</option></select></label>
+                  <label class="compact-field preset-size-field"><span>画面比例</span><select name="aspect_ratio" data-basic-param><option>1:1</option><option>4:3</option><option>3:4</option><option selected>16:9</option><option>9:16</option></select></label>
+                  <label class="compact-field range-field" id="freeformDurationField" hidden><span>视频时长 <output id="freeformDurationValue">5.0 秒</output></span><input name="duration_seconds" type="range" min="1" max="15" step="0.5" value="5" data-basic-param><small>自由输入模式单独设置</small></label>
+                  <div class="custom-size-fields" id="customSizeFields" hidden>
+                    <label class="compact-field range-field"><span>宽度 <output id="customWidthValue">864 px</output></span><input name="width" type="range" min="192" max="1920" step="32" value="864" disabled></label>
+                    <label class="compact-field range-field"><span>高度 <output id="customHeightValue">480 px</output></span><input name="height" type="range" min="192" max="1920" step="32" value="480" disabled></label>
+                  </div>
+                  <div class="upscale-setting" id="upscaleCard">
+                    <div class="inline-tool-row"><span><b>生成后超分</b><small id="upscaleStateText">关闭</small></span><label class="compact-toggle" aria-label="生成后超分"><input id="upscaleEnabled" name="upscale_enabled" type="checkbox"><i></i></label></div>
+                    <div id="upscaleControls" class="compact-upscale-target" hidden>
+                      <input type="hidden" name="upscale_mode" value="basic" disabled>
+                      <div id="upscaleBasic"><div class="upscale-resolution-tabs"><button type="button" data-upscale-resolution="720p" class="active">720P</button><button type="button" data-upscale-resolution="1080p">1080P</button><button type="button" data-upscale-resolution="2k">2K</button></div><select name="upscale_resolution" class="visually-hidden-control" disabled aria-hidden="true" tabindex="-1"><option value="720p" selected>720p</option><option value="1080p">1080p</option><option value="2k">2K</option></select></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </details>
+            <input name="advanced" type="hidden" value="false">
+            <input name="seed" type="hidden" value="" data-basic-param>
+          </section>
+
+          <div id="formMessage" class="message" hidden></div>
+        </form>
+      </div>
+    </section>
+
+    <section class="workspace-page" id="tasksPage" hidden>
+      <section class="panel task-manager">
+        <div class="task-manager-head"><div><span class="eyebrow">GPU QUEUE</span><h1>任务管理</h1><p>拖动等待中的任务调整顺序；正在执行的任务只能取消，不能重排。</p></div><button id="refreshJobs" class="secondary-button">刷新</button></div>
+        <section class="resource-dashboard" aria-label="主机实时资源">
+          <article><div><span>CPU</span><strong id="cpuUsage">--%</strong></div><div class="resource-track"><i id="cpuBar"></i></div><small id="cpuDetail">读取中</small></article>
+          <article><div><span>系统内存</span><strong id="memoryUsage">-- GiB</strong></div><div class="resource-track"><i id="memoryBar"></i></div><small id="memoryDetail">读取中</small></article>
+          <article><div><span>GPU</span><strong id="gpuUsage">--%</strong></div><div class="resource-track gpu"><i id="gpuBar"></i></div><small id="gpuDetail">读取中</small></article>
+          <article><div><span>GPU 显存</span><strong id="vramUsage">-- GiB</strong></div><div class="resource-track gpu"><i id="vramBar"></i></div><small id="vramDetail">读取中</small></article>
+        </section>
+        <div class="manager-summary"><div><span>正在运行</span><strong id="runningCount">0</strong></div><div><span>等待队列</span><strong id="queuedCount">0</strong></div><div><span>已完成</span><strong id="completedCount">0</strong></div><div><span>服务热态</span><strong id="warmStateText">检查中</strong></div></div>
+        <section class="task-section"><div class="task-section-title"><h2>正在运行</h2><span>真实阶段进度</span></div><div id="runningJobs" class="manager-jobs"></div></section>
+        <section class="task-section"><div class="task-section-title"><h2>等待队列</h2><span>拖动卡片改变执行顺序</span></div><div id="queuedJobs" class="manager-jobs sortable-jobs"></div></section>
+        <section class="task-section"><div class="task-section-title"><h2>历史任务</h2><span>可预览、下载或删除记录与输出</span></div><div id="historyJobs" class="manager-jobs history-grid"></div></section>
+      </section>
+    </section>
+  </main>
+
+  <dialog id="settingsDialog"><form method="dialog"><div class="dialog-heading"><h3>服务与AI设置</h3><button value="cancel">×</button></div><label class="field"><span>服务 API Key</span><input id="apiKeyInput" type="password" placeholder="本地无鉴权时留空"></label><p>用于访问设置了 <code>H3_SERVE_API_KEY</code> 的视频服务。</p><label class="field"><span>小米 MiMo API Key</span><input id="mimoApiKeyInput" type="password" autocomplete="off" placeholder="填写新Key；留空则保留服务器现有Key"></label><p id="mimoKeyStatus">正在检查服务器配置……</p><button id="clearMimoKey" type="button" class="ghost-button">清除服务器 MiMo Key</button><section class="reference-media-settings"><div class="memory-settings-head"><span>参考素材自动压缩</span><b>全局默认</b></div><div class="settings-inline-grid"><label class="field"><span>参考图片</span><select id="globalReferenceImageResolution"><option value="original">保持原分辨率</option><option value="360p">360P</option><option value="480p">480P</option><option value="720p">720P</option></select></label><label class="field"><span>参考视频</span><select id="globalReferenceVideoResolution"><option value="original">保持原分辨率</option><option value="360p">360P</option><option value="480p">480P</option><option value="720p">720P</option></select></label></div><p>档位只控制像素采样分辨率：始终按原宽高比等比例缩小，原画幅尺寸、完整构图和视频时长不变；不裁切、不拉伸、不补边，也不放大小素材。该默认同时作用于工作台、API和ComfyUI。</p></section><section class="generation-limit-settings"><div class="memory-settings-head"><span>生成任务上限</span><b id="generationLimitStatus">读取中</b></div><div id="generationLimitEditor" class="generation-limit-editor"></div><p id="generationLimitHint">逐项设置每种分辨率和画面比例允许提交的最长时长。显存信息只供参考，最终上限由你决定。</p></section><section class="memory-settings"><div class="memory-settings-head"><span>主机内存运行模式</span><b id="detectedMemory">检测中</b></div><div id="memoryProfileList" class="memory-profile-list"></div><p id="memoryProfileHint">模式改变的是CPU权重驻留和冷加载，不改变模型权重、采样步数或画质。切换要求任务队列为空并会重新预加载H3。</p></section><button id="saveSettings" value="default" class="submit-button small">保存并应用</button></form></dialog>
+  <dialog id="workspaceDialog" class="workspace-dialog"><form method="dialog"><div class="dialog-heading"><h3>选择工作空间</h3><button value="cancel">×</button></div><p>生成视频、导入素材、任务记录和断点都保存在这个文件夹。模型权重与编译缓存不会重复复制。</p><div class="workspace-path-row"><input id="workspacePathInput" type="text" spellcheck="false" aria-label="工作空间绝对路径"><button type="button" id="openWorkspacePath" class="secondary-button">打开</button></div><div class="workspace-browser-head"><button type="button" id="workspaceParent" class="ghost-button">← 上一级</button><button type="button" id="workspaceDefault" class="ghost-button">项目默认</button></div><div id="workspaceDirectories" class="workspace-directories"></div><div id="workspaceMessage" class="message" hidden></div><button type="button" id="selectWorkspace" class="submit-button small">使用这个文件夹</button></form></dialog>
+  <dialog id="videoDialog" class="video-dialog"><form method="dialog"><button class="video-close">×</button></form><video id="resultVideo" controls playsinline></video><a id="downloadVideo" class="download-button" download>下载视频</a></dialog>
+  <script src="/static/app.js?v=20260820-gpu-aware-limits" defer></script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+aiohttp==3.13.5
+av==17.1.0
+comfy-kitchen==0.2.26
+huggingface-hub==1.12.0
+Pillow==12.2.0
+safetensors==0.7.0
+numpy==2.2.6
+diffusers==0.32.2
+einops==0.8.2
+transformers==5.6.2
+tqdm==4.67.1
+imageio==2.37.0
+imageio-ffmpeg==0.6.0

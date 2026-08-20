@@ -1,0 +1,34 @@
+# Installed runtimes and caches
+/runtime/
+/.venv/
+**/__pycache__/
+*.py[cod]
+/.pytest_cache/
+/.ruff_cache/
+
+# Downloaded weights (the contract itself stays tracked)
+/models/**
+!/models/manifest.json
+!/models/.gitkeep
+*.part
+
+# User data
+/data/**
+!/data/.gitkeep
+/output/**
+!/output/.gitkeep
+/workspace/**
+!/workspace/default/
+!/workspace/default/.gitkeep
+
+# Local settings and secrets
+.env
+*.local.json
+*.log
+*.pid
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,27 @@
+{
+  "schema_version": "h3_round223_online_runtime_evidence_v1",
+  "policy_id": "h3_joint_v12_reserve_rebate_global_dp",
+  "online_guard_id": "round223_reserve_rebate_budget_v1",
+  "records": [
+    {
+      "evidence_id": "round223_v12_a100_720p5_door_seed82303",
+      "evidence_kind": "normal_policy",
+      "telemetry": "runtime/calibration/joint_scheduler_v12_gpu_round1/telemetry/66c83a37-d13a-454a-8b1a-f0351a4e7df7.scheduler.json",
+      "telemetry_sha256": "2b814bf11f870e3fa56823965dbd408c1ed3b0509f74f957fe13318854ee0cf8",
+      "artifact": "runtime/calibration/joint_scheduler_v12_gpu_round1/v12_reserve_rebate_720p5_door_seed82303_96.778s.mp4",
+      "artifact_sha256": "72d515701031385de49e6cd890886c780a7132ed7d3728e30cf08428c8ddae24",
+      "human_review": "pending",
+      "note": "Nine phase probes executed without a trigger. The exact conditional top-k rebate spent the 12 otherwise-idle Dense-layer equivalents on steps 17-19, left 0.153846 equivalents, and incurred no denial. Total service time was 96.778s versus V11 96.417s (+0.374%)."
+    },
+    {
+      "evidence_id": "round223_v12_a100_720p15_medieval_seed82303",
+      "evidence_kind": "normal_policy",
+      "telemetry": "runtime/calibration/joint_scheduler_v12_gpu_round1/telemetry/63006961-eabf-4e42-a210-4a2e2c93267d.scheduler.json",
+      "telemetry_sha256": "842f0b8a1e151743364d75127ff443e70ac282596b3599f6c56910b3186ba8b5",
+      "artifact": "runtime/calibration/joint_scheduler_v12_gpu_round1/v12_reserve_rebate_720p15_medieval_seed82303_397.402s.mp4",
+      "artifact_sha256": "7dccb96e286711e683e1d4a39f1e5a9fe852698735cac0df39da4770a900d1be",
+      "human_review": "pending",
+      "note": "Long-sequence target workload: nine probes, maximum calibrated growth ratio 1.000426, no trigger or denial. The exact conditional top-k rebate upgraded 11 future cells and left 0.238095 Dense-layer equivalents. Total service time was 397.402s versus V11 394.008s (+0.861%)."
+    }
+  ]
+}

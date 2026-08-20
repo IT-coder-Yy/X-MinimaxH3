@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "components": [
+    {
+      "name": "MiniMax-H3 runtime subset",
+      "upstream": "https://github.com/MiniMax-AI/MiniMax-H3",
+      "revision": "8d8824efaf94586c0cc9ac7ad8d0723d4d6420ea",
+      "license": "MiniMax H3 Community License Agreement; the complete agreement is distributed as third_party_licenses/MiniMax-H3-COMMUNITY-LICENSE",
+      "modifications": "Processor tokenizer assets are de-duplicated into tokenizer/; the two processor configs and text/vision architecture config are retained there for fully offline Qwen3-VL loading.",
+      "sentinels": {
+        "MiniMax-H3/FL2VA/video_vae/klvae.py": "d05a22b4918ad303f147d6b0d0ae9038bd1af1f810a5553b04f3542ab9bcff96",
+        "MiniMax-H3/audio_vae/config.json": "9a3c645ff892b376c6f5f4c8685964cd75474731af594ff058492a0000caabb6",
+        "MiniMax-H3/tokenizer/tokenizer.json": "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
+        "MiniMax-H3/tokenizer/preprocessor_config.json": "5102cc0567b75a34738c5af8e547c00b1faca4ca63c60b1b79acd0423af0ef43",
+        "MiniMax-H3/tokenizer/video_preprocessor_config.json": "00bd47a5eaaf8760744a12658cd99ba168b818edc4c0a983b90157289c8e546a",
+        "MiniMax-H3/text_encoder/config.json": "d2dd0c60d01b9e195d9447c52da61c7302d28828524914c044d9c6e1b81d0427"
+      }
+    },
+    {
+      "name": "LightX2V runtime subset",
+      "upstream": "https://github.com/ModelTC/LightX2V",
+      "revision": "205d5c872d01557935dc87d67156f4f94069ea65",
+      "license": "Apache-2.0",
+      "modifications": "The video-encoder and platform package __init__ files are reduced to non-eager namespaces so the audio-only runtime subset does not import unshipped video-VAE or multi-accelerator graphs.",
+      "sentinels": {
+        "LightX2V/lightx2v/models/audio_encoders/hf/minimax_h3/audio_vae.py": "2a6a6367a107534871b86b82302eb8757eb97c76a281a969cb647b62b95fa463",
+        "LightX2V/lightx2v/models/video_encoders/hf/minimax_h3/weights.py": "c4948788e1744a716ef5bd72a1d8ccee0003031b0d0e8655b5a423d04888fd0e",
+        "LightX2V/lightx2v/models/video_encoders/hf/minimax_h3/__init__.py": "e5b359863d560d70fd21c14b614e99938d76ab5c1ebbc53dcc485d53f4b2e784",
+        "LightX2V/lightx2v_platform/__init__.py": "f6bcab9f11d6b0756fb683f9137723152da36238b53da9aa198b71b7e86419c1",
+        "LightX2V/lightx2v_platform/base/__init__.py": "a58d1d229b27fe83b5c5dc2c0a78878536c2505d8a3199869c30becb47b50866"
+      }
+    }
+  ]
+}

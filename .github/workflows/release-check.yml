@@ -1,0 +1,50 @@
+name: release-check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  offline-contract:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Shell syntax
+        run: bash -n install.sh start.sh stop.sh scripts/*.sh
+      - name: Python syntax
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          roots = (Path("h3serve"), Path("scripts"), Path("integrations"))
+          files = [path for root in roots for path in root.rglob("*.py")]
+          for path in files:
+              ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+          print(f"Parsed {len(files)} Python files")
+          PY
+      - name: Release contract
+        run: python scripts/verify_release.py
+
+  windows-wrapper:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Windows PowerShell 5 syntax
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($path in @('install-windows.ps1', 'start-windows.ps1', 'stop-windows.ps1', 'setup-and-start-windows.ps1')) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $path), [ref]$null, [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "${path}: $($_.Message)" }
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }

@@ -1,0 +1,192 @@
+{
+  "schema_version": "h3_v19_human_mechanism_evidence_v1",
+  "scope": "Seed evidence extracted from direct Human continuous-play reviews. Shared comparator failures are retained but are not acceleration negatives.",
+  "records": [
+    {
+      "evidence_id": "H19-CACHE-024",
+      "mechanism": "audio_timbre_and_temporal_clarity",
+      "candidate_id": "round24_av_guard_cache",
+      "comparator_id": "round23_no_segment_cache",
+      "same_prompt_seed_shape_steps": true,
+      "candidate_outcome": "reject",
+      "comparator_outcome": "accept",
+      "dimensions": {
+        "prompt_adherence": "not_reported",
+        "contact_causality": "not_reported",
+        "trajectory_continuity": "not_reported",
+        "temporal_clarity": "reject",
+        "identity_binding": "reject",
+        "audio_integrity": "reject",
+        "anomaly": "not_reported"
+      },
+      "artifact": "runtime/calibration/workload_routing_round24/avguard128_720p15/round24_avguard128_720p15_i004_original911_720p15_seed82303_h3prompt_1280x736_362f_seed82303.mp4",
+      "comparator_artifact": "runtime/calibration/workload_routing_round23/original128_split050/round23_original128_split050_i004_original911_720p15_seed82303_h3prompt_1280x736_362f_seed82303.mp4",
+      "note": "Human reported strange audio, female-to-male timbre drift and blur."
+    },
+    {
+      "evidence_id": "H19-CACHE-026",
+      "mechanism": "motion_ghosting",
+      "candidate_id": "round26_layer_group_cache",
+      "comparator_id": "round23_no_segment_cache",
+      "same_prompt_seed_shape_steps": true,
+      "candidate_outcome": "reject",
+      "comparator_outcome": "accept",
+      "dimensions": {
+        "prompt_adherence": "not_reported",
+        "contact_causality": "not_reported",
+        "trajectory_continuity": "reject",
+        "temporal_clarity": "reject",
+        "identity_binding": "not_reported",
+        "audio_integrity": "not_reported",
+        "anomaly": "reject"
+      },
+      "artifact": "runtime/calibration/workload_routing_round26/layergroup30_38_720p15/round26_layergroup30_38_720p15_i004_original911_720p15_seed82303_h3prompt_1280x736_362f_seed82303.mp4",
+      "comparator_artifact": "runtime/calibration/workload_routing_round23/original128_split050/round23_original128_split050_i004_original911_720p15_seed82303_h3prompt_1280x736_362f_seed82303.mp4",
+      "note": "Human continuous playback exposed ghosting missed by static contact sheets."
+    },
+    {
+      "evidence_id": "H19-SPARSE-063",
+      "mechanism": "dynamic_threshold_motion_and_clarity",
+      "candidate_id": "round63_aggressive_sol",
+      "comparator_id": "round51_tlhb",
+      "same_prompt_seed_shape_steps": true,
+      "candidate_outcome": "reject",
+      "comparator_outcome": "accept",
+      "dimensions": {
+        "prompt_adherence": "not_reported",
+        "contact_causality": "reject",
+        "trajectory_continuity": "reject",
+        "temporal_clarity": "reject",
+        "identity_binding": "not_reported",
+        "audio_integrity": "not_reported",
+        "anomaly": "not_reported"
+      },
+      "artifact": "runtime/calibration/workload_routing_round63/sol24_phase_720p15/round63_sol24_phase_720p15_i004_original911_720p15_seed82303_h3prompt_1280x736_362f_seed82303.mp4",
+      "note": "Human rejected blur and abnormal movement despite the lower latency."
+    },
+    {
+      "evidence_id": "H19-CAUSAL-143",
+      "mechanism": "door_contact_causality",
+      "candidate_id": "round143_causal_dense_island",
+      "comparator_id": "round86_mtcr",
+      "same_prompt_seed_shape_steps": true,
+      "candidate_outcome": "accept",
+      "comparator_outcome": "reject",
+      "dimensions": {
+        "prompt_adherence": "accept",
+        "contact_causality": "accept",
+        "trajectory_continuity": "accept",
+        "temporal_clarity": "accept",
+        "identity_binding": "not_reported",
+        "audio_integrity": "not_reported",
+        "anomaly": "accept"
+      },
+      "artifact": "runtime/calibration/workload_routing_round143/causal_dense_island_720p5/round143_causal_dense_island_720p5_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "note": "Human confirmed repaired door/contact motion and improved clarity."
+    },
+    {
+      "evidence_id": "H19-CAUSAL-149",
+      "mechanism": "door_contact_causality",
+      "candidate_id": "round149_phase_causal_island",
+      "comparator_id": "round143_causal_dense_island",
+      "same_prompt_seed_shape_steps": true,
+      "candidate_outcome": "reject",
+      "comparator_outcome": "accept",
+      "dimensions": {
+        "prompt_adherence": "not_reported",
+        "contact_causality": "reject",
+        "trajectory_continuity": "reject",
+        "temporal_clarity": "not_reported",
+        "identity_binding": "not_reported",
+        "audio_integrity": "not_reported",
+        "anomaly": "reject"
+      },
+      "artifact": "runtime/calibration/workload_routing_round149/phase_causal_island_720p5/round149_phase_causal_island_720p5_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "comparator_artifact": "runtime/calibration/workload_routing_round143/causal_dense_island_720p5/round143_causal_dense_island_720p5_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "note": "Human reported the return of the uncontacted automatic-door motion."
+    },
+    {
+      "evidence_id": "H19-BUDGET-216",
+      "mechanism": "door_contact_causality",
+      "candidate_id": "round216_measured_budget_sparse",
+      "comparator_id": "round143_causal_dense_island",
+      "same_prompt_seed_shape_steps": true,
+      "candidate_outcome": "accept",
+      "comparator_outcome": "accept",
+      "dimensions": {
+        "prompt_adherence": "accept",
+        "contact_causality": "accept",
+        "trajectory_continuity": "accept",
+        "temporal_clarity": "accept",
+        "identity_binding": "accept",
+        "audio_integrity": "accept",
+        "anomaly": "accept"
+      },
+      "artifact": "runtime/calibration/workload_routing_round216/measured_budget_v1_720p5_retry1/round216_measured_budget_v1_720p5_retry1_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "comparator_artifact": "runtime/calibration/workload_routing_round143/causal_dense_island_720p5/round143_causal_dense_island_720p5_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "note": "Human found the logic consistent with the accepted comparator."
+    },
+    {
+      "evidence_id": "H19-BUDGET-217",
+      "mechanism": "door_contact_causality",
+      "candidate_id": "round217_relaxed_causal",
+      "comparator_id": "round216_measured_budget_sparse",
+      "same_prompt_seed_shape_steps": true,
+      "candidate_outcome": "reject",
+      "comparator_outcome": "accept",
+      "dimensions": {
+        "prompt_adherence": "not_reported",
+        "contact_causality": "reject",
+        "trajectory_continuity": "reject",
+        "temporal_clarity": "not_reported",
+        "identity_binding": "not_reported",
+        "audio_integrity": "not_reported",
+        "anomaly": "reject"
+      },
+      "artifact": "runtime/calibration/workload_routing_round217/measured_budget_v2_720p5/round217_measured_budget_v2_720p5_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "comparator_artifact": "runtime/calibration/workload_routing_round216/measured_budget_v1_720p5_retry1/round216_measured_budget_v1_720p5_retry1_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "note": "Relaxing layers 30-39 and 45 together regressed door causality."
+    },
+    {
+      "evidence_id": "H19-SHARED-219-220",
+      "mechanism": "unlocking_prompt_adherence",
+      "candidate_id": "round219_sparse_unlock",
+      "comparator_id": "round220_dense_unlock",
+      "same_prompt_seed_shape_steps": true,
+      "candidate_outcome": "reject",
+      "comparator_outcome": "reject",
+      "dimensions": {
+        "prompt_adherence": "reject",
+        "contact_causality": "not_reported",
+        "trajectory_continuity": "not_reported",
+        "temporal_clarity": "not_reported",
+        "identity_binding": "not_reported",
+        "audio_integrity": "not_reported",
+        "anomaly": "not_reported"
+      },
+      "artifact": "runtime/calibration/workload_routing_round219/terminal45_budget7800_480p5_four_scene_retry1/round219_terminal45_budget7800_retry1_unlock_latch_then_gate_480p5_864x480_124f_seed82303.mp4",
+      "comparator_artifact": "runtime/calibration/workload_routing_round220/dense12a8f_unlock_480p5/round220_dense12a8f_unlock_480p5_unlock_latch_then_gate_dense_480p5_864x480_124f_seed82303.mp4",
+      "note": "Both Dense and sparse failed; this must not become a sparse-negative label."
+    },
+    {
+      "evidence_id": "H19-TRAJECTORY-V13",
+      "mechanism": "long_forecast_identity_geometry",
+      "candidate_id": "v13_six_actual_fourteen_forecast",
+      "comparator_id": "round188_twelve_actual_eight_forecast",
+      "same_prompt_seed_shape_steps": true,
+      "candidate_outcome": "reject",
+      "comparator_outcome": "accept",
+      "dimensions": {
+        "prompt_adherence": "reject",
+        "contact_causality": "reject",
+        "trajectory_continuity": "reject",
+        "temporal_clarity": "reject",
+        "identity_binding": "reject",
+        "audio_integrity": "not_reported",
+        "anomaly": "reject"
+      },
+      "artifact": "runtime/calibration/workload_routing_round224/v13_release_candidate/round224_v13_100_round188_comparator_720p15_1280x736_362f_seed82303.mp4",
+      "note": "Human rejected the unformed video and persistent identity/geometry drift."
+    }
+  ]
+}

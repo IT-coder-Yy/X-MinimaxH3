@@ -1,0 +1,27 @@
+{
+  "schema_version": "h3_round221_online_runtime_evidence_v1",
+  "policy_id": "h3_joint_v11_calibrated_growth_global_dp",
+  "online_guard_id": "round221_calibrated_growth_budget_v1",
+  "records": [
+    {
+      "evidence_id": "round221_v11_a100_720p5_door_seed82303",
+      "evidence_kind": "normal_policy",
+      "telemetry": "runtime/calibration/joint_scheduler_v11_gpu_round1/telemetry/caf20753-0bba-4a22-b1f6-324aecc3644a.scheduler.json",
+      "telemetry_sha256": "b499e37292c97b334651562b235249a31ece6a0c2910813d6709d5ce00753bbb",
+      "artifact": "runtime/calibration/joint_scheduler_v11_gpu_round1/v11_a100_calibrated_growth_720p5_door_seed82303_96.417s.mp4",
+      "artifact_sha256": "0309998970ed4f1c91651a5841bf41e5ab277832ceb9e2186f2581e69948fca9",
+      "human_review": "pending",
+      "note": "Nine task-relative phase probes executed with maximum growth ratio 1.0 versus the calibrated 1.246819 threshold. No trigger or denial occurred; 12.153846 Dense-layer equivalents remained. Total 96.417s, within 0.046% of V10's 96.373s, and the MP4 is byte-identical to V10."
+    },
+    {
+      "evidence_id": "round221_v11_a100_720p15_medieval_seed82303",
+      "evidence_kind": "normal_policy",
+      "telemetry": "runtime/calibration/joint_scheduler_v11_gpu_round1/telemetry/1e42fa00-7dd7-4a44-8f5f-4cd3473c12ed.scheduler.json",
+      "telemetry_sha256": "018e0c02596bb236be399c5a0e6a5cca2753717330894e6dd3b3edf022e85a33",
+      "artifact": "runtime/calibration/joint_scheduler_v11_gpu_round1/v11_a100_calibrated_growth_720p15_medieval_seed82303_394.008s.mp4",
+      "artifact_sha256": "863b4765671e75fdd39cbad501236e882d5dd78e69c990ddf7e2b8a995f3b307",
+      "human_review": "pending",
+      "note": "Long-sequence target workload: nine probes, maximum growth ratio 1.000426, no trigger or denial, and 11.238095 Dense-layer equivalents remained. Total 394.008s versus V10 394.026s; the MP4 is byte-identical to V10."
+    }
+  ]
+}

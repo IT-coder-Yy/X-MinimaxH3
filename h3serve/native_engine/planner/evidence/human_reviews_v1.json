@@ -1,0 +1,151 @@
+{
+  "schema_version": "h3_human_scheduler_evidence_v1",
+  "scope": "Blind or direct Human continuous-play reviews of H3 scheduling candidates. These labels calibrate and challenge risk assumptions; they do not certify a different policy.",
+  "source_summary": "subprojects-main/main/DIT-knowledge/idea-list.md",
+  "records": [
+    {
+      "evidence_id": "H-SCHED-025",
+      "round": 25,
+      "policy_family": "tile_guard_cache",
+      "scheduler_policy_id": null,
+      "task": "complex_dialogue_720p15_seed82303_12actual8forecast",
+      "human_label": "reject",
+      "dimensions": {
+        "motion_physics": "reject",
+        "clarity": "reject",
+        "identity": "reject",
+        "audio": "reject"
+      },
+      "latency_seconds": null,
+      "artifact": "runtime/calibration/workload_routing_round25/tileguard128_720p15/round25_tileguard128_720p15_i004_original911_720p15_seed82303_h3prompt_1280x736_362f_seed82303.mp4",
+      "telemetry": "runtime/calibration/workload_routing_round25/tileguard128_720p15/round25_tileguard128_720p15_hot_session.json",
+      "note": "Human rejected both picture and sound, including voice-identity instability."
+    },
+    {
+      "evidence_id": "H-SCHED-143",
+      "round": 143,
+      "policy_family": "causal_dense_island",
+      "scheduler_policy_id": null,
+      "task": "door_contact_720p5_seed82303_12actual8forecast",
+      "human_label": "accept",
+      "dimensions": {
+        "motion_physics": "accept",
+        "clarity": "accept",
+        "identity": "not_reported",
+        "audio": "not_reported"
+      },
+      "latency_seconds": 90.035,
+      "artifact": "runtime/calibration/workload_routing_round143/causal_dense_island_720p5/round143_causal_dense_island_720p5_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "telemetry": "runtime/calibration/workload_routing_round143/causal_dense_island_720p5/round143_causal_dense_island_720p5_hot_session.json",
+      "note": "Human confirmed the door/contact motion repair and improved clarity. This is a task-specific quality anchor, not a universal upper bound."
+    },
+    {
+      "evidence_id": "H-SCHED-149",
+      "round": 149,
+      "policy_family": "phase_causal_island",
+      "scheduler_policy_id": null,
+      "task": "door_contact_720p5_seed82303_12actual8forecast",
+      "human_label": "reject",
+      "dimensions": {
+        "motion_physics": "reject",
+        "clarity": "not_reported",
+        "identity": "not_reported",
+        "audio": "not_reported"
+      },
+      "latency_seconds": 82.799,
+      "artifact": "runtime/calibration/workload_routing_round149/phase_causal_island_720p5/round149_phase_causal_island_720p5_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "telemetry": "runtime/calibration/workload_routing_round149/phase_causal_island_720p5/round149_phase_causal_island_720p5_hot_session.json",
+      "note": "Human observed the return of an uncontacted automatic-door motion error."
+    },
+    {
+      "evidence_id": "H-SCHED-154",
+      "round": 154,
+      "policy_family": "pisa_compensation",
+      "scheduler_policy_id": null,
+      "task": "door_contact_720p5_seed82303_12actual8forecast",
+      "human_label": "reject",
+      "dimensions": {
+        "motion_physics": "reject",
+        "clarity": "reject",
+        "identity": "not_reported",
+        "audio": "not_reported"
+      },
+      "latency_seconds": null,
+      "artifact": "runtime/calibration/workload_routing_round154/piecewise010_720p5/round154_piecewise010_720p5_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "telemetry": "runtime/calibration/workload_routing_round154/piecewise010_720p5/round154_piecewise010_720p5_hot_session.json",
+      "note": "Human rejected the door causality and a bright flashing patch; lower local tensor error did not guarantee video acceptance."
+    },
+    {
+      "evidence_id": "H-SCHED-209",
+      "round": 209,
+      "policy_family": "trajectory_group_waterfill",
+      "scheduler_policy_id": null,
+      "task": "door_contact_720p5_seed82303_12actual8forecast",
+      "human_label": "accept",
+      "dimensions": {
+        "motion_physics": "accept",
+        "clarity": "accept",
+        "identity": "accept",
+        "audio": "not_reported"
+      },
+      "latency_seconds": 92.028,
+      "artifact": "runtime/calibration/workload_routing_round209/trajectoryadaptive_groupfill_b0407_s100_720p5/round209_trajectoryadaptive_groupfill_b0407_s100_720p5_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "telemetry": "runtime/calibration/workload_routing_round209/trajectoryadaptive_groupfill_b0407_s100_720p5/round209_trajectoryadaptive_groupfill_b0407_s100_720p5_hot_session.json",
+      "note": "Human reported no visible difference versus the Round143 anchor."
+    },
+    {
+      "evidence_id": "H-SCHED-216",
+      "round": 216,
+      "policy_family": "measured_budget_sparse_v1",
+      "scheduler_policy_id": null,
+      "task": "door_contact_720p5_seed82303_12actual8forecast",
+      "human_label": "accept",
+      "dimensions": {
+        "motion_physics": "accept",
+        "clarity": "accept",
+        "identity": "accept",
+        "audio": "accept"
+      },
+      "latency_seconds": 90.141,
+      "artifact": "runtime/calibration/workload_routing_round216/measured_budget_v1_720p5_retry1/round216_measured_budget_v1_720p5_retry1_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "telemetry": "runtime/calibration/workload_routing_round216/measured_budget_v1_720p5_retry1/round216_measured_budget_v1_720p5_retry1_hot_session.json",
+      "note": "Human continuous-play review found the logic consistent with the accepted comparator."
+    },
+    {
+      "evidence_id": "H-SCHED-217",
+      "round": 217,
+      "policy_family": "measured_budget_sparse_v1_relaxed_causal",
+      "scheduler_policy_id": null,
+      "task": "door_contact_720p5_seed82303_12actual8forecast",
+      "human_label": "reject",
+      "dimensions": {
+        "motion_physics": "reject",
+        "clarity": "not_reported",
+        "identity": "not_reported",
+        "audio": "not_reported"
+      },
+      "latency_seconds": 87.255,
+      "artifact": "runtime/calibration/workload_routing_round217/measured_budget_v2_720p5/round217_measured_budget_v2_720p5_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "telemetry": "runtime/calibration/workload_routing_round217/measured_budget_v2_720p5/round217_measured_budget_v2_720p5_hot_session.json",
+      "note": "Human rejected the door-closing logic after causal bands 30-39 and layer 45 were relaxed together."
+    },
+    {
+      "evidence_id": "H-SCHED-222",
+      "round": 222,
+      "policy_family": "measured_budget_sparse_v1_long_relaxed",
+      "scheduler_policy_id": null,
+      "task": "medieval_complex_720p15_seed82303_12actual8forecast",
+      "human_label": "reject",
+      "dimensions": {
+        "motion_physics": "reject",
+        "clarity": "reject",
+        "identity": "reject",
+        "audio": "not_reported"
+      },
+      "latency_seconds": 275.771,
+      "artifact": "runtime/calibration/workload_routing_round222/measured_budget90k_medieval_720p15/round222_measured_budget90k_medieval_720p15_round86_mtcr_fused_rms_720p15_1280x736_362f_seed82303.mp4",
+      "telemetry": "runtime/calibration/workload_routing_round222/measured_budget90k_medieval_720p15/round222_measured_budget90k_medieval_720p15_hot_session.json",
+      "note": "Human rejected unsupported torch placement, map jumps, edge instability and blur."
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+.workspace-picker{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:14px;margin:20px 0 24px;padding:14px 16px;border:1px solid var(--line);border-radius:14px;background:rgba(5,7,11,.35)}
+.workspace-picker-icon{width:34px;height:34px;display:grid;place-items:center;border-radius:10px;background:rgba(138,120,255,.12);color:#b8adff}
+.workspace-picker-copy{display:block;min-width:0}.workspace-picker-copy small,.workspace-picker-copy strong,.workspace-picker-copy code{display:block}
+.workspace-picker-copy small{font-size:9px;color:var(--muted)}.workspace-picker-copy strong{margin-top:3px;font-size:12px}
+.workspace-picker-copy code{margin-top:4px;overflow:hidden;color:#959dae;font-family:ui-monospace,SFMono-Regular,monospace;font-size:9px;text-overflow:ellipsis;white-space:nowrap}
+.workspace-dialog{width:min(680px,calc(100% - 30px))}.workspace-path-row{display:grid;grid-template-columns:1fr auto;gap:8px}
+.workspace-path-row input{height:42px;padding:0 12px;border:1px solid var(--line);border-radius:10px;background:rgba(5,7,11,.55);color:var(--text);font-family:ui-monospace,SFMono-Regular,monospace;font-size:10px}
+.workspace-browser-head{display:flex;justify-content:space-between;margin:12px 0 8px}.ghost-button{border:1px solid var(--line);border-radius:9px;background:rgba(255,255,255,.035);color:#cfd4df;padding:7px 10px;font-size:10px;cursor:pointer}
+.workspace-directories{max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:11px;background:rgba(4,6,10,.35)}
+.workspace-directory{display:grid;grid-template-columns:auto 1fr;gap:9px;width:100%;padding:10px 12px;border:0;border-bottom:1px solid var(--line);background:transparent;color:#dce0e8;text-align:left;font-size:11px;cursor:pointer}.workspace-directory:last-child{border-bottom:0}.workspace-directory:hover{background:rgba(138,120,255,.09)}.workspace-directory i{color:#a99cff;font-style:normal}.workspace-dialog .submit-button{margin-top:14px}
+@media(max-width:600px){.workspace-picker{grid-template-columns:auto 1fr}.workspace-picker>button{grid-column:1/-1}.workspace-path-row{grid-template-columns:1fr}.workspace-path-row button{width:100%}}

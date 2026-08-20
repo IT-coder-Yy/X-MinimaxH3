@@ -1,0 +1,2 @@
+# No third-party dependencies. ComfyUI already provides torch, Pillow and NumPy.
+

@@ -1,0 +1,17 @@
+{
+  "schema_version": "h3_round219_online_runtime_evidence_v1",
+  "policy_id": "h3_joint_v9_bounded_online_global_dp",
+  "online_guard_id": "round219_noncausal_probe_upgrade_v1",
+  "records": [
+    {
+      "evidence_id": "round219_v9_a100_720p5_door_seed82303",
+      "evidence_kind": "normal_policy",
+      "telemetry": "runtime/calibration/joint_scheduler_v9_gpu_round1/telemetry/252d6d2a-83e2-4c75-86b2-aa1dbc0ca918.scheduler.json",
+      "telemetry_sha256": "8acad7bcb76bb4bb4a665c8a67df92b8bac0c0c45b255b9f21ded68472debfcc",
+      "artifact": "runtime/calibration/joint_scheduler_v9_gpu_round1/v9_a100_bounded_online_720p5_door_seed82303_96.362s.mp4",
+      "artifact_sha256": "0309998970ed4f1c91651a5841bf41e5ab277832ceb9e2186f2581e69948fca9",
+      "human_review": "pending",
+      "note": "Twenty-one probes executed with no trigger; all reserve was spent on observation and nine later probes were denied. Retained as the negative design evidence that motivated Round220 phase sentinels."
+    }
+  ]
+}

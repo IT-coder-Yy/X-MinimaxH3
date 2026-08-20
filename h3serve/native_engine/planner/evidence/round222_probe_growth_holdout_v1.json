@@ -1,0 +1,76 @@
+{
+  "schema_version": "h3_round222_probe_growth_holdout_v1",
+  "policy_id": "h3_joint_v11_calibrated_growth_global_dp",
+  "online_guard_id": "round221_calibrated_growth_budget_v1",
+  "calibration_evidence_sha256": "dcb0929e770590759c9ad7557cca5889175b674c043e4f4d4eba7b3e6643fec1",
+  "runtime_growth_threshold": 1.2468191793541,
+  "probe_domain": "per_frame_spatial_anchors",
+  "records": [
+    {
+      "id": "pendulum_collision_480p5",
+      "job_id": "a7d74e16-2b79-43ce-99d9-c8140fd68486",
+      "telemetry": "runtime/calibration/joint_scheduler_v11_gpu_round1/telemetry/a7d74e16-2b79-43ce-99d9-c8140fd68486.scheduler.json",
+      "telemetry_sha256": "8824b06b3a58ac9a798f4a81aa1006f6c0499137d343aa50d32dafa54fc4958b",
+      "artifact": "runtime/calibration/joint_scheduler_v11_gpu_round1/v11_holdout_pendulum_collision_480p5_seed82401_37.102s.mp4",
+      "artifact_sha256": "b064e20bd08adb44d0e39a256df70b7d53af89bc7391854a491913f082eceb58",
+      "task_score": 1.131160728575359,
+      "growth_triggers": 0,
+      "human_review": "pending"
+    },
+    {
+      "id": "runner_occlusion_480p5",
+      "job_id": "fccb8e40-aaef-4cdb-9553-a93623d69bbb",
+      "telemetry": "runtime/calibration/joint_scheduler_v11_gpu_round1/telemetry/fccb8e40-aaef-4cdb-9553-a93623d69bbb.scheduler.json",
+      "telemetry_sha256": "b355278f769c3bc497bdd58f4b31098ae3af90d75b23d6224c416d8fa4ebef36",
+      "artifact": "runtime/calibration/joint_scheduler_v11_gpu_round1/v11_holdout_runner_occlusion_480p5_seed82402_36.730s.mp4",
+      "artifact_sha256": "5c6d7601131e9af9102e8a50dcf41fd0ce1080baee7363a0f9f0dc9c246e08cb",
+      "task_score": 1.0284725937528467,
+      "growth_triggers": 0,
+      "human_review": "pending"
+    },
+    {
+      "id": "rope_teamwork_480p5",
+      "job_id": "f6ed625d-83f7-410a-989c-dc6f8860dc46",
+      "telemetry": "runtime/calibration/joint_scheduler_v11_gpu_round1/telemetry/f6ed625d-83f7-410a-989c-dc6f8860dc46.scheduler.json",
+      "telemetry_sha256": "c219c9dc70ad23878582daa5010340909329f3d14ea78dccfde2574e78829091",
+      "artifact": "runtime/calibration/joint_scheduler_v11_gpu_round1/v11_holdout_rope_teamwork_480p5_seed82403_36.813s.mp4",
+      "artifact_sha256": "cfaceef6c6aba2b19b01610b1a44194169aa771b159a1680b0b0ba992658676d",
+      "task_score": 1.0250484185116864,
+      "growth_triggers": 0,
+      "human_review": "pending"
+    },
+    {
+      "id": "glass_reflection_480p5",
+      "job_id": "f1d046c3-0939-4767-bfb7-d323548ad4c4",
+      "telemetry": "runtime/calibration/joint_scheduler_v11_gpu_round1/telemetry/f1d046c3-0939-4767-bfb7-d323548ad4c4.scheduler.json",
+      "telemetry_sha256": "cb493135553886460e9cfaa1c598fd1343731be6f075409ee409fb76232c83c7",
+      "artifact": "runtime/calibration/joint_scheduler_v11_gpu_round1/v11_holdout_glass_reflection_480p5_seed82404_36.804s.mp4",
+      "artifact_sha256": "711ed4f728659aba9b5456a61a3a56938a9f70c00b3507b2b7c814dfcb79d558",
+      "task_score": 1.1160518201765395,
+      "growth_triggers": 0,
+      "human_review": "pending"
+    },
+    {
+      "id": "fl2va_first_last_720psq8",
+      "job_id": "aa4d3136-6122-4b0c-8473-e3faabdaedf4",
+      "telemetry": "runtime/calibration/joint_scheduler_v11_gpu_round1/telemetry/aa4d3136-6122-4b0c-8473-e3faabdaedf4.scheduler.json",
+      "telemetry_sha256": "5531b23876b12c04065d5602f3ff9664469139b685eed4eeb3225e67781755ef",
+      "artifact": "runtime/calibration/joint_scheduler_v11_gpu_round1/v11_holdout_fl2va_first_last_720psq8_seed82416_110.512s.mp4",
+      "artifact_sha256": "392c3e94cd52f80e77c838d1aa416c0939ccea4c8f2a3416d1aa2eeb0f23b17d",
+      "task_score": 1.0455539253939896,
+      "growth_triggers": 0,
+      "human_review": "pending"
+    }
+  ],
+  "summary": {
+    "held_out_tasks": 5,
+    "tasks_above_threshold": 0,
+    "observed_novelty_rate": 0.0,
+    "maximum_task_score": 1.131160728575359
+  },
+  "limitations": [
+    "This is a five-task engineering hold-out, not a production-distribution estimate.",
+    "No Human labels are attached, so zero growth triggers cannot be called a perceptual false-positive rate.",
+    "The hold-out validates numerical scale generalization only and does not prove correction effectiveness."
+  ]
+}

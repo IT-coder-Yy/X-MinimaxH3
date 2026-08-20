@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "x-minimaxh3"
+version = "0.7.0"
+description = "Single-RTX-4090 MiniMax H3 inference service and studio"
+requires-python = "==3.10.*"
+dependencies = [
+  "aiohttp>=3.13,<4",
+  "Pillow>=11,<13",
+  "huggingface-hub>=0.34,<2",
+  "safetensors>=0.7,<1",
+  "numpy>=2.2,<3",
+  "av>=17,<18",
+  "diffusers==0.32.2",
+  "einops>=0.8,<1",
+  "transformers==5.6.2",
+  "tqdm>=4.67,<5",
+  "imageio==2.37.0",
+  "imageio-ffmpeg==0.6.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["h3serve*"]
+
+[tool.setuptools.package-data]
+"h3serve.native_engine.planner" = ["evidence/*.json"]

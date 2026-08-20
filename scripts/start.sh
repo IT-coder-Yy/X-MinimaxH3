@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+release_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+runtime_root="${H3_SERVE_RUNTIME_DIR:-${release_root}/runtime}"
+mkdir -p "${runtime_root}/tmp"
+export TMPDIR="${TMPDIR:-${runtime_root}/tmp}"
+source "${release_root}/scripts/_process.sh"
+source "${release_root}/scripts/_runtime.sh"
+
+serve_port="${H3_SERVE_PORT:-8090}"
+pid_file="${H3_SERVE_PID_FILE:-${runtime_root}/h3serve-${serve_port}.pid}"
+if [[ -s "${pid_file}" ]]; then
+  existing_pid="$(<"${pid_file}")"
+  if h3_is_release_server_pid "${existing_pid}"; then
+    echo "H3 service is already running (PID ${existing_pid}, port ${serve_port})." >&2
+    echo "Stop it with: ${release_root}/scripts/stop.sh" >&2
+    exit 1
+  fi
+fi
+
+# Recover a service whose PID file was removed by an older stop script or by a
+# shell using different /mnt/c path casing.
+mapfile -t existing_pids < <(h3_find_release_server_pids)
+if ((${#existing_pids[@]})); then
+  printf '%s\n' "${existing_pids[0]}" > "${pid_file}"
+  echo "H3 service is already running (PID ${existing_pids[*]}, port ${serve_port})." >&2
+  echo "Stop it with: ${release_root}/scripts/stop.sh" >&2
+  exit 1
+fi
+
+rm -f -- "${pid_file}"
+h3_configure_runtime
+printf '%s\n' "$$" > "${pid_file}"
+export H3_SERVE_PID_FILE="${pid_file}"
+
+exec "${H3_SERVE_PYTHON}" "${release_root}/server.py" \
+  --host "${H3_SERVE_HOST:-127.0.0.1}" \
+  --port "${serve_port}" \
+  --data-dir "${H3_SERVE_DATA_DIR:-${release_root}/data}" \
+  --memory-profile "${H3_SERVE_MEMORY_PROFILE:-auto}" \
+  --unified-console \
+  "$@"

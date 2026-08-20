@@ -1,0 +1,27 @@
+{
+  "schema_version": "h3_round220_online_runtime_evidence_v1",
+  "policy_id": "h3_joint_v10_phase_sentinel_global_dp",
+  "online_guard_id": "round220_phase_sentinel_budget_v1",
+  "records": [
+    {
+      "evidence_id": "round220_v10_a100_720p5_door_seed82303",
+      "evidence_kind": "normal_policy",
+      "telemetry": "runtime/calibration/joint_scheduler_v10_gpu_round1/telemetry/1f164717-e7ed-498a-b34a-cdfbc3d86881.scheduler.json",
+      "telemetry_sha256": "1b864580cb11cf3092436594a9e72910605e84586016498aaaac0f48ef322b21",
+      "artifact": "runtime/calibration/joint_scheduler_v10_gpu_round1/v10_a100_phase_sentinel_720p5_door_seed82303_96.373s.mp4",
+      "artifact_sha256": "0309998970ed4f1c91651a5841bf41e5ab277832ceb9e2186f2581e69948fca9",
+      "human_review": "pending",
+      "note": "Nine phase-layer probes executed with no trigger, no denial and 12.153846 Dense-layer equivalents left for intervention. The artifact is byte-identical to the Round219 no-trigger run."
+    },
+    {
+      "evidence_id": "round220_v10_a100_720p15_medieval_seed82303",
+      "evidence_kind": "normal_policy",
+      "telemetry": "runtime/calibration/joint_scheduler_v10_gpu_round1/telemetry/85e66690-fbbc-47a4-858c-d62904da7e5d.scheduler.json",
+      "telemetry_sha256": "9a3d54132e8b0d053a205a48cf7cc6d5bc6be0beb8608ec659d978f9f95186ef",
+      "artifact": "runtime/calibration/joint_scheduler_v10_gpu_round1/v10_a100_phase_sentinel_720p15_medieval_seed82303_394.026s.mp4",
+      "artifact_sha256": "863b4765671e75fdd39cbad501236e882d5dd78e69c990ddf7e2b8a995f3b307",
+      "human_review": "pending",
+      "note": "Long-sequence normal-policy run: total 394.026s, denoise 351.555s, video decode 35.182s, peak 17.369 GiB. Nine probes, no denial, no trigger; maximum sampled relative RMS was about 0.194 versus the 0.294 absolute threshold."
+    }
+  ]
+}

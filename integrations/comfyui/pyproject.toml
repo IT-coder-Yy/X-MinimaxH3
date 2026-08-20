@@ -1,0 +1,15 @@
+[project]
+name = "comfyui-h3-serve-connector"
+version = "0.1.0"
+description = "A lightweight ComfyUI client for an independently running H3 Serve instance."
+requires-python = ">=3.10"
+dependencies = []
+license = {text = "LicenseRef-UNDECIDED"}
+
+[project.urls]
+Repository = "https://github.com/TODO/ComfyUI-H3-Serve-Connector"
+
+[tool.comfy]
+PublisherId = "TODO"
+DisplayName = "H3 Serve Connector"
+requires-comfyui = ">=0.30.0"

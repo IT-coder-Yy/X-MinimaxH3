@@ -1,0 +1,110 @@
+#settingsDialog {
+  font-size: 10px;
+}
+#settingsDialog .dialog-heading h3 { font-size: 14px; }
+#settingsDialog .dialog-heading { margin-bottom: 14px; }
+#settingsDialog .field > span {
+  margin-bottom: 6px;
+  font-size: 9px;
+}
+#settingsDialog .field input,
+#settingsDialog .field select {
+  height: 36px;
+  font-size: 10px;
+}
+#settingsDialog > form > p,
+#settingsDialog section > p {
+  font-size: 8px;
+  line-height: 1.45;
+}
+#settingsDialog button { font-size: 9px; }
+#settingsDialog .dialog-heading button { font-size: 18px; }
+#settingsDialog .submit-button.small { height: 38px; font-size: 10px; }
+
+.memory-settings,
+.reference-media-settings,
+.generation-limit-settings {
+  margin: 20px 0 16px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(3, 5, 9, .42);
+}
+.reference-media-settings,
+.generation-limit-settings { margin-bottom: 0; }
+.settings-inline-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+.settings-inline-grid .field { margin: 0; }
+.reference-media-settings > p,
+.generation-limit-settings > p {
+  margin: 10px 0 0 !important;
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.55;
+}
+.memory-settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 11px;
+}
+.memory-settings-head span { font-size: 9px; font-weight: 800; }
+.memory-settings-head b { color: #91c7ff; font-size: 8px; font-weight: 650; }
+.generation-limit-editor { display:grid; gap:7px; overflow-x:auto; }
+.generation-limit-head,
+.generation-limit-editor section { display:grid; grid-template-columns:52px repeat(5,minmax(92px,1fr)); gap:7px; align-items:center; }
+.generation-limit-head b,
+.generation-limit-editor section>b { color:#aeb5c3; font-size:8px; white-space:nowrap; }
+.generation-limit-editor section label { display:grid; grid-template-columns:minmax(48px,1fr) 38px; align-items:center; gap:5px; }
+.generation-limit-editor input[type="range"] { width:100%; min-width:48px; accent-color:#ff8258; }
+.generation-limit-editor output { color:#dfe4ed; font-size:7px; text-align:right; white-space:nowrap; }
+.memory-profile-list { display: grid; gap: 8px; }
+.memory-profile-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, .025);
+  cursor: pointer;
+}
+.memory-profile-option:has(input:checked) {
+  border-color: rgba(86, 200, 235, .44);
+  background: rgba(86, 200, 235, .07);
+}
+.memory-profile-option.unavailable { cursor: not-allowed; opacity: .5; }
+.memory-profile-option input { margin-top: 3px; accent-color: #56c8eb; }
+.memory-profile-option strong, .memory-profile-option small { display: block; }
+.memory-profile-option strong { font-size: 10px; }
+.memory-profile-option small {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.45;
+}
+.memory-profile-option em {
+  padding: 3px 6px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .06);
+  color: #aeb5c3;
+  font-size: 8px;
+  font-style: normal;
+  white-space: nowrap;
+}
+.memory-profile-option em.experimental { color: #e8be68; }
+.memory-settings > p {
+  margin: 11px 0 0 !important;
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.5;
+}
+@media (max-width: 620px) {
+  .settings-inline-grid { grid-template-columns: 1fr; }
+  .generation-limit-head,
+  .generation-limit-editor section { grid-template-columns:44px repeat(5,92px); }
+}

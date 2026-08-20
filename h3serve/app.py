@@ -1,0 +1,2303 @@
+from __future__ import annotations
+
+import argparse
+import atexit
+import asyncio
+import dataclasses
+import errno
+import io
+import json
+import os
+import re
+import shutil
+import socket
+import threading
+import time
+import traceback
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from aiohttp import web
+from PIL import Image, UnidentifiedImageError
+
+from . import __version__
+from .backend import CheckpointResult, JobCancelled, build_native_backend
+from .config import ServicePaths
+from .contract import (
+    ContractError, DEFAULT_REFERENCE_IMAGE_RESOLUTION,
+    DEFAULT_REFERENCE_VIDEO_RESOLUTION, ENGINES, REFERENCE_MEDIA_RESOLUTIONS,
+    SERVICE_FAMILIES, GenerationSpec, default_quality, engine_family,
+    engine_variant, resolve_engine, public_options,
+)
+from .models import model_status
+from .openapi import document as openapi_document
+from .memory_policy import (
+    HOST_MEMORY_PROFILES,
+    HostMemoryProfile,
+    HostMemoryStatus,
+    current_process_pss_gib,
+    detect_host_memory,
+    resolve_host_memory_profile,
+    validate_workload_for_profile,
+)
+from .prompt_enhancer import MiMoPromptEnhancer, parse_enhancement_request
+from .resources import ResourceMonitor
+from .upscaler import FlashVSRUpscaler
+from .workspace import WorkspaceController, WorkspaceLayout
+from .generation_limits import (
+    GenerationLimitPolicy,
+    detect_gpu_vram_gib,
+    load_generation_limit_policy,
+    persist_generation_limit_policy,
+)
+
+
+MAX_IMAGE_BYTES = 25 * 1024 * 1024
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+MAX_IMAGE_PIXELS = 80_000_000
+MAX_REFERENCE_IMAGES = 9
+MAX_REFERENCE_VIDEOS = 3
+MAX_REFERENCE_AUDIOS = 3
+MAX_REFERENCE_VIDEO_BYTES = 200 * 1024 * 1024
+VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+VIDEO_MIME_BY_SUFFIX = {
+    ".mp4": "video/mp4", ".mov": "video/quicktime",
+    ".mkv": "video/x-matroska", ".webm": "video/webm",
+    ".avi": "video/x-msvideo",
+}
+AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".opus"}
+AUDIO_MIME_BY_SUFFIX = {
+    ".wav": "audio/wav", ".mp3": "audio/mpeg", ".flac": "audio/flac",
+    ".m4a": "audio/mp4", ".ogg": "audio/ogg", ".opus": "audio/ogg",
+}
+
+
+def _mimo_key_path(data_dir: Path) -> Path:
+    return data_dir / "private" / "mimo.key"
+
+
+def _load_persisted_mimo_key(data_dir: Path) -> str:
+    try:
+        value = _mimo_key_path(data_dir).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return ""
+    return value if len(value) <= 4096 else ""
+
+
+def _persist_mimo_key(data_dir: Path, value: str) -> None:
+    path = _mimo_key_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    if not value:
+        path.unlink(missing_ok=True)
+        return
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _reference_media_settings_path(data_dir: Path) -> Path:
+    return data_dir / "settings" / "reference_media.json"
+
+
+def _default_reference_media_settings() -> dict[str, str]:
+    return {
+        "image_resolution": DEFAULT_REFERENCE_IMAGE_RESOLUTION,
+        "video_resolution": DEFAULT_REFERENCE_VIDEO_RESOLUTION,
+    }
+
+
+def _load_reference_media_settings(data_dir: Path) -> dict[str, str]:
+    defaults = _default_reference_media_settings()
+    try:
+        document = json.loads(
+            _reference_media_settings_path(data_dir).read_text(encoding="utf-8")
+        )
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return defaults
+    if not isinstance(document, dict):
+        return defaults
+    image_resolution = str(document.get("image_resolution", "")).strip().lower()
+    video_resolution = str(document.get("video_resolution", "")).strip().lower()
+    if image_resolution not in REFERENCE_MEDIA_RESOLUTIONS:
+        image_resolution = defaults["image_resolution"]
+    if video_resolution not in REFERENCE_MEDIA_RESOLUTIONS:
+        video_resolution = defaults["video_resolution"]
+    return {
+        "image_resolution": image_resolution,
+        "video_resolution": video_resolution,
+    }
+
+
+def _persist_reference_media_settings(
+    data_dir: Path,
+    settings: dict[str, str],
+) -> None:
+    path = _reference_media_settings_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _validate_image(content: bytes, role: str) -> None:
+    try:
+        with Image.open(io.BytesIO(content)) as image:
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
+                raise ContractError(f"{role} has unsupported dimensions")
+            if (image.format or "").upper() not in {"PNG", "JPEG", "WEBP"}:
+                raise ContractError(f"{role} must contain PNG, JPEG or WebP data")
+            image.verify()
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as error:
+        raise ContractError(f"{role} is not a valid image") from error
+
+
+def _image_mime(content: bytes, role: str) -> str:
+    _validate_image(content, role)
+    with Image.open(io.BytesIO(content)) as image:
+        return {
+            "PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"
+        }[(image.format or "").upper()]
+
+
+def _validate_reference_video(content: bytes, role: str) -> float | None:
+    """Probe container/video metadata without decoding the expensive payload."""
+
+    try:
+        import av
+
+        with av.open(io.BytesIO(content)) as container:
+            if not container.streams.video:
+                raise ContractError(f"{role} contains no video stream")
+            stream = container.streams.video[0]
+            if stream.width <= 0 or stream.height <= 0:
+                raise ContractError(f"{role} has invalid video dimensions")
+            duration = None
+            if container.duration is not None:
+                duration = float(container.duration) / float(av.time_base)
+            elif stream.duration is not None and stream.time_base is not None:
+                duration = float(stream.duration * stream.time_base)
+            elif stream.frames and (stream.average_rate or stream.guessed_rate):
+                duration = float(stream.frames) / float(stream.average_rate or stream.guessed_rate)
+            if duration is not None and not 1.95 <= duration <= 15.1:
+                raise ContractError(f"{role} must be between 2 and 15 seconds")
+            return duration
+    except ContractError:
+        raise
+    except Exception as error:
+        raise ContractError(f"{role} is not a decodable video container") from error
+
+
+def _validate_reference_audio(content: bytes, role: str) -> float:
+    try:
+        import av
+
+        with av.open(io.BytesIO(content)) as container:
+            if not container.streams.audio:
+                raise ContractError(f"{role} contains no audio stream")
+            stream = container.streams.audio[0]
+            if stream.rate <= 0:
+                raise ContractError(f"{role} has invalid sample rate")
+            if container.duration is not None:
+                duration = float(container.duration) / float(av.time_base)
+            elif stream.duration is not None and stream.time_base is not None:
+                duration = float(stream.duration * stream.time_base)
+            else:
+                duration = 0.0
+                for frame in container.decode(stream):
+                    duration += float(frame.samples) / float(frame.sample_rate)
+            if not 0.1 <= duration <= 15.1:
+                raise ContractError(f"{role} must be between 0.1 and 15 seconds")
+            return duration
+    except ContractError:
+        raise
+    except Exception as error:
+        raise ContractError(f"{role} is not a decodable audio container") from error
+
+
+def _audio_mime(filename: str, content: bytes, role: str) -> str:
+    """Validate an audio reference and choose a MiMo-compatible data-URL MIME."""
+
+    _validate_reference_audio(content, role)
+    suffix = Path(filename).suffix.lower()
+    mime_type = AUDIO_MIME_BY_SUFFIX.get(suffix)
+    if mime_type is None:
+        raise ContractError(f"{role} has an unsupported audio suffix")
+    return mime_type
+
+
+def _video_mime(filename: str, content: bytes, role: str) -> str:
+    """Validate a video reference and choose MiMo's data-URL MIME type."""
+
+    _validate_reference_video(content, role)
+    mime_type = VIDEO_MIME_BY_SUFFIX.get(Path(filename).suffix.lower())
+    if mime_type is None:
+        raise ContractError(f"{role} has an unsupported video suffix")
+    return mime_type
+
+
+@dataclass
+class JobRecord:
+    id: str
+    spec: GenerationSpec
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    status: str = "queued"
+    first_frame: Path | None = None
+    last_frame: Path | None = None
+    reference_images: tuple[Path, ...] = ()
+    reference_videos: tuple[Path, ...] = ()
+    reference_audios: tuple[Path, ...] = ()
+    runtime_key: str | None = None
+    backend_prompt_id: str | None = None
+    elapsed_seconds: float | None = None
+    generation_elapsed_seconds: float | None = None
+    upscale_elapsed_seconds: float | None = None
+    upscale_peak_allocated_mib: float | None = None
+    upscale_peak_reserved_mib: float | None = None
+    output_path: Path | None = None
+    preview_path: Path | None = None
+    preview_decision: str | None = None
+    checkpoint_path: Path | None = None
+    checkpoint_completed_steps: int | None = None
+    checkpoint_total_steps: int | None = None
+    checkpoint_retained: bool = False
+    pending_action: str = "generate"
+    error: str | None = None
+    progress_percent: float = 0.0
+    progress_stage: str = "queued"
+    progress_detail: str = "等待执行"
+    estimated_total_seconds: float | None = None
+    estimated_remaining_seconds: float | None = None
+    started_at: float | None = None
+    inference_plan: dict[str, Any] | None = None
+
+    @property
+    def condition_mode(self) -> str:
+        if self.reference_images or self.reference_videos or self.reference_audios:
+            return "reference"
+        if self.first_frame and self.last_frame:
+            return "first_last"
+        if self.first_frame:
+            return "first"
+        if self.last_frame:
+            return "last"
+        return "text"
+
+    def public(
+        self,
+        queue_position: int | None = None,
+        *,
+        estimated_remaining_seconds: float | None = None,
+        estimated_queue_seconds: float | None = None,
+        estimated_completion_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        result = {
+            "id": self.id,
+            "status": self.status,
+            "queue_position": queue_position,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "request": {
+                **self.spec.to_dict(),
+                "condition_mode": self.condition_mode,
+                "has_first_frame": self.first_frame is not None,
+                "has_last_frame": self.last_frame is not None,
+                "reference_image_count": len(self.reference_images),
+                "reference_video_count": len(self.reference_videos),
+                "reference_audio_count": len(self.reference_audios),
+                "reference_video_audio_policy": "ignored",
+            },
+            "elapsed_seconds": self.elapsed_seconds,
+            "generation_elapsed_seconds": self.generation_elapsed_seconds,
+            "upscale_elapsed_seconds": self.upscale_elapsed_seconds,
+            "upscale_peak_allocated_mib": self.upscale_peak_allocated_mib,
+            "upscale_peak_reserved_mib": self.upscale_peak_reserved_mib,
+            "progress": {
+                "percent": round(self.progress_percent, 1),
+                "stage": self.progress_stage,
+                "detail": self.progress_detail,
+                "estimated_total_seconds": self.estimated_total_seconds,
+                "estimated_remaining_seconds": estimated_remaining_seconds,
+                "estimated_queue_seconds": estimated_queue_seconds,
+                "estimated_completion_seconds": estimated_completion_seconds,
+            },
+            "error": self.error,
+        }
+        if self.inference_plan is not None:
+            result["inference_plan"] = dict(self.inference_plan)
+        if self.output_path is not None:
+            result["video_url"] = f"/api/v1/jobs/{self.id}/video"
+            result["download_name"] = self.output_path.name
+        if self.preview_path is not None:
+            result["preview"] = {
+                "ready": self.preview_path.is_file(),
+                "video_url": f"/api/v1/jobs/{self.id}/preview",
+                "decision_required": self.status == "awaiting_preview",
+                "decision": self.preview_decision,
+            }
+        if self.spec.execution_mode == "checkpoint" or self.checkpoint_completed_steps:
+            result["checkpoint"] = {
+                "completed_steps": self.checkpoint_completed_steps,
+                "total_steps": self.checkpoint_total_steps,
+                "retained": self.checkpoint_retained,
+                "resume_available": bool(
+                    self.status == "checkpointed"
+                    and self.checkpoint_retained
+                    and self.checkpoint_path is not None
+                    and self.checkpoint_path.is_file()
+                ),
+            }
+        return result
+
+
+@dataclass
+class PreviewControl:
+    event: threading.Event = field(default_factory=threading.Event)
+    decision: str | None = None
+
+
+class JobService:
+    def __init__(
+        self,
+        data_dir: Path,
+        backend: Any,
+        *,
+        max_queued_jobs: int = 32,
+        output_root: Path | None = None,
+        upscaler: Any | None = None,
+        memory_profile_getter: Any | None = None,
+    ) -> None:
+        self.data_dir = data_dir
+        self.backend = backend
+        self.output_root = output_root.resolve() if output_root is not None else None
+        self.max_queued_jobs = max(1, int(max_queued_jobs))
+        self.upscaler = upscaler
+        self.memory_profile_getter = memory_profile_getter
+        self.jobs: dict[str, JobRecord] = {}
+        self.pending: list[str] = []
+        self.queue_changed = asyncio.Condition()
+        self.cancel_events: dict[str, asyncio.Event] = {}
+        self.preview_controls: dict[str, PreviewControl] = {}
+        self.worker_task: asyncio.Task | None = None
+        self.warmup_task: asyncio.Task | None = None
+        self.fixed_engine: str | None = None
+        for name in ("jobs", "uploads", "logs", "checkpoints"):
+            (self.data_dir / name).mkdir(parents=True, exist_ok=True)
+        self._load_jobs()
+
+    def switch_workspace(self, layout: WorkspaceLayout) -> None:
+        """Rebind persistent job state after the API has proven the GPU idle."""
+
+        if self.pending or any(
+            job.status in {"queued", "starting_backend", "running", "awaiting_preview"}
+            for job in self.jobs.values()
+        ):
+            raise RuntimeError("cannot switch workspace while jobs are active")
+        self.data_dir = layout.data_dir
+        self.output_root = layout.output_dir
+        self.jobs.clear()
+        self.pending.clear()
+        self.cancel_events.clear()
+        self.preview_controls.clear()
+        for name in ("jobs", "uploads", "logs", "checkpoints"):
+            (self.data_dir / name).mkdir(parents=True, exist_ok=True)
+        self._load_jobs()
+
+    def _load_jobs(self) -> None:
+        for path in sorted((self.data_dir / "jobs").glob("*.json")):
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+                request = document.get("_internal", {}).get("spec", document["request"])
+                spec = GenerationSpec.from_mapping(request)
+                internal = document.get("_internal", {})
+
+                def optional_path(name: str) -> Path | None:
+                    value = internal.get(name)
+                    return Path(value) if value else None
+
+                status = str(document.get("status", "failed"))
+                error = document.get("error")
+                if status in {"queued", "starting_backend", "running", "awaiting_preview"}:
+                    status = "failed"
+                    error = "service restarted before the task completed"
+                job = JobRecord(
+                    id=str(document["id"]),
+                    spec=spec,
+                    created_at=float(document.get("created_at", path.stat().st_mtime)),
+                    updated_at=float(document.get("updated_at", path.stat().st_mtime)),
+                    status=status,
+                    first_frame=optional_path("first_frame"),
+                    last_frame=optional_path("last_frame"),
+                    reference_images=tuple(
+                        Path(value)
+                        for value in internal.get("reference_images", [])
+                        if value
+                    ),
+                    reference_videos=tuple(
+                        Path(value)
+                        for value in internal.get("reference_videos", [])
+                        if value
+                    ),
+                    reference_audios=tuple(
+                        Path(value)
+                        for value in internal.get("reference_audios", [])
+                        if value
+                    ),
+                    runtime_key=internal.get("runtime_key", document.get("backend_key")),
+                    backend_prompt_id=internal.get("backend_prompt_id"),
+                    elapsed_seconds=document.get("elapsed_seconds"),
+                    generation_elapsed_seconds=document.get(
+                        "generation_elapsed_seconds"
+                    ),
+                    upscale_elapsed_seconds=document.get("upscale_elapsed_seconds"),
+                    upscale_peak_allocated_mib=document.get(
+                        "upscale_peak_allocated_mib"
+                    ),
+                    upscale_peak_reserved_mib=document.get(
+                        "upscale_peak_reserved_mib"
+                    ),
+                    output_path=optional_path("output_path"),
+                    preview_path=optional_path("preview_path"),
+                    preview_decision=internal.get("preview_decision"),
+                    checkpoint_path=optional_path("checkpoint_path"),
+                    checkpoint_completed_steps=internal.get(
+                        "checkpoint_completed_steps"
+                    ),
+                    checkpoint_total_steps=internal.get("checkpoint_total_steps"),
+                    checkpoint_retained=bool(
+                        internal.get("checkpoint_retained", False)
+                    ),
+                    pending_action=str(internal.get("pending_action", "generate")),
+                    error=error,
+                    progress_percent=float(document.get("progress", {}).get("percent", 0.0)),
+                    progress_stage=str(document.get("progress", {}).get("stage", status)),
+                    progress_detail=str(document.get("progress", {}).get("detail", "")),
+                    estimated_total_seconds=document.get("progress", {}).get(
+                        "estimated_total_seconds"
+                    ),
+                    estimated_remaining_seconds=document.get("progress", {}).get(
+                        "estimated_remaining_seconds"
+                    ),
+                    inference_plan=(
+                        dict(document["inference_plan"])
+                        if isinstance(document.get("inference_plan"), dict)
+                        else None
+                    ),
+                )
+                if job.output_path is not None and not job.output_path.is_file():
+                    job.status = "failed"
+                    job.error = "recorded output video is missing"
+                    job.output_path = None
+                if job.status == "checkpointed" and (
+                    not job.checkpoint_retained
+                    or job.checkpoint_path is None
+                    or not job.checkpoint_path.is_file()
+                ):
+                    job.checkpoint_retained = False
+                self.jobs[job.id] = job
+            except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+                # One damaged history record must not prevent the service from starting.
+                continue
+
+    def queue_position(self, job_id: str) -> int | None:
+        try:
+            return self.pending.index(job_id) + 1
+        except ValueError:
+            return None
+
+    def serialize(self, job: JobRecord) -> dict[str, Any]:
+        queue_position = self.queue_position(job.id)
+        remaining = self._dynamic_remaining(job)
+        queue_seconds = None
+        completion_seconds = remaining
+        if queue_position is not None:
+            queue_seconds, completion_seconds = self._queued_eta(job.id)
+        return job.public(
+            queue_position,
+            estimated_remaining_seconds=remaining,
+            estimated_queue_seconds=queue_seconds,
+            estimated_completion_seconds=completion_seconds,
+        )
+
+    @staticmethod
+    def _dynamic_remaining(job: JobRecord, now: float | None = None) -> float | None:
+        """Return a wall-clock countdown without treating stage progress as linear."""
+
+        if job.status == "succeeded":
+            return 0.0
+        if job.status == "checkpointed":
+            return None
+        total = job.estimated_total_seconds
+        if total is None:
+            return None
+        if job.status == "starting_backend" and job.started_at is None:
+            return None
+        if job.status == "awaiting_preview":
+            return None
+        if job.status not in {"starting_backend", "running"} or job.started_at is None:
+            return round(max(0.0, total), 1)
+        elapsed = max(0.0, (time.time() if now is None else now) - job.started_at)
+        return round(max(0.0, total - elapsed), 1)
+
+    def _queued_eta(self, job_id: str) -> tuple[float | None, float | None]:
+        """Estimate queue wait and completion from the one-GPU FIFO schedule."""
+
+        if job_id not in self.pending:
+            return None, None
+        now = time.time()
+        seconds = 0.0
+        known = False
+        unknown_active = False
+        for active in self.jobs.values():
+            if active.status not in {"starting_backend", "running", "awaiting_preview"}:
+                continue
+            value = self._dynamic_remaining(active, now)
+            if value is not None:
+                seconds += value
+                known = True
+            else:
+                unknown_active = True
+        if unknown_active:
+            return None, None
+        target = self.jobs[job_id]
+        own = target.estimated_total_seconds
+        for pending_id in self.pending:
+            pending = self.jobs.get(pending_id)
+            if pending is None:
+                continue
+            if pending_id == job_id:
+                queue_seconds = seconds if known or own is not None else None
+                if own is None:
+                    return queue_seconds, None
+                return queue_seconds, round(seconds + own, 1)
+            if pending.estimated_total_seconds is not None:
+                seconds += pending.estimated_total_seconds
+                known = True
+        return None, None
+
+    def persist(self, job: JobRecord) -> None:
+        path = self.data_dir / "jobs" / f"{job.id}.json"
+        temporary = path.with_suffix(".json.tmp")
+        document = self.serialize(job)
+        document["schema_version"] = 2
+        document["_internal"] = {
+            "spec": job.spec.to_dict(include_execution=True),
+            "first_frame": str(job.first_frame) if job.first_frame else None,
+            "last_frame": str(job.last_frame) if job.last_frame else None,
+            "reference_images": [str(path) for path in job.reference_images],
+            "reference_videos": [str(path) for path in job.reference_videos],
+            "reference_audios": [str(path) for path in job.reference_audios],
+            "backend_prompt_id": job.backend_prompt_id,
+            "runtime_key": job.runtime_key,
+            "output_path": str(job.output_path) if job.output_path else None,
+            "preview_path": str(job.preview_path) if job.preview_path else None,
+            "preview_decision": job.preview_decision,
+            "checkpoint_path": str(job.checkpoint_path) if job.checkpoint_path else None,
+            "checkpoint_completed_steps": job.checkpoint_completed_steps,
+            "checkpoint_total_steps": job.checkpoint_total_steps,
+            "checkpoint_retained": job.checkpoint_retained,
+            "pending_action": job.pending_action,
+            "inference_plan": job.inference_plan,
+        }
+        temporary.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+
+    async def submit(
+        self,
+        spec: GenerationSpec,
+        uploads: dict[str, tuple[str, bytes]],
+    ) -> JobRecord:
+        if len(self.pending) >= self.max_queued_jobs:
+            raise ContractError("generation queue is full; try again later")
+        job_id = str(uuid.uuid4())
+        reference_video_duration = 0.0
+        for role, (original_name, content) in uploads.items():
+            suffix = Path(original_name).suffix.lower()
+            if role.startswith("reference_video_"):
+                if suffix not in VIDEO_SUFFIXES:
+                    raise ContractError(f"{role} must be MP4, MOV, MKV, WebM or AVI")
+                duration = _validate_reference_video(content, role)
+                if duration is not None:
+                    reference_video_duration += duration
+            elif role.startswith("reference_audio_"):
+                if suffix not in AUDIO_SUFFIXES:
+                    raise ContractError(f"{role} must be WAV, MP3, FLAC, M4A, OGG or Opus")
+                _validate_reference_audio(content, role)
+            else:
+                if suffix not in IMAGE_SUFFIXES:
+                    raise ContractError(f"{role} must be PNG, JPEG or WebP")
+                _validate_image(content, role)
+        if reference_video_duration > 15.1:
+            raise ContractError("total reference video duration must not exceed 15 seconds")
+        upload_dir = self.data_dir / "uploads" / job_id
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        paths: dict[str, Path] = {}
+        for role, (original_name, content) in uploads.items():
+            suffix = Path(original_name).suffix.lower()
+            target = upload_dir / f"{role}{suffix}"
+            target.write_bytes(content)
+            paths[role] = target
+
+        job = JobRecord(
+            id=job_id,
+            spec=spec,
+            first_frame=paths.get("first_frame"),
+            last_frame=paths.get("last_frame"),
+            reference_images=tuple(
+                path for role, path in sorted(paths.items())
+                if role.startswith("reference_image_")
+            ),
+            reference_videos=tuple(
+                path for role, path in sorted(paths.items())
+                if role.startswith("reference_video_")
+            ),
+            reference_audios=tuple(
+                path for role, path in sorted(paths.items())
+                if role.startswith("reference_audio_")
+            ),
+        )
+        job.estimated_total_seconds = self._estimate_total(spec, job.condition_mode)
+        job.estimated_remaining_seconds = job.estimated_total_seconds
+        self.jobs[job_id] = job
+        self.cancel_events[job_id] = asyncio.Event()
+        self.preview_controls[job_id] = PreviewControl()
+        async with self.queue_changed:
+            self.pending.append(job_id)
+            self.queue_changed.notify()
+        self.persist(job)
+        return job
+
+    def _estimate_total(self, spec: GenerationSpec, condition_mode: str) -> float:
+        execution = spec.preset
+        actual_steps = execution.get("actual_steps")
+        lora_steps = execution.get("steps")
+        matches = [
+            job.elapsed_seconds
+            for job in sorted(self.jobs.values(), key=lambda item: item.created_at)
+            if job.status == "succeeded"
+            and job.elapsed_seconds is not None
+            and job.spec.engine == spec.engine
+            and job.spec.width == spec.width
+            and job.spec.height == spec.height
+            and job.spec.frames == spec.frames
+            and job.condition_mode == condition_mode
+            and job.spec.preset.get("actual_steps") == actual_steps
+            and job.spec.preset.get("steps") == lora_steps
+            and job.spec.sampling_steps == spec.sampling_steps
+            and job.spec.acceleration == spec.acceleration
+            and job.spec.attention_keep_ratio == spec.attention_keep_ratio
+            and job.spec.sparse_scope == spec.sparse_scope
+            and job.spec.upscale_enabled == spec.upscale_enabled
+            and job.spec.upscale_target_width == spec.upscale_target_width
+            and job.spec.upscale_target_height == spec.upscale_target_height
+        ]
+        if matches:
+            recent = matches[-5:]
+            estimate = sum(recent) / len(recent)
+            return round(estimate, 1)
+        megapixel_frames = spec.width * spec.height * spec.frames / 1_000_000
+        if spec.joint_acceleration_enabled:
+            from .native_engine.planner import H3JointAccelerationScheduler
+
+            joint = H3JointAccelerationScheduler().plan(
+                int(spec.sampling_steps or 20),
+                float(spec.acceleration or 0.0),
+                allow_forecast=spec.model_variant == "base",
+            )
+            # Normalized compute units include full evaluations, shallow
+            # forecasts and measured Attention action ratios.  This remains a
+            # cold estimate; exact matching completed-job history wins above.
+            denominator = 6.0 if spec.model_variant == "lora" else 9.0
+            slope = 0.32 if spec.model_variant == "lora" else 0.37
+            estimate = 12 + megapixel_frames * slope * (
+                joint.estimated_compute_units / denominator
+            )
+        elif spec.engine in ("lora", "reference_lora"):
+            step_factor = int(spec.preset["steps"]) / 6
+            estimate = 12 + megapixel_frames * 0.32 * step_factor
+        else:
+            actual = int(spec.preset["actual_steps"])
+            forecast = int(spec.preset["forecast_steps"])
+            estimate = 16 + megapixel_frames * (0.37 * actual + 0.025 * forecast) / 9
+        if condition_mode != "text":
+            # Ref2VA additionally runs Qwen3-VL over the reference images and
+            # Video-VAE encodes them.  On the compact memory profile Qwen is
+            # intentionally read per request.  The first measured 480p/3s
+            # full-schedule job spent about 108 s beyond the dense DiT/VAE
+            # estimate; matching completed-job history supersedes this cold
+            # fallback from the second identical workload onward.
+            estimate += 4.0 if condition_mode != "reference" else 108.0
+        if not spec.joint_acceleration_enabled and spec.attention_keep_ratio < 1.0:
+            # Sparse attention only affects part of the DiT cost. Scope is the
+            # fraction of sampling steps on which the approximation is active;
+            # measured history supersedes this conservative cold estimate.
+            scope_fraction = {
+                "middle_only": 0.50,
+                "guarded": 0.80,
+                "full": 1.00,
+            }[spec.sparse_scope]
+            estimate *= 1.0 - (1.0 - spec.attention_keep_ratio) * scope_fraction * 0.30
+        if spec.upscale_enabled:
+            # Until this installation has matching history, use a conservative
+            # postprocess estimate. The next completed task calibrates it.
+            output_pixels = (
+                int(spec.upscale_target_width or spec.width)
+                * int(spec.upscale_target_height or spec.height)
+            )
+            estimate += 28.0 + output_pixels * spec.frames / 1_000_000 * 0.42
+        return round(max(8.0, estimate), 1)
+
+    async def cancel(self, job_id: str) -> JobRecord:
+        job = self.jobs[job_id]
+        if job.status in {"succeeded", "failed", "cancelled", "checkpointed"}:
+            return job
+        self.cancel_events[job_id].set()
+        control = self.preview_controls.get(job_id)
+        if control is not None and not control.event.is_set():
+            control.decision = "discard"
+            control.event.set()
+        if job.status == "queued":
+            job.status = "cancelled"
+            job.updated_at = time.time()
+            job.error = "cancelled before execution"
+            async with self.queue_changed:
+                if job_id in self.pending:
+                    self.pending.remove(job_id)
+                self.queue_changed.notify()
+            self.persist(job)
+        return job
+
+    async def reorder(self, ordered_ids: list[str]) -> None:
+        async with self.queue_changed:
+            if len(ordered_ids) != len(set(ordered_ids)):
+                raise ContractError("queue order contains duplicate job ids")
+            if set(ordered_ids) != set(self.pending):
+                raise ContractError("queue order must contain every queued job exactly once")
+            self.pending[:] = ordered_ids
+            self.queue_changed.notify()
+
+    async def resume(self, job_id: str) -> JobRecord:
+        job = self.jobs[job_id]
+        if job.status != "checkpointed":
+            raise ContractError("job is not stopped at a checkpoint")
+        if (
+            not job.checkpoint_retained
+            or job.checkpoint_path is None
+            or not job.checkpoint_path.is_file()
+        ):
+            raise ContractError("the checkpoint was not retained")
+        if len(self.pending) >= self.max_queued_jobs:
+            raise ContractError("generation queue is full; try again later")
+        job.pending_action = "resume"
+        job.status = "queued"
+        job.error = None
+        job.progress_stage = "queued_resume"
+        job.progress_detail = "断点恢复已加入队列"
+        job.updated_at = time.time()
+        self.cancel_events[job_id] = asyncio.Event()
+        async with self.queue_changed:
+            self.pending.append(job_id)
+            self.queue_changed.notify()
+        self.persist(job)
+        return job
+
+    async def delete(self, job_id: str) -> dict[str, bool]:
+        """Delete a job and any output owned by the configured output root.
+
+        Persisted development jobs can legitimately point at an older smoke or
+        calibration directory.  Those paths are not trusted deletion targets:
+        remove the service record and uploads, but retain the external file.
+        This keeps the path-containment guard without making legacy cards
+        impossible to dismiss from the UI.
+        """
+        job = self.jobs[job_id]
+        if job.status in {"starting_backend", "running", "awaiting_preview"}:
+            raise ContractError("cancel the running job before deleting it")
+        if job.status == "queued":
+            await self.cancel(job_id)
+        resolved_output = None
+        resolved_preview = None
+        resolved_checkpoint = None
+        output_retained = False
+        if job.output_path is not None and job.output_path.is_file():
+            candidate = job.output_path.resolve()
+            if self.output_root is not None and candidate.is_relative_to(
+                self.output_root
+            ):
+                resolved_output = candidate
+            else:
+                output_retained = True
+        if job.preview_path is not None and job.preview_path.is_file():
+            candidate_preview = job.preview_path.resolve()
+            if self.output_root is not None and candidate_preview.is_relative_to(
+                self.output_root
+            ):
+                resolved_preview = candidate_preview
+        if job.checkpoint_path is not None and job.checkpoint_path.is_file():
+            candidate_checkpoint = job.checkpoint_path.resolve()
+            checkpoint_root = (self.data_dir / "checkpoints").resolve()
+            if candidate_checkpoint.is_relative_to(checkpoint_root):
+                resolved_checkpoint = candidate_checkpoint
+        async with self.queue_changed:
+            if job_id in self.pending:
+                self.pending.remove(job_id)
+        self.cancel_events.pop(job_id, None)
+        self.preview_controls.pop(job_id, None)
+        self.jobs.pop(job_id, None)
+        (self.data_dir / "jobs" / f"{job_id}.json").unlink(missing_ok=True)
+        shutil.rmtree(self.data_dir / "uploads" / job_id, ignore_errors=True)
+        if resolved_output is not None:
+            resolved_output.unlink()
+        if resolved_preview is not None and resolved_preview != resolved_output:
+            resolved_preview.unlink()
+        if resolved_checkpoint is not None:
+            resolved_checkpoint.unlink()
+        return {
+            "output_deleted": resolved_output is not None,
+            "preview_deleted": resolved_preview is not None,
+            "output_retained": output_retained,
+            "checkpoint_deleted": resolved_checkpoint is not None,
+        }
+
+    async def decide_preview(self, job_id: str, decision: str) -> JobRecord:
+        if decision not in {"continue", "discard"}:
+            raise ContractError("preview decision must be continue or discard")
+        job = self.jobs[job_id]
+        if job.status != "awaiting_preview":
+            raise ContractError("job is not waiting for a preview decision")
+        control = self.preview_controls[job_id]
+        if control.event.is_set():
+            raise ContractError("preview decision was already submitted")
+        control.decision = decision
+        job.preview_decision = decision
+        if decision == "continue":
+            job.status = "running"
+            job.progress_stage = "resuming"
+            job.progress_detail = "继续正式轨迹"
+        else:
+            self.cancel_events[job_id].set()
+            job.progress_detail = "放弃当前抽卡"
+        job.updated_at = time.time()
+        self.persist(job)
+        control.event.set()
+        return job
+
+    def _progress_callback(self, job: JobRecord, *, scale: float = 1.0, offset: float = 0.0):
+        loop = asyncio.get_running_loop()
+        last_persisted = [0.0]
+
+        def update(event: dict[str, Any]) -> None:
+            def apply() -> None:
+                if job.status in {"succeeded", "failed", "cancelled"}:
+                    return
+                mapped = offset + float(event["percent"]) * scale
+                percent = min(99.0, max(job.progress_percent, mapped))
+                job.progress_percent = percent
+                job.progress_stage = str(event.get("stage", job.progress_stage))
+                job.progress_detail = str(event.get("detail", job.progress_detail))
+                now = time.time()
+                elapsed = max(0.0, now - (job.started_at or now))
+                # Pipeline percentages are stage-weighted, not linear time.
+                # Keep the calibrated/history estimate stable. If reality has
+                # already overtaken it, extend gently instead of jumping by
+                # elapsed/percent (the source of the old ETA bug).
+                prior = job.estimated_total_seconds
+                if prior is None:
+                    prior = self._estimate_total(job.spec, job.condition_mode)
+                if elapsed >= prior * 0.95:
+                    prior = elapsed + max(5.0, prior * 0.08)
+                job.estimated_total_seconds = round(prior, 1)
+                job.estimated_remaining_seconds = round(max(0.0, prior - elapsed), 1)
+                job.updated_at = now
+                if now - last_persisted[0] >= 1.0:
+                    self.persist(job)
+                    last_persisted[0] = now
+
+            loop.call_soon_threadsafe(apply)
+
+        return update
+
+    def _update(self, job: JobRecord, status: str) -> None:
+        job.status = status
+        job.updated_at = time.time()
+        self.persist(job)
+
+    async def worker(self) -> None:
+        while True:
+            async with self.queue_changed:
+                await self.queue_changed.wait_for(lambda: bool(self.pending))
+                job_id = self.pending.pop(0)
+            job = self.jobs.get(job_id)
+            if job is None or job.status == "cancelled":
+                continue
+            await self._run(job)
+
+    async def _run(self, job: JobRecord) -> None:
+        # Persisted jobs and direct boundary tests created before fork preview
+        # do not have an associated control object.  Lazily creating it keeps
+        # those records executable while new submissions still allocate it at
+        # submit time.
+        cancel_event = self.cancel_events.setdefault(job.id, asyncio.Event())
+        preview_control = self.preview_controls.setdefault(job.id, PreviewControl())
+        action = job.pending_action
+        try:
+            job.progress_percent = 1.0
+            job.progress_stage = "preparing"
+            job.progress_detail = "等待模型预加载"
+            self._update(job, "starting_backend")
+            if self.warmup_task is not None and not self.warmup_task.done():
+                await self.warmup_task
+            if cancel_event.is_set():
+                raise JobCancelled("cancelled before generation")
+            job.started_at = time.time()
+            job.progress_detail = "准备热会话"
+            job.backend_prompt_id = job.id
+            self._update(job, "running")
+            loop = asyncio.get_running_loop()
+
+            def preview_ready(event: dict[str, Any]) -> None:
+                def apply() -> None:
+                    job.preview_path = Path(str(event["output_path"])).resolve()
+                    job.progress_percent = max(job.progress_percent, 60.0)
+                    job.progress_stage = "preview_ready"
+                    if job.spec.preview_mode == "pause":
+                        job.status = "awaiting_preview"
+                        job.progress_detail = "预览已就绪：继续正式生成或放弃本次抽卡"
+                    else:
+                        job.progress_detail = "分叉预览已保存，正式轨迹继续运行"
+                    job.updated_at = time.time()
+                    self.persist(job)
+                loop.call_soon_threadsafe(apply)
+
+            def wait_preview_decision() -> str:
+                while not preview_control.event.wait(0.25):
+                    if cancel_event.is_set():
+                        return "discard"
+                return preview_control.decision or "discard"
+
+            generate_args = (
+                job.spec,
+                job.id,
+                job.first_frame,
+                job.last_frame,
+                job.reference_images,
+                job.reference_videos,
+                job.reference_audios,
+                cancel_event,
+                self._progress_callback(
+                    job, scale=0.84 if job.spec.upscale_enabled else 1.0
+                ),
+            )
+            # Do not force legacy/testing backend adapters to understand the
+            # preview callbacks when the feature is disabled.
+            preview_kwargs: dict[str, Any] = {}
+            if job.spec.preview_mode != "off":
+                preview_kwargs["preview_ready_callback"] = preview_ready
+                preview_kwargs["preview_decision_wait"] = (
+                    wait_preview_decision
+                    if job.spec.preview_mode == "pause" else None
+                )
+            if job.spec.execution_mode == "checkpoint":
+                if action == "resume":
+                    preview_kwargs["resume_checkpoint_path"] = job.checkpoint_path
+                else:
+                    preview_kwargs["checkpoint_path"] = (
+                        self.data_dir / "checkpoints" / f"{job.id}.pt"
+                    )
+            result = await self.backend.generate(*generate_args, **preview_kwargs)
+            if isinstance(result, CheckpointResult):
+                job.inference_plan = result.inference_plan
+                job.runtime_key = result.runtime_key
+                job.generation_elapsed_seconds = round(
+                    float(job.generation_elapsed_seconds or 0.0)
+                    + float(result.elapsed_seconds),
+                    3,
+                )
+                job.elapsed_seconds = job.generation_elapsed_seconds
+                job.checkpoint_completed_steps = result.completed_steps
+                job.checkpoint_total_steps = result.total_steps
+                job.preview_path = result.preview_path
+                job.checkpoint_path = result.checkpoint_path
+                job.checkpoint_retained = bool(
+                    job.spec.checkpoint_retain
+                    and result.checkpoint_path is not None
+                    and result.checkpoint_path.is_file()
+                )
+                if not job.spec.checkpoint_retain and result.checkpoint_path is not None:
+                    result.checkpoint_path.unlink(missing_ok=True)
+                    job.checkpoint_path = None
+                job.pending_action = "generate"
+                job.progress_percent = round(
+                    100.0 * result.completed_steps / result.total_steps, 1
+                )
+                job.progress_stage = "checkpointed"
+                job.progress_detail = (
+                    f"已在第 {result.completed_steps}/{result.total_steps} 步停止"
+                )
+                job.estimated_remaining_seconds = None
+                self._update(job, "checkpointed")
+                return
+            job.runtime_key = result.runtime_key
+            # Keep the service boundary compatible with backend adapters that
+            # predate scheduler telemetry.  Production native results expose
+            # the field, while a minimal backend may legitimately omit it.
+            job.inference_plan = getattr(result, "inference_plan", None)
+            job.generation_elapsed_seconds = round(
+                float(job.generation_elapsed_seconds or 0.0)
+                + float(result.elapsed_seconds),
+                3,
+            )
+            job.output_path = result.output_path
+            if job.spec.upscale_enabled:
+                if self.upscaler is None:
+                    raise RuntimeError("FlashVSR upscaler is not configured")
+                job.progress_percent = max(job.progress_percent, 84.0)
+                job.progress_stage = "upscaling"
+                job.progress_detail = "H3完成，正在加载FlashVSR"
+                self.persist(job)
+                profile = (
+                    self.memory_profile_getter()
+                    if callable(self.memory_profile_getter)
+                    else None
+                )
+                exclusive = bool(
+                    profile is not None and profile.exclusive_upscaler
+                )
+                upscale_cycle_started = time.monotonic()
+                if exclusive:
+                    job.progress_detail = "释放H3内存，准备独占超分"
+                    self.persist(job)
+                    await self.backend.stop()
+                try:
+                    upscale = await self.upscaler.upscale(
+                        job.output_path,
+                        target_width=int(job.spec.upscale_target_width),
+                        target_height=int(job.spec.upscale_target_height),
+                        cancel_event=cancel_event,
+                        progress_callback=self._progress_callback(
+                            job, scale=0.15, offset=84.0
+                        ),
+                    )
+                finally:
+                    if exclusive:
+                        job.progress_detail = "超分完成，正在恢复H3热态"
+                        self.persist(job)
+                        await self.upscaler.stop()
+                        await self.backend.preload(job.spec.engine)
+                        if self.backend.warm_state.get("status") != "ready":
+                            raise RuntimeError("H3 failed to recover after exclusive upscaling")
+                job.upscale_elapsed_seconds = (
+                    time.monotonic() - upscale_cycle_started
+                    if exclusive else upscale.elapsed_seconds
+                )
+                job.upscale_peak_allocated_mib = upscale.peak_allocated_mib
+                job.upscale_peak_reserved_mib = upscale.peak_reserved_mib
+                job.output_path = upscale.output_path
+                if result.output_path != upscale.output_path:
+                    result.output_path.unlink(missing_ok=True)
+            job.elapsed_seconds = (
+                float(job.generation_elapsed_seconds or 0.0)
+                + float(job.upscale_elapsed_seconds or 0.0)
+            )
+            job.progress_percent = 100.0
+            job.progress_stage = "completed"
+            job.progress_detail = "视频生成完成"
+            job.estimated_remaining_seconds = 0.0
+            job.pending_action = "generate"
+            self._update(job, "succeeded")
+        except JobCancelled as error:
+            job.error = str(error)
+            job.progress_stage = "cancelled"
+            job.progress_detail = "任务已取消"
+            self._update(job, "cancelled")
+        except Exception:
+            detail = self.data_dir / "logs" / f"job_{job.id}.error.log"
+            detail.write_text(traceback.format_exc(), encoding="utf-8")
+            job.error = f"generation failed (reference {job.id[:8]})"
+            job.progress_stage = "failed"
+            job.progress_detail = "生成失败"
+            self._update(job, "failed")
+
+    async def start(self, fixed_engine: str | None = None, *, preload: bool = True) -> None:
+        self.fixed_engine = fixed_engine
+        self.worker_task = asyncio.create_task(self.worker(), name="h3serve-worker")
+        if preload and fixed_engine is not None and hasattr(self.backend, "preload"):
+            self.warmup_task = asyncio.create_task(
+                self.backend.preload(fixed_engine), name="h3serve-model-preload"
+            )
+
+    async def close(self) -> None:
+        if self.warmup_task is not None and not self.warmup_task.done():
+            self.warmup_task.cancel()
+            try:
+                await self.warmup_task
+            except asyncio.CancelledError:
+                pass
+        if self.worker_task is not None:
+            self.worker_task.cancel()
+            try:
+                await self.worker_task
+            except asyncio.CancelledError:
+                pass
+        if self.upscaler is not None and hasattr(self.upscaler, "stop"):
+            await self.upscaler.stop()
+        await self.backend.stop()
+
+
+async def _read_generation_request(
+    request: web.Request,
+) -> tuple[dict[str, Any], dict[str, tuple[str, bytes]]]:
+    uploads: dict[str, tuple[str, bytes]] = {}
+    if request.content_type == "application/json":
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ContractError("JSON body must be an object")
+        return payload, uploads
+
+    if not request.content_type.startswith("multipart/"):
+        raise ContractError("use application/json or multipart/form-data")
+    payload: dict[str, Any] = {}
+    reader = await request.multipart()
+    async for part in reader:
+        is_reference_image = bool(
+            part.name and re.fullmatch(r"reference_image_[1-9]", part.name)
+        )
+        is_reference_video = bool(
+            part.name and re.fullmatch(r"reference_video_[1-3]", part.name)
+        )
+        is_reference_audio = bool(
+            part.name and re.fullmatch(r"reference_audio_[1-3]", part.name)
+        )
+        if part.name in {"first_frame", "last_frame"} or is_reference_image or is_reference_video or is_reference_audio:
+            if not part.filename:
+                continue
+            content = bytearray()
+            while True:
+                chunk = await part.read_chunk(1024 * 1024)
+                if not chunk:
+                    break
+                content.extend(chunk)
+                limit = MAX_REFERENCE_VIDEO_BYTES if is_reference_video else MAX_IMAGE_BYTES
+                if len(content) > limit:
+                    raise ContractError(f"{part.name} exceeds {limit // (1024 * 1024)} MiB")
+            uploads[part.name] = (part.filename, bytes(content))
+        elif part.filename:
+            raise ContractError(f"unsupported file field: {part.name}")
+        else:
+            payload[str(part.name)] = await part.text()
+    return payload, uploads
+
+
+def create_app(
+    *,
+    paths: ServicePaths,
+    serve_dir: Path,
+    api_key: str | None = None,
+    backend: Any | None = None,
+    max_queued_jobs: int = 32,
+    fixed_engine: str | None = "original",
+    preload: bool = True,
+    prompt_enhancer: Any | None = None,
+    upscaler: Any | None = None,
+    memory_profile: HostMemoryProfile | None = None,
+) -> web.Application:
+    default_variant = (
+        engine_variant(str(fixed_engine)) if fixed_engine in ENGINES else "base"
+    )
+    if fixed_engine in ENGINES:
+        fixed_engine = engine_family(str(fixed_engine))
+    if fixed_engine is not None and fixed_engine not in SERVICE_FAMILIES:
+        raise ValueError(f"unsupported fixed service family: {fixed_engine}")
+    workspace_controller = (
+        WorkspaceController(paths.release_root) if fixed_engine is None else None
+    )
+    runtime_paths = (
+        dataclasses.replace(
+            paths,
+            data_dir=workspace_controller.current.data_dir,
+            output_dir=workspace_controller.current.output_dir,
+        )
+        if workspace_controller is not None else paths
+    )
+    @web.middleware
+    async def api_auth(request: web.Request, handler):
+        if api_key and request.path.startswith("/api/v1"):
+            bearer = request.headers.get("Authorization", "")
+            supplied = request.headers.get("X-API-Key")
+            if bearer.startswith("Bearer "):
+                supplied = bearer[7:]
+            if supplied != api_key:
+                raise web.HTTPUnauthorized(text="missing or invalid API key")
+        elif request.method not in {"GET", "HEAD", "OPTIONS"}:
+            origin = request.headers.get("Origin")
+            expected = f"{request.scheme}://{request.host}"
+            if origin and origin.rstrip("/") != expected.rstrip("/"):
+                raise web.HTTPForbidden(text="cross-origin state changes are not allowed")
+        return await handler(request)
+
+    app = web.Application(middlewares=[api_auth], client_max_size=640 * 1024 * 1024)
+    memory_profile = memory_profile or HOST_MEMORY_PROFILES["fullspeed"]
+    memory_state = {"profile": memory_profile, "changing": False}
+    engine_state: dict[str, Any] = {
+        "active": fixed_engine,
+        "switching": False,
+        "switchable": fixed_engine is None,
+        "default_variant": default_variant,
+        "error": None,
+    }
+    engine_lock = asyncio.Lock()
+    manager = backend if backend is not None else build_native_backend(
+        runtime_paths, memory_profile=memory_profile
+    )
+    video_upscaler = upscaler if upscaler is not None else FlashVSRUpscaler(runtime_paths)
+    service = JobService(
+        runtime_paths.data_dir,
+        manager,
+        max_queued_jobs=max_queued_jobs,
+        output_root=runtime_paths.output_dir,
+        upscaler=video_upscaler,
+        memory_profile_getter=lambda: memory_state["profile"],
+    )
+    app["job_service"] = service
+    enhancer = prompt_enhancer if prompt_enhancer is not None else MiMoPromptEnhancer()
+    # One operator-configured secret shared by the Web console and API clients
+    # such as the ComfyUI connector. The secret is isolated from jobs and logs
+    # in a mode-0600 file under the ignored service data directory.
+    mimo_key_state = {"value": (
+        os.environ.get("H3_MIMO_API_KEY", "").strip()
+        or _load_persisted_mimo_key(paths.data_dir)
+    )}
+    reference_media_state = _load_reference_media_settings(paths.data_dir)
+    generation_limit_state = {
+        "policy": load_generation_limit_policy(paths.data_dir),
+        "detected_vram_gib": detect_gpu_vram_gib(),
+    }
+    resource_monitor = ResourceMonitor()
+
+    def active_engine(*, required: bool = False) -> str | None:
+        engine = engine_state["active"]
+        if required and engine is None:
+            raise ContractError("select an engine before submitting a generation")
+        return engine
+
+    def engine_options() -> dict[str, Any]:
+        engine = active_engine()
+        document = public_options(
+            fixed_engine if fixed_engine is not None else None,
+            max_duration_by_preset=(
+                generation_limit_state["policy"].preset_limits
+            ),
+        )
+        document["deployment_mode"] = (
+            "fixed_engine" if fixed_engine is not None else "unified_console"
+        )
+        document["current_engine"] = engine
+        document["active_service_family"] = engine
+        document["current_model_variant"] = engine_state["default_variant"]
+        document["current_engine_options"] = (
+            document["service_families"].get(engine) if engine is not None else None
+        )
+        document["defaults"]["service_family"] = engine
+        document["defaults"]["model_variant"] = engine_state["default_variant"]
+        document["defaults"]["engine"] = (
+            resolve_engine(engine, engine_state["default_variant"])
+            if engine is not None else None
+        )
+        document["defaults"]["quality"] = (
+            default_quality(resolve_engine(engine, engine_state["default_variant"]))
+            if engine is not None else None
+        )
+        document["defaults"]["reference_image_resolution"] = (
+            reference_media_state["image_resolution"]
+        )
+        document["defaults"]["reference_video_resolution"] = (
+            reference_media_state["video_resolution"]
+        )
+        document["reference_media_processing"]["image_default"] = (
+            reference_media_state["image_resolution"]
+        )
+        document["reference_media_processing"]["video_default"] = (
+            reference_media_state["video_resolution"]
+        )
+        document["reference_media_processing"]["scope"] = (
+            "server_default_with_per_request_override"
+        )
+        document["generation_limits"] = generation_limit_state["policy"].public(
+            generation_limit_state["detected_vram_gib"]
+        )
+        document["engine_control"] = {
+            "switchable": engine_state["switchable"],
+            "switching": engine_state["switching"],
+            "active": engine,
+            "error": engine_state["error"],
+        }
+        if workspace_controller is not None:
+            document["workspace"] = workspace_controller.public(
+                switchable=engine is None and not engine_state["switching"] and not service_busy()
+            )
+        else:
+            document["workspace"] = {
+                "current": {
+                    "path": str(paths.release_root),
+                    "name": "legacy",
+                    "is_default": True,
+                    "output_path": str(paths.output_dir),
+                },
+                "default_path": str(paths.release_root),
+                "switchable": False,
+            }
+        return document
+
+    def service_busy() -> bool:
+        return bool(service.pending) or any(
+            job.status in {"queued", "starting_backend", "running", "awaiting_preview"}
+            for job in service.jobs.values()
+        )
+
+    async def select_engine(request: web.Request) -> web.Response:
+        if not engine_state["switchable"]:
+            raise web.HTTPConflict(text="this process uses a fixed engine launcher")
+        try:
+            document = await request.json()
+            requested = str(document.get("service_family", document.get("engine", "")))
+            requested_variant = str(document.get("model_variant", "") or "base")
+            if requested in ENGINES:
+                requested_variant = engine_variant(requested)
+                requested = engine_family(requested)
+            if requested not in SERVICE_FAMILIES:
+                raise ContractError(f"unsupported service family: {requested}")
+            if requested_variant not in {"base", "lora"}:
+                raise ContractError(f"unsupported model variant: {requested_variant}")
+        except (ContractError, json.JSONDecodeError) as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
+        if memory_state["changing"]:
+            raise web.HTTPConflict(text="host-memory profile is changing")
+        async with engine_lock:
+            if service_busy():
+                raise web.HTTPConflict(
+                    text="cancel or finish all running and queued jobs before switching service family"
+                )
+            if engine_state["switching"]:
+                raise web.HTTPConflict(text="engine is already switching")
+            if active_engine() == requested and manager.warm_state.get("status") == "ready":
+                engine_state["default_variant"] = requested_variant
+                return web.json_response({
+                    "changed": False, "active_engine": requested,
+                    "warm_state": manager.warm_state,
+                })
+            engine_state.update({"switching": True, "error": None})
+            previous = active_engine()
+            try:
+                await video_upscaler.stop()
+                await manager.stop()
+                engine_state["active"] = None
+                await manager.preload(requested)
+                if manager.warm_state.get("status") != "ready":
+                    raise RuntimeError("the selected engine failed to load")
+                engine_state["active"] = requested
+                engine_state["default_variant"] = requested_variant
+                if memory_state["profile"].preload_upscaler:
+                    try:
+                        await video_upscaler.start()
+                    except Exception:
+                        # FlashVSR is optional and isolated; its preload must
+                        # never roll back an otherwise healthy H3 engine.
+                        pass
+            except Exception as error:
+                engine_state.update({
+                    "active": None,
+                    "error": f"failed to enter {requested}; the service remains idle",
+                })
+                raise web.HTTPInternalServerError(
+                    text=engine_state["error"]
+                ) from error
+            finally:
+                engine_state["switching"] = False
+            return web.json_response({
+                "changed": previous != requested,
+                "active_engine": requested,
+                "warm_state": manager.warm_state,
+            })
+
+    async def exit_engine(_: web.Request) -> web.Response:
+        if not engine_state["switchable"]:
+            raise web.HTTPConflict(text="this process uses a fixed engine launcher")
+        if memory_state["changing"]:
+            raise web.HTTPConflict(text="host-memory profile is changing")
+        async with engine_lock:
+            if service_busy():
+                raise web.HTTPConflict(
+                    text="cancel or finish all running and queued jobs before exiting engine"
+                )
+            if engine_state["switching"]:
+                raise web.HTTPConflict(text="engine is already switching")
+            if active_engine() is None:
+                return web.json_response({"changed": False, "active_engine": None})
+            engine_state.update({"switching": True, "error": None})
+            try:
+                await video_upscaler.stop()
+                await manager.stop()
+                engine_state["active"] = None
+            finally:
+                engine_state["switching"] = False
+            return web.json_response({
+                "changed": True, "active_engine": None,
+                "warm_state": manager.warm_state,
+            })
+
+    async def browse_workspace(request: web.Request) -> web.Response:
+        if workspace_controller is None:
+            raise web.HTTPConflict(text="workspace selection requires the unified console")
+        try:
+            return web.json_response(
+                workspace_controller.browse(request.query.get("path"))
+            )
+        except ValueError as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
+
+    async def select_workspace(request: web.Request) -> web.Response:
+        if workspace_controller is None:
+            raise web.HTTPConflict(text="workspace selection requires the unified console")
+        try:
+            document = await request.json()
+            layout = workspace_controller.resolve(str(document.get("path", "")))
+        except (ValueError, json.JSONDecodeError) as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
+        async with engine_lock:
+            if active_engine() is not None or engine_state["switching"]:
+                raise web.HTTPConflict(text="exit the current model before switching workspace")
+            if service_busy():
+                raise web.HTTPConflict(text="finish or cancel active jobs before switching workspace")
+            try:
+                await video_upscaler.stop()
+                configure_output = getattr(manager, "configure_output_root", None)
+                if callable(configure_output):
+                    configure_output(layout.output_dir)
+                configure_upscaler = getattr(video_upscaler, "configure_data_dir", None)
+                if callable(configure_upscaler):
+                    configure_upscaler(layout.data_dir)
+                service.switch_workspace(layout)
+                workspace_controller.activate(layout)
+            except (OSError, RuntimeError, ValueError) as error:
+                raise web.HTTPConflict(text=str(error)) from error
+        return web.json_response(
+            workspace_controller.public(switchable=True)
+        )
+
+    async def index(_: web.Request) -> web.StreamResponse:
+        return web.FileResponse(serve_dir / "static/index.html")
+
+    async def openapi(_: web.Request) -> web.Response:
+        return web.json_response(openapi_document(__version__))
+
+    async def options(_: web.Request) -> web.Response:
+        active_memory_profile = memory_state["profile"]
+        document = engine_options()
+        engine = active_engine()
+        runtime = manager.preflight(engine) if engine is not None else {"capabilities": {}}
+        capabilities = runtime.get("capabilities", {})
+        document["advanced_limits"]["sparse_attention_available"] = bool(
+            capabilities.get("sparse_attention", False)
+        )
+        base_scheduler = (
+            "v19_certified_frontier"
+            if capabilities.get("v19_certified_frontier", False)
+            else "h3_int8_frozen_round229"
+        )
+        document["advanced_limits"]["acceleration"]["scheduler"] = base_scheduler
+        document["advanced_limits"]["acceleration"]["scheduler_by_variant"] = {
+            "base": base_scheduler,
+            "lora": "h3_lora_v1_no_forecast_round229",
+        }
+        document["advanced_limits"]["upscaler"]["available"] = bool(
+            video_upscaler.status().get("ready", False)
+        )
+        document["host_memory"] = {
+            "active_profile": active_memory_profile.key,
+            "profile": active_memory_profile.public(),
+            "detected": detect_host_memory().public(),
+            "profiles": [
+                profile.public() for profile in HOST_MEMORY_PROFILES.values()
+            ],
+            "selection_scope": "service_startup",
+        }
+        return web.json_response(document)
+
+    async def models(_: web.Request) -> web.Response:
+        state = model_status(paths.model_dir)
+        engine = active_engine()
+        if engine is None:
+            return web.json_response({
+                "engine": None, "ready": state["any_engine_ready"],
+                "models": state["engines"],
+            })
+        return web.json_response({
+            "engine": engine,
+            "ready": state["engines"][resolve_engine(engine, "base")]["ready"],
+            "models": {
+                variant: state["engines"][resolve_engine(engine, variant)]
+                for variant in ("base", "lora")
+            },
+        })
+
+    async def health(_: web.Request) -> web.Response:
+        active_memory_profile = memory_state["profile"]
+        active_route = (
+            service.backend.key.split(":", 1)[0]
+            if service.backend.key else None
+        )
+        return web.json_response({
+            "status": "ok",
+            "version": __version__,
+            "queue_length": len(service.pending),
+            "configured_engine": fixed_engine,
+            "active_engine": active_engine(),
+            "active_service_family": active_engine(),
+            "last_model_variant": (
+                engine_variant(active_route) if active_route in ENGINES else None
+            ),
+            "last_runtime_route": active_route,
+            "engine_control": dict(engine_state),
+            "warm_state": getattr(
+                service.backend, "warm_state", {"status": "unsupported"}
+            ),
+            "gpu_concurrency": 1,
+            "upscaler": video_upscaler.status(),
+            "host_memory": {
+                "active_profile": active_memory_profile.key,
+                "profile": active_memory_profile.public(),
+                "detected": detect_host_memory().public(),
+                "changing": memory_state["changing"],
+            },
+        })
+
+    async def resources(_: web.Request) -> web.Response:
+        """Return cached host/GPU telemetry without touching model residency."""
+
+        document = await resource_monitor.snapshot()
+        document["active_engine"] = active_engine()
+        document["warm_state"] = getattr(
+            service.backend, "warm_state", {"status": "unsupported"}
+        )
+        document["queue"] = {
+            "running": sum(
+                job.status in {"starting_backend", "running", "awaiting_preview"}
+                for job in service.jobs.values()
+            ),
+            "queued": len(service.pending),
+        }
+        return web.json_response(document)
+
+    async def readiness(_: web.Request) -> web.Response:
+        models_state = model_status(paths.model_dir)
+        engine = active_engine()
+        if engine is None:
+            return web.json_response({
+                "status": "idle", "engines": models_state["engines"],
+                "message": "select an engine in the control console",
+            })
+        runtimes = {engine: manager.preflight(engine)}
+        engines = {
+            engine: {
+                "ready": all(
+                    models_state["engines"][resolve_engine(engine, variant)]["ready"]
+                    for variant in ("base", "lora")
+                )
+                and runtimes[engine]["ready"],
+                "models": {
+                    variant: models_state["engines"][resolve_engine(engine, variant)]
+                    for variant in ("base", "lora")
+                },
+                "runtime": runtimes[engine],
+            }
+            for engine in (engine,)
+        }
+        ready = any(value["ready"] for value in engines.values())
+        return web.json_response(
+            {"status": "ready" if ready else "not_ready", "engines": engines},
+            status=200 if ready else 503,
+        )
+
+    async def change_memory_profile(request: web.Request) -> web.Response:
+        if memory_state["changing"]:
+            raise web.HTTPConflict(text="host-memory profile is already changing")
+        if engine_state["switching"]:
+            raise web.HTTPConflict(text="engine is switching")
+        try:
+            document = await request.json()
+            requested = str(document.get("profile", ""))
+            detected = detect_host_memory()
+            reconfiguration_status = HostMemoryStatus(
+                detected.physical_total_gib,
+                detected.effective_limit_gib,
+                min(
+                    detected.effective_limit_gib,
+                    detected.available_gib + current_process_pss_gib(),
+                ),
+            )
+            profile = resolve_host_memory_profile(
+                requested, reconfiguration_status
+            )
+        except (json.JSONDecodeError, RuntimeError, ValueError) as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
+        if profile.evidence not in {"validated", "review"}:
+            raise web.HTTPConflict(
+                text=f"{profile.label} is not release-validated on this build"
+            )
+        if service_busy():
+            raise web.HTTPConflict(
+                text="wait for the running and queued jobs before changing memory mode"
+            )
+        if profile.key == memory_state["profile"].key:
+            return web.json_response({
+                "changed": False, "profile": profile.public(),
+                "warm_state": manager.warm_state,
+            })
+
+        previous = memory_state["profile"]
+        memory_state["changing"] = True
+        try:
+            await video_upscaler.stop()
+            await manager.stop()
+            manager.configure_memory_profile(profile)
+            engine = active_engine()
+            if engine is not None:
+                await manager.preload(engine)
+            if engine is not None and manager.warm_state.get("status") != "ready":
+                raise RuntimeError("H3 failed to preload under the selected memory mode")
+            if profile.preload_upscaler:
+                await video_upscaler.start()
+            memory_state["profile"] = profile
+        except Exception as error:
+            # Restore the previously working policy before returning an error.
+            try:
+                await video_upscaler.stop()
+                await manager.stop()
+                manager.configure_memory_profile(previous)
+                if engine is not None:
+                    await manager.preload(engine)
+                if previous.preload_upscaler:
+                    await video_upscaler.start()
+            finally:
+                memory_state["profile"] = previous
+            raise web.HTTPInternalServerError(
+                text="memory-profile change failed; the previous mode was restored"
+            ) from error
+        finally:
+            memory_state["changing"] = False
+        return web.json_response({
+            "changed": True, "profile": profile.public(),
+            "warm_state": manager.warm_state,
+        })
+
+    async def create_generation(request: web.Request) -> web.Response:
+        try:
+            payload, uploads = await _read_generation_request(request)
+            if engine_state["switching"]:
+                raise ContractError("engine is switching; wait until it is ready")
+            async with engine_lock:
+                engine = active_engine(required=True)
+                if engine_state["switching"]:
+                    raise ContractError("engine is switching; wait until it is ready")
+                requested_engine = payload.get("service_family", payload.get("engine"))
+                if requested_engine in ENGINES:
+                    requested_engine = engine_family(str(requested_engine))
+                if requested_engine not in (None, "", engine):
+                    if fixed_engine is not None:
+                        raise ContractError(f"this service is fixed to the {engine} engine")
+                    raise ContractError(f"the active engine is {engine}")
+                payload.pop("engine", None)
+                payload["service_family"] = engine
+                payload.setdefault("model_variant", engine_state["default_variant"])
+                if payload.get("quality") in (None, ""):
+                    payload["quality"] = default_quality(
+                        resolve_engine(engine, str(payload["model_variant"]))
+                    )
+                # The operator's console setting is the shared default for
+                # Web, direct API and ComfyUI requests. Explicit request
+                # fields remain a deliberate one-job override.
+                payload.setdefault(
+                    "reference_image_resolution",
+                    reference_media_state["image_resolution"],
+                )
+                payload.setdefault(
+                    "reference_video_resolution",
+                    reference_media_state["video_resolution"],
+                )
+                spec = GenerationSpec.from_mapping(
+                    payload,
+                    max_duration_by_preset=(
+                        generation_limit_state["policy"].preset_limits
+                    ),
+                )
+                reference_image_roles = sorted(
+                    role for role in uploads if role.startswith("reference_image_")
+                )
+                reference_video_roles = sorted(
+                    role for role in uploads if role.startswith("reference_video_")
+                )
+                reference_audio_roles = sorted(
+                    role for role in uploads if role.startswith("reference_audio_")
+                )
+                if engine == "reference":
+                    if not reference_image_roles and not reference_video_roles and not reference_audio_roles:
+                        raise ContractError("reference engine requires at least one reference image, video or audio")
+                    if len(reference_image_roles) > MAX_REFERENCE_IMAGES:
+                        raise ContractError("reference engine accepts at most 9 reference images")
+                    if len(reference_video_roles) > MAX_REFERENCE_VIDEOS:
+                        raise ContractError("reference engine accepts at most 3 reference videos")
+                    if len(reference_audio_roles) > MAX_REFERENCE_AUDIOS:
+                        raise ContractError("reference engine accepts at most 3 reference audios")
+                    if "first_frame" in uploads or "last_frame" in uploads:
+                        raise ContractError("reference engine does not use first/last-frame anchors")
+                elif reference_image_roles or reference_video_roles or reference_audio_roles:
+                    raise ContractError("reference media require the Ref2VA engine")
+                try:
+                    validate_workload_for_profile(
+                        memory_state["profile"], width=spec.width,
+                        height=spec.height, frames=spec.frames,
+                    )
+                except ValueError as error:
+                    raise ContractError(str(error)) from error
+                job = await service.submit(spec, uploads)
+        except (ContractError, json.JSONDecodeError) as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
+        return web.json_response(service.serialize(job), status=202)
+
+    async def enhance_prompt(request: web.Request) -> web.Response:
+        try:
+            if request.content_type == "application/x-www-form-urlencoded":
+                form = await request.post()
+                payload, uploads = {str(key): str(value) for key, value in form.items()}, {}
+            else:
+                payload, uploads = await _read_generation_request(request)
+            enhancement = parse_enhancement_request(str(payload.get("storyboard", "")))
+            images = []
+            for field_name, label in (("first_frame", "opening frame"),
+                                      ("last_frame", "ending frame")):
+                uploaded = uploads.get(field_name)
+                if uploaded is None:
+                    continue
+                _, content = uploaded
+                images.append((label, _image_mime(content, field_name), content))
+            for index, field_name in enumerate(sorted(
+                name for name in uploads if name.startswith("reference_image_")
+            ), start=1):
+                _, content = uploads[field_name]
+                images.append((
+                    f"<Picture {index}>",
+                    _image_mime(content, field_name),
+                    content,
+                ))
+            audios = []
+            for index, field_name in enumerate(sorted(
+                name for name in uploads if name.startswith("reference_audio_")
+            ), start=1):
+                filename, content = uploads[field_name]
+                audios.append((
+                    f"<Audio {index}>",
+                    _audio_mime(filename, content, field_name),
+                    content,
+                ))
+            videos = []
+            for index, field_name in enumerate(sorted(
+                name for name in uploads if name.startswith("reference_video_")
+            ), start=1):
+                filename, content = uploads[field_name]
+                videos.append((
+                    f"<Video {index}>",
+                    _video_mime(filename, content, field_name),
+                    content,
+                ))
+            has_first = "first_frame" in uploads
+            has_last = "last_frame" in uploads
+            condition_mode = (
+                "REF2VA" if active_engine() in ("reference", "reference_lora") else
+                "FL2VA" if has_first and has_last else
+                "I2VA" if has_first else
+                "L2VA" if has_last else
+                "T2VA"
+            )
+            # The active launcher and uploaded media define the H3 mode.
+            # Image anchors and Ref2VA reference images are intentionally sent
+            # to MiMo so enhancement can describe the supplied visual identity.
+            enhancement = dataclasses.replace(
+                enhancement, condition_mode=condition_mode
+            )
+            if condition_mode == "REF2VA":
+                actual_counts = {
+                    "picture": sum(name.startswith("reference_image_") for name in uploads),
+                    "video": sum(name.startswith("reference_video_") for name in uploads),
+                    "audio": sum(name.startswith("reference_audio_") for name in uploads),
+                }
+                if not sum(actual_counts.values()):
+                    raise ContractError(
+                        "reference prompt polishing requires uploaded reference media; "
+                        "browser refreshes do not preserve local file inputs"
+                    )
+                metadata_counts = {
+                    kind: sum(
+                        item["kind"] == media_kind
+                        for item in enhancement.reference_media
+                    )
+                    for kind, media_kind in (
+                        ("picture", "image"), ("video", "video"), ("audio", "audio")
+                    )
+                }
+                if metadata_counts != actual_counts:
+                    raise ContractError(
+                        "reference-media metadata does not match the uploaded files; "
+                        "remove and add the reference files again"
+                    )
+                reference_text = "\n".join((
+                    "\n".join(item["prompt"] for item in enhancement.shots),
+                    json.dumps(enhancement.reference_protocol or {}, ensure_ascii=False),
+                    json.dumps(enhancement.soundtrack or {}, ensure_ascii=False),
+                ))
+                for kind, raw_index in re.findall(
+                    r"<(Picture|Video|Audio)\s+(\d+)>", reference_text, re.IGNORECASE
+                ):
+                    index = int(raw_index)
+                    if index < 1 or index > actual_counts[kind.lower()]:
+                        raise ContractError(
+                            f"<{kind} {index}> has no matching uploaded reference file"
+                        )
+            mimo_key = (
+                request.headers.get("X-MiMo-API-Key", "").strip()
+                or mimo_key_state["value"]
+            )
+            result = await enhancer.enhance(
+                api_key=mimo_key, request=enhancement,
+                images=tuple(images), videos=tuple(videos), audios=tuple(audios),
+            )
+        except (ContractError, json.JSONDecodeError) as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
+        except RuntimeError as error:
+            raise web.HTTPBadGateway(text=str(error)) from error
+        return web.json_response(result)
+
+    async def get_mimo_key_status(_request: web.Request) -> web.Response:
+        return web.json_response({"configured": bool(mimo_key_state["value"])})
+
+    async def configure_mimo_key(request: web.Request) -> web.Response:
+        try:
+            document = await request.json()
+        except (json.JSONDecodeError, ValueError) as error:
+            raise web.HTTPBadRequest(text="request body must be JSON") from error
+        if not isinstance(document, dict):
+            raise web.HTTPBadRequest(text="request body must be an object")
+        value = str(document.get("api_key", "")).strip()
+        if len(value) > 4096:
+            raise web.HTTPBadRequest(text="MiMo API key is too long")
+        try:
+            _persist_mimo_key(paths.data_dir, value)
+        except OSError as error:
+            raise web.HTTPInternalServerError(
+                text="failed to save MiMo API key"
+            ) from error
+        mimo_key_state["value"] = value
+        return web.json_response({"configured": bool(value)})
+
+    async def get_reference_media_settings(_request: web.Request) -> web.Response:
+        return web.json_response({
+            **reference_media_state,
+            "levels": list(REFERENCE_MEDIA_RESOLUTIONS),
+            "preserve_aspect_ratio": True,
+            "preserve_composition": True,
+            "preserve_duration": True,
+            "crop": False,
+            "stretch": False,
+            "pad_user_media": False,
+            "upscale_small_inputs": False,
+            "internal_vae_alignment": "private_replicated_edge_padding_to_32px",
+        })
+
+    async def configure_reference_media_settings(
+        request: web.Request,
+    ) -> web.Response:
+        try:
+            document = await request.json()
+        except (json.JSONDecodeError, ValueError) as error:
+            raise web.HTTPBadRequest(text="request body must be JSON") from error
+        if not isinstance(document, dict):
+            raise web.HTTPBadRequest(text="request body must be an object")
+        image_resolution = str(
+            document.get("image_resolution", reference_media_state["image_resolution"])
+        ).strip().lower()
+        video_resolution = str(
+            document.get("video_resolution", reference_media_state["video_resolution"])
+        ).strip().lower()
+        if image_resolution not in REFERENCE_MEDIA_RESOLUTIONS:
+            raise web.HTTPBadRequest(
+                text="image_resolution must be original, 360p, 480p or 720p"
+            )
+        if video_resolution not in REFERENCE_MEDIA_RESOLUTIONS:
+            raise web.HTTPBadRequest(
+                text="video_resolution must be original, 360p, 480p or 720p"
+            )
+        updated = {
+            "image_resolution": image_resolution,
+            "video_resolution": video_resolution,
+        }
+        try:
+            _persist_reference_media_settings(paths.data_dir, updated)
+        except OSError as error:
+            raise web.HTTPInternalServerError(
+                text="failed to save reference-media settings"
+            ) from error
+        reference_media_state.update(updated)
+        return await get_reference_media_settings(request)
+
+    async def get_generation_limit_settings(_request: web.Request) -> web.Response:
+        document = generation_limit_state["policy"].public(
+            generation_limit_state["detected_vram_gib"]
+        )
+        return web.json_response(document)
+
+    async def configure_generation_limit_settings(
+        request: web.Request,
+    ) -> web.Response:
+        try:
+            document = await request.json()
+        except (json.JSONDecodeError, ValueError) as error:
+            raise web.HTTPBadRequest(text="request body must be JSON") from error
+        if not isinstance(document, dict):
+            raise web.HTTPBadRequest(text="request body must be an object")
+        try:
+            policy = GenerationLimitPolicy(
+                preset_limits=document.get("preset_limits"),
+            )
+            persist_generation_limit_policy(paths.data_dir, policy)
+        except (TypeError, ValueError) as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
+        except OSError as error:
+            raise web.HTTPInternalServerError(
+                text="failed to save generation-limit settings"
+            ) from error
+        generation_limit_state["policy"] = policy
+        # Refresh on save so a changed GPU/driver does not require restart.
+        generation_limit_state["detected_vram_gib"] = detect_gpu_vram_gib()
+        return await get_generation_limit_settings(request)
+
+    async def list_jobs(request: web.Request) -> web.Response:
+        try:
+            limit = min(100, max(1, int(request.query.get("limit", "30"))))
+        except ValueError as error:
+            raise web.HTTPBadRequest(text="limit must be an integer") from error
+        running = sorted(
+            (
+                job for job in service.jobs.values()
+                if job.status in {"starting_backend", "running", "awaiting_preview"}
+            ),
+            key=lambda job: job.created_at,
+        )
+        queued = [
+            service.jobs[job_id]
+            for job_id in service.pending
+            if job_id in service.jobs
+        ]
+        history = sorted(
+            (
+                job for job in service.jobs.values()
+                if job.status not in {"queued", "starting_backend", "running", "awaiting_preview"}
+            ),
+            key=lambda job: job.created_at,
+            reverse=True,
+        )
+        jobs = (running + queued + history)[:limit]
+        return web.json_response({"jobs": [service.serialize(job) for job in jobs]})
+
+    async def reorder_jobs(request: web.Request) -> web.Response:
+        try:
+            document = await request.json()
+            ordered_ids = document.get("job_ids") if isinstance(document, dict) else None
+            if not isinstance(ordered_ids, list) or not all(
+                isinstance(item, str) for item in ordered_ids
+            ):
+                raise ContractError("job_ids must be a JSON string array")
+            await service.reorder(ordered_ids)
+        except (ContractError, json.JSONDecodeError) as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
+        return web.json_response({"job_ids": list(service.pending)})
+
+    def require_job(request: web.Request) -> JobRecord:
+        job = service.jobs.get(request.match_info["job_id"])
+        if job is None:
+            raise web.HTTPNotFound(text="job not found")
+        return job
+
+    async def get_job(request: web.Request) -> web.Response:
+        return web.json_response(service.serialize(require_job(request)))
+
+    async def cancel_job(request: web.Request) -> web.Response:
+        job = require_job(request)
+        await service.cancel(job.id)
+        return web.json_response(service.serialize(job))
+
+    async def resume_job(request: web.Request) -> web.Response:
+        job = require_job(request)
+        engine = active_engine()
+        if engine is None:
+            raise web.HTTPConflict(
+                text="select and finish loading a service family before resuming"
+            )
+        if job.spec.service_family != engine:
+            raise web.HTTPConflict(
+                text=(
+                    "the checkpoint belongs to the "
+                    f"{job.spec.service_family} service family; switch back before resuming"
+                )
+            )
+        try:
+            await service.resume(job.id)
+        except ContractError as error:
+            raise web.HTTPConflict(text=str(error)) from error
+        return web.json_response(service.serialize(job), status=202)
+
+    async def decide_preview(request: web.Request) -> web.Response:
+        job = require_job(request)
+        decision = request.match_info["decision"]
+        try:
+            await service.decide_preview(job.id, decision)
+        except ContractError as error:
+            raise web.HTTPConflict(text=str(error)) from error
+        return web.json_response(service.serialize(job))
+
+    async def get_preview(request: web.Request) -> web.StreamResponse:
+        job = require_job(request)
+        if job.preview_path is None or not job.preview_path.is_file():
+            raise web.HTTPConflict(text="preview is not ready")
+        return web.FileResponse(
+            job.preview_path,
+            headers={"Content-Disposition": f'inline; filename="{job.preview_path.name}"'},
+        )
+
+    async def delete_job(request: web.Request) -> web.Response:
+        job = require_job(request)
+        try:
+            deletion = await service.delete(job.id)
+        except ContractError as error:
+            raise web.HTTPConflict(text=str(error)) from error
+        return web.json_response({"deleted": True, "id": job.id, **deletion})
+
+    async def get_video(request: web.Request) -> web.StreamResponse:
+        job = require_job(request)
+        if job.status != "succeeded" or job.output_path is None:
+            raise web.HTTPConflict(text="video is not ready")
+        return web.FileResponse(
+            job.output_path,
+            headers={"Content-Disposition": f'inline; filename="{job.output_path.name}"'},
+        )
+
+    async def on_startup(_: web.Application) -> None:
+        await service.start(fixed_engine, preload=preload)
+        # FlashVSR is loaded into the isolated daemon's CPU memory only. This
+        # overlaps disk/model construction with normal service startup without
+        # taking GPU ownership away from H3.
+        if (
+            preload
+            and memory_state["profile"].preload_upscaler
+            and hasattr(video_upscaler, "start")
+        ):
+            async def preload_upscaler() -> None:
+                try:
+                    # Prioritise the generation engine and avoid competing for
+                    # disk/RAM bandwidth during its initial weight load.
+                    if service.warmup_task is not None:
+                        await service.warmup_task
+                    await video_upscaler.start()
+                except Exception:
+                    # Upscaling is optional. Keep H3 generation available and
+                    # expose the failure through /healthz and the daemon log.
+                    pass
+
+            app["flashvsr_preload_task"] = asyncio.create_task(
+                preload_upscaler(), name="flashvsr-cpu-preload"
+            )
+
+    async def on_cleanup(_: web.Application) -> None:
+        task = app.get("flashvsr_preload_task")
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await service.close()
+
+    app.router.add_get("/", index)
+    app.router.add_get("/openapi.json", openapi)
+    app.router.add_static("/static", serve_dir / "static", show_index=False)
+    app.router.add_get("/healthz", health)
+    app.router.add_get("/readyz", readiness)
+    app.router.add_get("/api/v1/options", options)
+    app.router.add_get("/api/v1/resources", resources)
+    app.router.add_get("/api/v1/models", models)
+    app.router.add_get("/api/v1/workspace/browse", browse_workspace)
+    app.router.add_put("/api/v1/workspace", select_workspace)
+    app.router.add_put("/api/v1/engine", select_engine)
+    app.router.add_delete("/api/v1/engine", exit_engine)
+    app.router.add_put("/api/v1/memory-profile", change_memory_profile)
+    app.router.add_post("/api/v1/generations", create_generation)
+    # MiMo polishing is a Web Studio authoring tool, not part of the public
+    # generation API contract. REST/ComfyUI clients submit one final prompt.
+    app.router.add_post("/studio/prompt-enhancements", enhance_prompt)
+    app.router.add_get("/api/v1/settings/mimo-key", get_mimo_key_status)
+    app.router.add_put("/api/v1/settings/mimo-key", configure_mimo_key)
+    app.router.add_get(
+        "/api/v1/settings/reference-media", get_reference_media_settings
+    )
+    app.router.add_put(
+        "/api/v1/settings/reference-media", configure_reference_media_settings
+    )
+    app.router.add_get(
+        "/api/v1/settings/generation-limits", get_generation_limit_settings
+    )
+    app.router.add_put(
+        "/api/v1/settings/generation-limits", configure_generation_limit_settings
+    )
+    app.router.add_get("/api/v1/jobs", list_jobs)
+    app.router.add_put("/api/v1/jobs/order", reorder_jobs)
+    app.router.add_get("/api/v1/jobs/{job_id}", get_job)
+    app.router.add_delete("/api/v1/jobs/{job_id}", cancel_job)
+    app.router.add_post("/api/v1/jobs/{job_id}/resume", resume_job)
+    app.router.add_post("/api/v1/jobs/{job_id}/preview/{decision}", decide_preview)
+    app.router.add_get("/api/v1/jobs/{job_id}/preview", get_preview)
+    app.router.add_delete("/api/v1/jobs/{job_id}/record", delete_job)
+    app.router.add_get("/api/v1/jobs/{job_id}/video", get_video)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    return app
+
+
+def parse_args() -> argparse.Namespace:
+    serve_dir = Path(__file__).resolve().parents[1]
+    parser = argparse.ArgumentParser(description="H3 4090 accelerated video service")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8090)
+    parser.add_argument(
+        "--engine",
+        choices=(*SERVICE_FAMILIES, *ENGINES),
+        default=os.environ.get("H3_SERVE_ENGINE", "first_last"),
+        help="fix this process to one model family (legacy route aliases are accepted)",
+    )
+    parser.add_argument(
+        "--unified-console",
+        action="store_true",
+        help="start idle and let the operator enter/exit one engine from the Web console",
+    )
+    parser.add_argument("--release-root", type=Path, default=serve_dir)
+    parser.add_argument("--data-dir", type=Path, default=serve_dir / "data")
+    parser.add_argument("--api-key", default=os.environ.get("H3_SERVE_API_KEY"))
+    parser.add_argument("--max-queued-jobs", type=int, default=32)
+    parser.add_argument(
+        "--memory-profile",
+        choices=("auto", *HOST_MEMORY_PROFILES),
+        default=os.environ.get("H3_SERVE_MEMORY_PROFILE", "auto"),
+        help="host-RAM residency policy; auto selects the fastest safe tier",
+    )
+    parser.add_argument(
+        "--lazy-load",
+        action="store_true",
+        help="defer fixed-engine model construction until the first job",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    serve_dir = Path(__file__).resolve().parents[1]
+    pid_file_value = os.environ.get("H3_SERVE_PID_FILE")
+
+    def remove_own_pid_file() -> None:
+        if not pid_file_value:
+            return
+        pid_file = Path(pid_file_value)
+        try:
+            if pid_file.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                pid_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    atexit.register(remove_own_pid_file)
+    if args.host not in {"127.0.0.1", "localhost", "::1"} and not args.api_key:
+        raise SystemExit("H3_SERVE_API_KEY is required when listening beyond localhost")
+    # Reserve the listening endpoint before constructing the application.
+    # Application startup launches the large model preload in a worker thread;
+    # discovering EADDRINUSE afterwards leaves Python waiting for that thread
+    # and CUDA pinned-memory finalizers, which makes Ctrl-C appear ineffective.
+    family = socket.AF_INET6 if ":" in args.host else socket.AF_INET
+    listen_socket = socket.socket(family, socket.SOCK_STREAM)
+    listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        listen_socket.bind((args.host, args.port))
+        listen_socket.listen(128)
+        listen_socket.setblocking(False)
+    except OSError as error:
+        listen_socket.close()
+        if error.errno == errno.EADDRINUSE:
+            raise SystemExit(
+                f"Port {args.port} is already in use. Stop the existing service, "
+                f"or start this one with H3_SERVE_PORT={args.port + 1}."
+            ) from None
+        raise
+    paths = ServicePaths.defaults(args.release_root, data_dir=args.data_dir)
+    memory_status = detect_host_memory()
+    try:
+        memory_profile = resolve_host_memory_profile(
+            args.memory_profile, memory_status
+        )
+    except (RuntimeError, ValueError) as error:
+        raise SystemExit(str(error)) from error
+    print(
+        f"Host memory profile: {memory_profile.label} "
+        f"(effective {memory_status.effective_limit_gib:.1f} GiB, "
+        f"available {memory_status.available_gib:.1f} GiB)",
+        flush=True,
+    )
+    try:
+        app = create_app(
+            paths=paths,
+            serve_dir=serve_dir,
+            api_key=args.api_key,
+            max_queued_jobs=args.max_queued_jobs,
+            fixed_engine=None if args.unified_console else args.engine,
+            preload=False if args.unified_console else not args.lazy_load,
+            memory_profile=memory_profile,
+        )
+        web.run_app(app, sock=listen_socket)
+    finally:
+        listen_socket.close()
+
+
+if __name__ == "__main__":
+    main()
