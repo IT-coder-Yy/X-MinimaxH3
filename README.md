@@ -1,8 +1,66 @@
 # X-MinimaxH3
 
-面向单张 RTX 4090 的 MiniMax H3 本地音视频生成工具。
+MiniMax H3 本地音视频生成与推理加速框架。
 
-> 当前发布的是 **RTX 4090 尝鲜版**。面向其他显卡型号的通用版本正在开发中。
+本项目在 NVIDIA RTX 4090 24GB 上完成开发、测试和针对性调优。
+
+## 效果对比
+
+下面是两组完整样片的轻量动态预览，不展示提示词；点击预览可以播放带原声的完整
+MP4。测试平台数据均为 RTX 4090 24GB 上测得的端到端时间，包含模型加载完成后的
+推理、解码与成片封装；加速指数越高，框架采用的加速策略越积极。官方未公开的数据
+不作推测。
+
+<table>
+  <tr>
+    <td width="33.33%" align="center">
+      <strong>T2V · 官方</strong><br><br>
+      <a href="assets/comparison/fl2va-official.mp4"><img src="assets/comparison/fl2va-official.webp" width="100%" alt="T2V 官方生成效果"></a><br>
+      <sub>1344×768 · 成片 8 秒<br>推理步数 / 生成耗时：官方未公开</sub>
+    </td>
+    <td width="33.33%" align="center">
+      <strong>T2V · 测试平台 · INT8 加速</strong><br><br>
+      <a href="assets/comparison/fl2va-base.mp4"><img src="assets/comparison/fl2va-base.webp" width="100%" alt="T2V X-MinimaxH3 INT8 生成效果"></a><br>
+      <sub>1920×1088 · 20 步<br>加速指数 75 · 端到端 499 秒</sub>
+    </td>
+    <td width="33.33%" align="center">
+      <strong>T2V · 测试平台 · LoRA 加速</strong><br><br>
+      <a href="assets/comparison/fl2va-lora.mp4"><img src="assets/comparison/fl2va-lora.webp" width="100%" alt="T2V X-MinimaxH3 LoRA 生成效果"></a><br>
+      <sub>1920×1088 · 7 步<br>加速指数 40 · 端到端 350 秒</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="33.33%" align="center">
+      <strong>Ref2VA · 官方</strong><br><br>
+      <a href="assets/comparison/ref-official.mp4"><img src="assets/comparison/ref-official.webp" width="100%" alt="Ref2VA 官方生成效果"></a><br>
+      <sub>1024×768 · 成片 10 秒<br>推理步数 / 生成耗时：官方未公开</sub>
+    </td>
+    <td width="33.33%" align="center">
+      <strong>Ref2VA · 测试平台 · INT8 加速</strong><br><br>
+      <a href="assets/comparison/ref-base.mp4"><img src="assets/comparison/ref-base.webp" width="100%" alt="Ref2VA X-MinimaxH3 INT8 生成效果"></a><br>
+      <sub>1440×1088 · 20 步<br>加速指数 75 · 端到端 544 秒</sub>
+    </td>
+    <td width="33.33%" align="center">
+      <strong>Ref2VA · 测试平台 · LoRA 加速</strong><br><br>
+      <a href="assets/comparison/ref-lora.mp4"><img src="assets/comparison/ref-lora.webp" width="100%" alt="Ref2VA X-MinimaxH3 LoRA 生成效果"></a><br>
+      <sub>1440×1088 · 7 步<br>加速指数 40 · 端到端 373 秒</sub>
+    </td>
+  </tr>
+</table>
+
+## 视频教程
+
+<p align="center">
+  <a href="https://www.bilibili.com/video/BV1Fn8q6JEhX/">
+    <img src="assets/tutorial/bilibili-quick-guide.jpg" width="860" alt="让你的 MiniMax H3 快如闪电——X-MinimaxH3 简易教程">
+  </a>
+</p>
+
+<p align="center">
+  <strong>▶ 让你的 MiniMax H3 快如闪电</strong><br>
+  <sub>项目部署与使用简易教程 · 约 20 分钟 · BV1Fn8q6JEhX</sub><br>
+  <a href="https://www.bilibili.com/video/BV1Fn8q6JEhX/">前往哔哩哔哩观看完整视频</a>
+</p>
 
 ## 交流与反馈
 
@@ -23,14 +81,21 @@
 - Web UI、REST API 和 ComfyUI
 - 可选 FlashVSR 超分
 
+## 用户文档
+
+第一次使用请从 [《X-MinimaxH3 用户手册》](docs/USER_GUIDE.md) 开始。手册按实际
+操作顺序说明 Windows/Linux 安装、启动控制台、选择服务、Web 创作、ComfyUI 接入、
+REST API 提交与下载，以及常见错误排查。
+
 ## 运行要求
 
-- NVIDIA RTX 4090 24GB
+- NVIDIA CUDA 显卡；当前开发、测试和调优平台为 RTX 4090 24GB
 - 64GB 内存起步，推荐 96GB 以上
 - 至少 120GB 可用磁盘
 - Linux x86_64，或 Windows 11 + WSL2
 
-当前预编译加速扩展只验证了 RTX 4090（SM89）。Windows 原生 CUDA 暂不支持。
+当前预编译加速扩展在 RTX 4090（SM89）上完成验证，其他显卡型号尚未完成兼容性
+验证。Windows 原生 CUDA 暂不支持。
 
 ## Windows 安装
 
@@ -96,6 +161,7 @@ SHA-256 校验。
 - Web UI：<http://127.0.0.1:8090>
 - API 合同：<http://127.0.0.1:8090/openapi.json>
 - ComfyUI 安装：[integrations/comfyui/README.md](integrations/comfyui/README.md)
+- 完整用户手册：[docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 
 工作空间保存上传素材、任务记录、断点和生成视频。默认位置为
 `workspace/default`，也可以在 Web UI 中选择其他目录。

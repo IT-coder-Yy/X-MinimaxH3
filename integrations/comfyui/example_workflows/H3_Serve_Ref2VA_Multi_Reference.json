@@ -39,7 +39,7 @@
       "properties": {"Node name for S&R": "LoadImage"}, "widgets_values": [""], "title": "④ Picture 2"
     },
     {
-      "id": 7, "type": "PrimitiveStringMultiline", "pos": [420, 820], "size": [520, 250],
+      "id": 7, "type": "PrimitiveStringMultiline", "pos": [420, 1080], "size": [640, 320],
       "flags": {}, "order": 3, "mode": 0,
       "inputs": [
         {"name": "value", "type": "STRING", "link": null, "widget": {"name": "value"}}
@@ -54,7 +54,7 @@
       "title": "⑤ Ref2VA 提示词"
     },
     {
-      "id": 6, "type": "H3ServeRef2VAPresetGenerate", "pos": [420, 160], "size": [520, 620],
+      "id": 6, "type": "H3ServeRef2VAPresetGenerate", "pos": [420, 160], "size": [640, 860],
       "flags": {}, "order": 4, "mode": 0,
       "inputs": [
         {"name": "连接", "type": "H3_SERVE_CONNECTION", "link": 1},

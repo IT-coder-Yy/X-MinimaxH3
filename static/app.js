@@ -729,7 +729,7 @@ function renderShots() {
     const start = cursor; const end = cursor + Number(shot.duration_seconds || 0); cursor = end;
     return `<article class="shot-card" data-shot-id="${escapeHtml(shot.id)}">
       <header><div><span class="shot-number">SHOT ${index + 1}</span><strong>${timecode(start)} → ${timecode(end)}</strong></div><div class="shot-header-actions"><label class="shot-duration"><span>镜头时长</span><input aria-label="持续时间（秒）" type="range" min="0.5" max="${currentMaxDuration()}" step="0.5" value="${Number(shot.duration_seconds)}"><output>${Number(shot.duration_seconds).toFixed(1)} 秒</output></label><div class="shot-actions"><button type="button" data-shot-up title="上移" ${index === 0 ? 'disabled' : ''}>↑</button><button type="button" data-shot-down title="下移" ${index === shots.length - 1 ? 'disabled' : ''}>↓</button><button type="button" data-shot-remove title="删除" ${shots.length === 1 ? 'disabled' : ''}>×</button></div></div></header>
-      <div class="shot-prompt"><textarea rows="5" maxlength="6000" required aria-label="SHOT ${index + 1} 镜头内容" placeholder="${escapeHtml(promptPlaceholder)}">${escapeHtml(shot.prompt)}</textarea><div class="reference-mention-menu" hidden></div></div>
+      <div class="shot-prompt"><textarea rows="5" maxlength="6000" aria-label="SHOT ${index + 1} 镜头内容" placeholder="${escapeHtml(promptPlaceholder)}">${escapeHtml(shot.prompt)}</textarea><div class="reference-mention-menu" hidden></div></div>
     </article>`;
   }).join('');
   $$('#shotList .shot-card').forEach((card, index) => {

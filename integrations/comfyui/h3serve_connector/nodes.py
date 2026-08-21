@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import wave
 from pathlib import Path
@@ -38,6 +39,16 @@ PRESET_ASPECT_RATIOS = {
     "16:9": (16, 9), "9:16": (9, 16),
 }
 MAX_NATIVE_PIXEL_FRAMES = 1920 * 1088 * 192
+
+
+def _acceleration_value(value: Any) -> float:
+    """Normalize corrupt values from older positionally serialized workflows."""
+
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
 
 
 def _nearest_32(value: float) -> int:
@@ -330,6 +341,100 @@ def _download_job_video(connection, job_id: str, *, preview: bool):
     )
 
 
+def _interactive_checkpoint_output(connection, job_id: str, document: dict[str, Any], *,
+                                   resumed: bool = False):
+    """Expose a stopped formal checkpoint as the creator node's preview output."""
+
+    import folder_paths
+    from comfy_api.latest import InputImpl, io as comfy_io, ui as comfy_ui
+
+    status = str(document.get("status") or "")
+    output_dir = Path(folder_paths.get_output_directory()) / "h3_serve"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ui_results = []
+    final_video = None
+    preview_video = None
+    client = _client(connection)
+
+    if status == "succeeded":
+        final_path = output_dir / f"{job_id}-final.mp4"
+        client.download(job_id, final_path)
+        final_video = InputImpl.VideoFromFile(str(final_path))
+        ui_results.append(
+            comfy_ui.SavedResult(final_path.name, "h3_serve", comfy_io.FolderType.output)
+        )
+        if resumed:
+            try:
+                preview_path = output_dir / f"{job_id}-preview.mp4"
+                client.download_preview(job_id, preview_path)
+                preview_video = InputImpl.VideoFromFile(str(preview_path))
+            except H3ServeError:
+                preview_video = None
+    elif status == "checkpointed":
+        preview_path = output_dir / f"{job_id}-preview.mp4"
+        client.download_preview(job_id, preview_path)
+        preview_video = InputImpl.VideoFromFile(str(preview_path))
+        ui_results.append(
+            comfy_ui.SavedResult(preview_path.name, "h3_serve", comfy_io.FolderType.output)
+        )
+    else:
+        raise H3ServeError(f"断点任务意外停止在状态：{status or 'unknown'}")
+
+    ui_payload = comfy_ui.PreviewVideo(ui_results).as_dict() if ui_results else {}
+    ui_payload["h3_checkpoint"] = [{
+        "job_id": job_id,
+        "status": status,
+        "resume_available": bool(
+            (document.get("checkpoint") or {}).get("resume_available")
+        ),
+    }]
+    return comfy_io.NodeOutput(final_video, preview_video, ui=ui_payload)
+
+
+def _run_interactive_checkpoint(connection, fields, *, first_frame=None,
+                                last_frame=None, references=None):
+    job_id, details = _wait_for_checkpoint(
+        connection, fields, first_frame=first_frame, last_frame=last_frame,
+        references=references,
+    )
+    return _interactive_checkpoint_output(
+        connection, job_id, json.loads(details), resumed=False,
+    )
+
+
+def _resume_interactive_checkpoint(connection, job_id: str):
+    import comfy.model_management
+    import comfy.utils
+
+    client = _client(connection)
+    client.resume(job_id)
+    pbar = comfy.utils.ProgressBar(100)
+    completed = client.wait(
+        job_id,
+        poll_seconds=float(connection["poll_seconds"]),
+        progress=lambda document: pbar.update_absolute(
+            round(float(document.get("progress", {}).get("percent") or 0)), 100
+        ),
+        cancel_check=comfy.model_management.throw_exception_if_processing_interrupted,
+    )
+    pbar.update_absolute(100, 100)
+    return _interactive_checkpoint_output(
+        connection, job_id, completed, resumed=True,
+    )
+
+
+def _discard_interactive_checkpoint(connection, job_id: str):
+    from comfy_api.latest import io as comfy_io
+
+    _client(connection).delete_record(job_id)
+    return comfy_io.NodeOutput(
+        None, None,
+        ui={"h3_checkpoint": [{
+            "job_id": "", "status": "reset", "resume_available": False,
+        }]},
+    )
+
+
 class _H3ServeCheckpointSubmitBase:
     RAW_PROMPT = False
 
@@ -388,7 +493,7 @@ class _H3ServeCheckpointSubmitBase:
             "duration_seconds": duration_seconds,
             "model_variant": variant,
             "sampling_steps": int(sampling_steps),
-            "acceleration": float(acceleration),
+            "acceleration": _acceleration_value(acceleration),
             "seed": seed,
             "execution_mode": "checkpoint",
             "checkpoint_step": checkpoint_step,
@@ -585,6 +690,14 @@ class H3ServePresetGenerate:
             raise H3ServeError(
                 f"{model_variant} 的总采样步数必须在 {lower}–{upper} 之间"
             )
+        checkpoint_job_id = str(kwargs.get("断点任务ID") or "").strip()
+        checkpoint_action = str(kwargs.get("断点动作") or "新建任务")
+        if preview_mode == "开启" and checkpoint_job_id:
+            if checkpoint_action == "继续生成":
+                return _resume_interactive_checkpoint(连接, checkpoint_job_id)
+            if checkpoint_action == "放弃生成":
+                return _discard_interactive_checkpoint(连接, checkpoint_job_id)
+            raise H3ServeError("断点任务正在等待选择：请点击继续生成或放弃生成")
         fields = {
             "mode": "preset", "prompt": (
                 prompt if self.RAW_PROMPT
@@ -594,20 +707,21 @@ class H3ServePresetGenerate:
             "duration_seconds": duration_seconds, "seed": seed,
             "upscale_enabled": upscale != "关闭",
             "sampling_steps": int(sampling_steps),
-            "acceleration": float(acceleration),
+            "acceleration": _acceleration_value(acceleration),
             "model_variant": variant,
-            "preview_mode": (
-                "auto" if preview_mode == "开启" else PREVIEW_MODES[preview_mode]
-            ),
+            "preview_mode": "off" if preview_mode == "开启" else PREVIEW_MODES[preview_mode],
         }
         if preview_mode == "开启":
             preview_step = int(kwargs.get("预览位置", 6))
             if not 1 <= preview_step < int(sampling_steps):
                 raise H3ServeError("预览位置必须大于0且小于总采样步数")
             fields.update({
-                # The service uses a zero-based evaluation index; the UI
-                # counts completed formal steps from one.
-                "preview_step_index": preview_step - 1,
+                # Stop the formal trajectory and release the worker. This is
+                # deliberately not the old auto-continue preview branch.
+                "execution_mode": "checkpoint",
+                "checkpoint_step": preview_step,
+                "checkpoint_retain": True,
+                "checkpoint_preview": True,
                 "checkpoint_preview_resolution": {
                     "原分辨率": "source", "360p": "360p",
                     "480p": "480p", "720p": "720p",
@@ -615,7 +729,6 @@ class H3ServePresetGenerate:
                 "checkpoint_preview_steps": int(
                     kwargs.get("LoRA预览步数", 4)
                 ),
-                "preview_fast_finish": True,
             })
         if upscale != "关闭":
             fields.update({
@@ -623,9 +736,16 @@ class H3ServePresetGenerate:
                 "upscale_resolution": "2k" if upscale == "2K" else upscale,
             })
         _add_reference_resolution_fields(fields, kwargs)
-        return _run(连接, fields, first_frame=first_frame, last_frame=last_frame,
-                    references=kwargs.get("参考素材") or _direct_references(kwargs),
-                    expose_preview_output=self.EXPOSE_PREVIEW_OUTPUT)
+        references = kwargs.get("参考素材") or _direct_references(kwargs)
+        if preview_mode == "开启":
+            return _run_interactive_checkpoint(
+                连接, fields, first_frame=first_frame, last_frame=last_frame,
+                references=references,
+            )
+        return _run(
+            连接, fields, first_frame=first_frame, last_frame=last_frame,
+            references=references, expose_preview_output=self.EXPOSE_PREVIEW_OUTPUT,
+        )
 
 
 class H3ServeAdvancedGenerate:
@@ -677,7 +797,7 @@ class H3ServeAdvancedGenerate:
             ),
             "width": width, "height": height, "duration_seconds": duration_seconds,
             "sampling_steps": int(sampling_steps),
-            "acceleration": float(acceleration),
+            "acceleration": _acceleration_value(acceleration),
             "seed": seed, "upscale_enabled": upscale != "关闭",
             "model_variant": variant,
             "preview_mode": PREVIEW_MODES[preview_mode],
@@ -716,6 +836,13 @@ def _interactive_preset_schema(schema: dict[str, Any]) -> dict[str, Any]:
             )
         else:
             ordered[name] = field
+    # Append internal state after every existing widget so older saved
+    # workflows keep their positional widget values intact.
+    ordered["断点任务ID"] = ("STRING", {"default": ""})
+    ordered["断点动作"] = (
+        ["新建任务", "等待选择", "继续生成", "放弃生成"],
+        {"default": "新建任务"},
+    )
     schema["required"] = ordered
     return schema
 

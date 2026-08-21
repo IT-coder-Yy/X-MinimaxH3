@@ -95,6 +95,11 @@ class H3ServeClient:
             body=b"", content_type="application/json",
         )
 
+    def delete_record(self, job_id: str) -> dict[str, Any]:
+        """Discard a stopped job and its retained checkpoint/preview files."""
+
+        return self._request("DELETE", f"/api/v1/jobs/{job_id}/record")
+
     def download_preview(self, job_id: str, destination: Path) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_suffix(destination.suffix + ".part")

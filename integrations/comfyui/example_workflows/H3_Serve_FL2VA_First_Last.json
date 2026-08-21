@@ -39,7 +39,7 @@
       "properties": {"Node name for S&R": "LoadImage"}, "widgets_values": [""], "title": "③ 选择尾帧"
     },
     {
-      "id": 5, "type": "PrimitiveStringMultiline", "pos": [500, 720], "size": [520, 250],
+      "id": 5, "type": "PrimitiveStringMultiline", "pos": [500, 900], "size": [640, 320],
       "flags": {}, "order": 3, "mode": 0,
       "inputs": [
         {"name": "value", "type": "STRING", "link": null, "widget": {"name": "value"}}
@@ -54,7 +54,7 @@
       "title": "FL2VA 提示词"
     },
     {
-      "id": 4, "type": "H3ServeFL2VAPresetGenerate", "pos": [500, 130], "size": [520, 500],
+      "id": 4, "type": "H3ServeFL2VAPresetGenerate", "pos": [500, 130], "size": [640, 720],
       "flags": {}, "order": 4, "mode": 0,
       "inputs": [
         {"name": "连接", "type": "H3_SERVE_CONNECTION", "link": 1},

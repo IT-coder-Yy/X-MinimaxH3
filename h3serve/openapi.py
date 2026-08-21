@@ -166,6 +166,35 @@ def document(version: str) -> dict[str, Any]:
                     "responses": {"200": {"description": "Workspace selected"}, "409": {"description": "Engine or queue is active"}},
                 },
             },
+            "/api/v1/engine": {
+                "put": {
+                    "summary": "Load or switch the active service family",
+                    "description": (
+                        "original/lora select FL2VA; reference/reference_lora select Ref2VA. "
+                        "The suffix only selects the initial task variant; later jobs can hot-switch "
+                        "base and LoRA inside the loaded family. Requires an idle queue when changing family."
+                    ),
+                    "requestBody": {"required": True, "content": {"application/json": {"schema": {
+                        "type": "object", "required": ["engine"],
+                        "properties": {"engine": {
+                            "type": "string",
+                            "enum": ["original", "lora", "reference", "reference_lora"],
+                        }},
+                    }}}},
+                    "responses": {
+                        "200": {"description": "Service family loaded"},
+                        "409": {"description": "Queue is busy or family cannot be switched"},
+                    },
+                },
+                "delete": {
+                    "summary": "Unload the active service family",
+                    "description": "Requires no active or queued jobs.",
+                    "responses": {
+                        "200": {"description": "Service family unloaded"},
+                        "409": {"description": "Queue is busy"},
+                    },
+                },
+            },
             "/api/v1/generations": {
                 "post": {
                     "summary": "Submit a generation job",
@@ -182,6 +211,8 @@ def document(version: str) -> dict[str, Any]:
                         "application/json": {"schema": {"$ref": "#/components/schemas/GenerationRequest"}},
                         "multipart/form-data": {"schema": {"type": "object", "properties": {
                             **request_properties,
+                            "first_frame": {"type": "string", "format": "binary"},
+                            "last_frame": {"type": "string", "format": "binary"},
                             **{f"reference_image_{index}": {"type": "string", "format": "binary"} for index in range(1, 10)},
                             **{f"reference_video_{index}": {"type": "string", "format": "binary"} for index in range(1, 4)},
                             **{f"reference_audio_{index}": {"type": "string", "format": "binary"} for index in range(1, 4)},
@@ -189,6 +220,12 @@ def document(version: str) -> dict[str, Any]:
                     }},
                     "responses": {"202": {"description": "Accepted", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Job"}}}}, "400": {"description": "Invalid request"}},
                 }
+            },
+            "/api/v1/jobs": {
+                "get": {
+                    "summary": "List jobs in the active workspace",
+                    "responses": {"200": {"description": "Ordered job list"}},
+                },
             },
             "/api/v1/jobs/{job_id}/preview": {
                 "get": {"summary": "Download a ready fork preview", "responses": {"200": {"description": "Preview MP4"}, "409": {"description": "Not ready"}}},

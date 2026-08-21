@@ -41,9 +41,13 @@ FL2VA生成节点只暴露`first_frame`/`last_frame`；Ref2VA生成节点直接�
 如果这个ComfyUI只用于调用H3服务，推荐使用随包启动器，使ComfyUI保持CPU模式、不占用
 4090显存：
 
+在 X-MinimaxH3 项目根目录执行：
+
 ```bash
-./start_comfyui.sh /path/to/ComfyUI
+./integrations/comfyui/start_comfyui.sh /path/to/ComfyUI
 ```
+
+注意开头是 `./integrations`，不是从系统根目录开始的 `/integrations`。
 
 Ref2VA不再使用素材集合串联节点。将ComfyUI的`Load Image`输出直接接到生成节点的
 `Picture N`，将`Load Audio`输出直接接到`Audio N`。编号同时决定提示词中对应的
@@ -68,18 +72,16 @@ Attention；越高表示越小的计算预算。服务自动安排真实/预测�
 Attention，不插入未经人工验收的预测步。连接器轮询服务进度并同步到ComfyUI进度条；中断ComfyUI任务时，
 它也会请求服务端取消对应任务。成片下载到 `ComfyUI/output/h3_serve/`。
 
-FL2VA与Ref2VA生成节点的预览都只有`关闭`/立即`开启`两个状态。开启后才显示`预览位置`、
-`预览分辨率`与`LoRA预览步数`三个参数。它们只影响可丢弃的快速预览分支，不改变正式输出。节点右侧
-分别提供`最终视频`与`预览视频`端口，并在节点结果区同时显示两个视频窗口。关闭预览时
-不创建分支，`预览视频`为空。由于ComfyUI的单节点只在整次执行返回后发布输出，这个窗口
-用于同屏比较预览与成片；如果需要在正式任务继续前先人工决策，使用下方的独立断点节点。
+FL2VA与Ref2VA生成节点的预览都只有`关闭`/`开启`两个状态。开启后才显示`预览位置`、
+`预览分辨率`与`LoRA预览步数`三个参数。正式轨迹运行到预览位置后会保存断点并停止，
+不会继续计算剩余正式步；此时任务释放GPU执行权，快速预览显示在生成节点下方和
+`预览视频`输出端口。节点随后显示两个按钮：
 
-需要让GPU先处理其他任务时，使用独立的断点节点，而不是普通生成节点：
+- `继续生成`：把同一正式轨迹重新排队，从保留的断点继续到最终视频；
+- `放弃生成`：删除服务端任务、预览和断点，并将节点复位为可提交新任务的状态。
 
-1. `H3 Serve · FL2VA断点任务`或`H3 Serve · Ref2VA断点任务`选择原始权重/LoRA、总采样步数、加速档位和停止位置；
-2. 节点输出`任务ID`，服务状态到达`checkpointed`后该任务已经释放GPU执行权；
-3. 可将任务ID连接到`H3 Serve · 查看断点预览`，读取可选的LoRA预览；
-4. 将同一个任务ID连接到`H3 Serve · 恢复断点任务`，恢复动作会重新排队并输出最终视频。
+关闭预览时不创建断点，节点直接运行到最终视频。原来的独立“断点任务/查看断点预览/
+恢复断点任务”节点仍保留，用于需要自行编排任务ID的高级工作流；普通工作流不再需要它们。
 
 断点节点中的数字是正式σ采样位置。LoRA正式任务的全部指定步均为真实Turbo步，
 加速档位只调整逐步逐层Attention配额，不插入预测步。`保留中间状态`决定能否恢复，`输出预览`只建立
@@ -93,6 +95,7 @@ FL2VA与Ref2VA生成节点的预览都只有`关闭`/立即`开启`两个状态�
 - `GET /api/v1/options`
 - `POST /api/v1/generations`
 - `GET/DELETE /api/v1/jobs/{id}`
+- `DELETE /api/v1/jobs/{id}/record`
 - `GET /api/v1/jobs/{id}/preview`
 - `POST /api/v1/jobs/{id}/preview/{continue|discard}`
 - `POST /api/v1/jobs/{id}/resume`

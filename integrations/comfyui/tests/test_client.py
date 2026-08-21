@@ -19,6 +19,7 @@ from h3serve_connector.nodes import (
     H3ServeCheckpointPreview,
     H3ServeCheckpointResume,
     QUALITY,
+    _acceleration_value,
     _add_reference_resolution_fields,
     _max_native_duration,
     _preset_geometry,
@@ -27,6 +28,11 @@ from h3serve_connector.nodes import (
 
 
 class NativeDurationBudgetTest(unittest.TestCase):
+    def test_invalid_legacy_acceleration_falls_back_to_zero(self):
+        self.assertEqual(_acceleration_value(float("nan")), 0.0)
+        self.assertEqual(_acceleration_value("原始权重"), 0.0)
+        self.assertEqual(_acceleration_value(50), 50.0)
+
     def test_preset_aspect_ratios_share_the_pixel_frame_budget(self):
         self.assertEqual(_preset_geometry("1080p", "16:9"), (1920, 1088))
         self.assertEqual(_max_native_duration(1920, 1088), 8)
@@ -195,11 +201,78 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(fl2va["LoRA预览步数"][1]["default"], 4)
         self.assertEqual(fl2va["LoRA预览步数"][1]["min"], 1)
         self.assertEqual(fl2va["LoRA预览步数"][1]["max"], 8)
+        self.assertEqual(fl2va["断点任务ID"][1]["default"], "")
+        self.assertEqual(fl2va["断点动作"][1]["default"], "新建任务")
         for name in (
             "prompt", "preview_mode", "预览位置", "预览分辨率",
             "LoRA预览步数",
         ):
             self.assertEqual(schema[name], fl2va[name])
+
+    def test_creator_preview_stops_at_formal_checkpoint(self):
+        with patch(
+            "h3serve_connector.nodes._run_interactive_checkpoint",
+            return_value=(None, "preview"),
+        ) as run_checkpoint, patch("h3serve_connector.nodes._run") as run_complete:
+            result = H3ServeFL2VAPresetGenerate().generate(
+                连接={"server_url": "http://127.0.0.1:8090"},
+                prompt="one continuous shot",
+                resolution="720p",
+                aspect_ratio="16:9",
+                duration_seconds=5.0,
+                sampling_steps=12,
+                acceleration=50.0,
+                model_variant="原始权重",
+                preview_mode="开启",
+                seed=4404,
+                upscale="关闭",
+                预览位置=6,
+                预览分辨率="480p",
+                LoRA预览步数=4,
+                断点任务ID="",
+                断点动作="新建任务",
+            )
+        self.assertEqual(result, (None, "preview"))
+        run_complete.assert_not_called()
+        fields = run_checkpoint.call_args.args[1]
+        self.assertEqual(fields["execution_mode"], "checkpoint")
+        self.assertEqual(fields["checkpoint_step"], 6)
+        self.assertTrue(fields["checkpoint_retain"])
+        self.assertTrue(fields["checkpoint_preview"])
+        self.assertEqual(fields["checkpoint_preview_resolution"], "480p")
+        self.assertEqual(fields["preview_mode"], "off")
+
+    def test_creator_preview_resumes_existing_checkpoint_without_resubmitting(self):
+        with patch(
+            "h3serve_connector.nodes._resume_interactive_checkpoint",
+            return_value=("final", "preview"),
+        ) as resume, patch("h3serve_connector.nodes._run_interactive_checkpoint") as submit:
+            result = H3ServeFL2VAPresetGenerate().generate(
+                连接={"server_url": "http://127.0.0.1:8090"},
+                prompt="unchanged",
+                resolution="720p",
+                aspect_ratio="16:9",
+                duration_seconds=5.0,
+                sampling_steps=12,
+                acceleration=50.0,
+                model_variant="原始权重",
+                preview_mode="开启",
+                seed=4404,
+                upscale="关闭",
+                断点任务ID="job-checkpoint",
+                断点动作="继续生成",
+            )
+        self.assertEqual(result, ("final", "preview"))
+        resume.assert_called_once_with(
+            {"server_url": "http://127.0.0.1:8090"}, "job-checkpoint",
+        )
+        submit.assert_not_called()
+
+    def test_freeform_editor_has_no_hidden_native_required_shot_control(self):
+        app_source = (
+            Path(__file__).parents[3] / "static" / "app.js"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn('maxlength="6000" required aria-label="SHOT', app_source)
 
     def test_ref2va_prompt_is_forwarded_without_mimo_or_soundtrack_rewrite(self):
         prompt = "  subject_definitions:\n<Subject 1> from <Picture 1>.\n  "
