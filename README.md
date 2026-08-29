@@ -96,8 +96,7 @@ This creates the runtime, checks out pinned upstream sources and downloads all
 weights declared by `models/manifest.json`:
 
 ```bash
-git clone <your-github-url> X-MinimaxH3
-cd X-MinimaxH3
+git clone https://github.com/PullMyBoots/X-MinimaxH3.git
 ./setup.sh --download-models --accept-model-license
 ./run.sh
 ```
