@@ -53,14 +53,16 @@ X-MinimaxH3 是面向单张 NVIDIA SM89 GPU 优化的 MiniMax H3 本地视频生
 
 ## 交流与反馈
 
-欢迎加入交流群讨论安装、使用和生成效果，也可以添加作者微信直接反馈问题。
+国际用户可在 [GitHub Discussions](https://github.com/PullMyBoots/X-MinimaxH3/discussions)
+交流安装、硬件兼容性、性能测试、ComfyUI/API 接入和生成作品。中文用户欢迎
+加入微信群，也可以添加作者微信直接反馈。
 
 | 添加作者 | 加入微信群 |
 |:---:|:---:|
 | <img src="assets/community/wechat-contact.jpg" width="260" alt="作者微信二维码"> | <img src="assets/community/wechat-group.jpg" width="260" alt="X-MinimaxH3 微信交流群二维码"> |
 | 请备注 `X-MinimaxH3` | 群二维码过期后会在这里更新 |
 
-对于能够复现的 Bug 和功能建议，请优先提交到
+对于能够复现的 Bug，请优先提交到
 [GitHub Issues](https://github.com/PullMyBoots/X-MinimaxH3/issues)，方便长期检索问题和解决方案。
 
 ## 已验证平台
