@@ -1302,6 +1302,7 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
     int input_dtype_code,
     bool stochastic,
     int act_code,
+    int block_threads_override,
     uint64_t seed,
     cudaStream_t stream)
 {
@@ -1345,10 +1346,15 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
 
         // Same block-size heuristic as before; STOCHASTIC and ACT are turned into
         // compile-time constants so neither costs a branch in the inner loop.
-        const int block_threads = (num_rows == 1) ? 512
+        const int block_threads = block_threads_override > 0
+                                ? block_threads_override
+                                : (num_rows == 1) ? 512
                                 : (num_cols == comfy::kConvRotGroup) ? 64
                                 : (num_cols == 2560) ? 640
+                                : (num_cols == 5376) ? 704
                                 : (num_cols == 6144) ? 768
+                                : (num_cols == 7168) ? 640
+                                : (num_cols == 14336) ? 896
                                 : 1024;
 
         DISPATCH_BOOL(stochastic, kStoch, [&] {
@@ -1364,12 +1370,22 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                     case 640:
                         launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 640, kStoch, kAct>, 640);
                         break;
+                    case 704:
+                        launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 704, kStoch, kAct>, 704);
+                        break;
                     case 768:
                         launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 768, kStoch, kAct>, 768);
                         break;
-                    default:
+                    case 896:
+                        launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 896, kStoch, kAct>, 896);
+                        break;
+                    case 1024:
                         launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 1024, kStoch, kAct>, 1024);
                         break;
+                    default:
+                        throw std::runtime_error(
+                            "convrot64 fused kernel block_threads must be one of "
+                            "64, 512, 640, 704, 768, 896 or 1024");
                 }
             };
             switch (act_code) {

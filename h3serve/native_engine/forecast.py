@@ -7,6 +7,7 @@ the two latest full-refresh tails to estimate the skipped blocks 3..49.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +16,11 @@ import torch
 import torch.nn.functional as F
 
 from .model.packed import PackedLayout
+
+
+LONG_FORECAST_HISTORY_PAGEABLE_BYTES = 2 * 1024**3
+LONG_FORECAST_HISTORY_CHUNK_ROWS = 4096
+V24_FORECAST_FEEDBACK_POLICY_ID = "v24_request_local_forecast_debt_v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +39,8 @@ class _TailHistory:
     step_index: int
     anchor_residual_sample: torch.Tensor
     tail_residual_host: torch.Tensor
+    streamed: bool = False
+    chunk_rows: int = LONG_FORECAST_HISTORY_CHUNK_ROWS
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +50,99 @@ class _ForecastCalibrationPoint:
     video_anchor: torch.Tensor
     audio_tail: torch.Tensor
     video_tail: torch.Tensor
+
+
+def _tensor_storage_bytes(value: torch.Tensor) -> int:
+    return int(value.numel() * value.element_size())
+
+
+def forecast_history_storage_mode(
+    *,
+    rows: int,
+    channels: int,
+    element_size: int,
+    device_type: str,
+) -> str:
+    storage_bytes = int(rows) * int(channels) * int(element_size)
+    if min(rows, channels, element_size) <= 0:
+        raise ValueError("forecast history geometry must be positive")
+    if (
+        device_type == "cuda"
+        and storage_bytes >= LONG_FORECAST_HISTORY_PAGEABLE_BYTES
+    ):
+        return "pageable_chunked"
+    return "pinned_whole" if device_type == "cuda" else "pageable_whole"
+
+
+def _stream_forecast_history(value: torch.Tensor) -> bool:
+    """Keep multi-GiB Forecast history out of CUDA's pinned allocation pool."""
+
+    return forecast_history_storage_mode(
+        rows=int(value.shape[0]),
+        channels=int(value.numel() // value.shape[0]),
+        element_size=int(value.element_size()),
+        device_type=value.device.type,
+    ) == "pageable_chunked"
+
+
+def _copy_forecast_history_to_host(
+    value: torch.Tensor,
+    *,
+    streamed: bool,
+    chunk_rows: int = LONG_FORECAST_HISTORY_CHUNK_ROWS,
+) -> torch.Tensor:
+    pin = value.device.type == "cuda" and not streamed
+    host = torch.empty(
+        value.shape,
+        dtype=value.dtype,
+        device="cpu",
+        pin_memory=pin,
+    )
+    if not streamed:
+        host.copy_(value.detach(), non_blocking=pin)
+        return host
+    for start in range(0, value.shape[0], chunk_rows):
+        stop = min(start + chunk_rows, value.shape[0])
+        host[start:stop].copy_(value.detach()[start:stop], non_blocking=False)
+    return host
+
+
+def _apply_forecast_history_terms_(
+    predicted: torch.Tensor,
+    histories: tuple[_TailHistory, ...],
+    coefficients: tuple[torch.Tensor, ...],
+) -> bool:
+    """Accumulate host Forecast histories without materializing a full GPU tail."""
+
+    if len(histories) != len(coefficients):
+        raise ValueError("forecast histories and coefficients must have equal length")
+    streamed = any(history.streamed for history in histories)
+    device = predicted.device
+    if not streamed:
+        for history, coefficient in zip(histories, coefficients, strict=True):
+            tail = history.tail_residual_host.to(
+                device=device,
+                non_blocking=device.type == "cuda",
+            )
+            predicted.addcmul_(tail, coefficient.to(dtype=predicted.dtype))
+            del tail
+        return False
+
+    chunk_rows = min(history.chunk_rows for history in histories)
+    for start in range(0, predicted.shape[0], chunk_rows):
+        stop = min(start + chunk_rows, predicted.shape[0])
+        predicted_chunk = predicted[start:stop]
+        for history, coefficient in zip(histories, coefficients, strict=True):
+            tail_chunk = history.tail_residual_host[start:stop].to(
+                device=device,
+                non_blocking=False,
+            )
+            predicted_chunk.addcmul_(
+                tail_chunk,
+                coefficient[start:stop].to(dtype=predicted.dtype),
+            )
+            del tail_chunk
+    return True
 
 
 def _curvature_predict(
@@ -458,13 +559,12 @@ class DirectionalForecastController:
         ).to(dtype=anchor_full.dtype)
 
         predicted = anchor_full
-        device = predicted.device
-        old = older.tail_residual_host.to(device=device, non_blocking=device.type == "cuda")
-        predicted.addcmul_(old, 1.0 - gamma_rows)
-        del old
-        new = newer.tail_residual_host.to(device=device, non_blocking=device.type == "cuda")
-        predicted.addcmul_(new, gamma_rows)
-        del new, gamma_rows
+        streamed = _apply_forecast_history_terms_(
+            predicted,
+            (older, newer),
+            (1.0 - gamma_rows, gamma_rows),
+        )
+        del gamma_rows
         self.records.append(
             {
                 "step_index": int(step_index),
@@ -472,6 +572,12 @@ class DirectionalForecastController:
                 "anchor_depth": self.anchor_depth,
                 "audio": audio_stats,
                 "video": video_stats,
+                "history_transfer": (
+                    "pageable_chunked" if streamed else "pinned_whole"
+                ),
+                "history_chunk_rows": (
+                    LONG_FORECAST_HISTORY_CHUNK_ROWS if streamed else None
+                ),
                 "prediction_seconds": time.perf_counter() - started,
             }
         )
@@ -486,21 +592,27 @@ class DirectionalForecastController:
         anchor_host: torch.Tensor,
         final: torch.Tensor,
         layout: TargetLayout,
+        streamed_history: bool,
     ) -> None:
-        pin = final.device.type == "cuda"
+        started = time.perf_counter()
+        pin = final.device.type == "cuda" and not streamed_history
         tail_host = torch.empty(
             final.shape,
             dtype=final.dtype,
             device="cpu",
             pin_memory=pin,
         )
-        for start in range(0, final.shape[0], 4096):
-            stop = min(start + 4096, final.shape[0])
+        for start in range(0, final.shape[0], LONG_FORECAST_HISTORY_CHUNK_ROWS):
+            stop = min(start + LONG_FORECAST_HISTORY_CHUNK_ROWS, final.shape[0])
             anchor_chunk = anchor_host[start:stop].to(
-                device=final.device, non_blocking=pin
+                device=final.device,
+                non_blocking=pin,
             )
             tail_chunk = final[start:stop] - anchor_chunk
-            tail_host[start:stop].copy_(tail_chunk, non_blocking=pin)
+            tail_host[start:stop].copy_(
+                tail_chunk,
+                non_blocking=pin,
+            )
             del anchor_chunk, tail_chunk
         anchor_residual = anchor_sample - input_sample
         self._on_actual_observation(
@@ -509,13 +621,28 @@ class DirectionalForecastController:
             tail_residual_host=tail_host,
             layout=layout,
         )
-        self.history.append(_TailHistory(step_index, anchor_residual, tail_host))
+        self.history.append(_TailHistory(
+            step_index,
+            anchor_residual,
+            tail_host,
+            streamed=streamed_history,
+        ))
         self.history = self.history[-self.history_limit :]
         self.records.append(
             {
                 "step_index": int(step_index),
                 "mode": "actual",
                 "anchor_depth": self.anchor_depth,
+                "history_storage": (
+                    "pageable_chunked" if streamed_history else "pinned_whole"
+                ),
+                "history_bytes": _tensor_storage_bytes(tail_host),
+                "history_chunk_rows": (
+                    LONG_FORECAST_HISTORY_CHUNK_ROWS
+                    if streamed_history
+                    else None
+                ),
+                "observation_seconds": time.perf_counter() - started,
             }
         )
 
@@ -564,14 +691,11 @@ class DirectionalForecastController:
                 layout=info,
             )
             return value
-        pin = anchor.device.type == "cuda"
-        anchor_host = torch.empty(
-            anchor.shape,
-            dtype=anchor.dtype,
-            device="cpu",
-            pin_memory=pin,
+        streamed_history = _stream_forecast_history(anchor)
+        anchor_host = _copy_forecast_history_to_host(
+            anchor,
+            streamed=streamed_history,
         )
-        anchor_host.copy_(anchor.detach(), non_blocking=pin)
 
         if self.segment_cache is not None:
             value = self.segment_cache.run_actual_tail(
@@ -601,6 +725,7 @@ class DirectionalForecastController:
             anchor_host=anchor_host,
             final=value[target],
             layout=info,
+            streamed_history=streamed_history,
         )
         return value
 
@@ -631,6 +756,8 @@ class DirectionalForecastController:
                     "step_index": int(item.step_index),
                     "anchor_residual_sample": item.anchor_residual_sample.detach().cpu(),
                     "tail_residual_host": item.tail_residual_host.detach().cpu(),
+                    "streamed": bool(item.streamed),
+                    "chunk_rows": int(item.chunk_rows),
                 }
                 for item in self.history
             ],
@@ -659,10 +786,410 @@ class DirectionalForecastController:
                     int(item["step_index"]),
                     anchor.to(device="cuda", non_blocking=False),
                     tail.contiguous(),
+                    streamed=bool(item.get(
+                        "streamed",
+                        _tensor_storage_bytes(tail)
+                        >= LONG_FORECAST_HISTORY_PAGEABLE_BYTES,
+                    )),
+                    chunk_rows=int(item.get(
+                        "chunk_rows",
+                        LONG_FORECAST_HISTORY_CHUNK_ROWS,
+                    )),
                 )
             )
         self.history = restored[-self.history_limit :]
         self.records = list(records)
+
+
+class ForecastErrorDebtController(DirectionalForecastController):
+    """Measure request-local Forecast debt without running a Dense teacher.
+
+    Every planned Actual correction already produces the exact expensive-tail
+    residual.  This controller compares that residual with the secant tail the
+    normal Forecast path *would* have used at the same point.  Only uniformly
+    sampled rows and the existing shallow-anchor channels are inspected, so
+    observation adds no DiT block or Attention evaluation.
+
+    The release starts in ``observe_only`` mode.  Once a workload-independent
+    null envelope has been calibrated, the same controller can spend a bounded
+    token bucket by promoting a future requested Forecast to a Dense Actual.
+    That discrete execution decision is driven by accumulated continuous error
+    debt, not by prompt semantics, scene labels or named candidate versions.
+    """
+
+    def __init__(
+        self,
+        *,
+        actual_steps: tuple[int, ...],
+        segment_cache=None,
+        sentinel_audio_rows: int = 128,
+        sentinel_video_rows: int = 512,
+        recovery_enabled: bool = False,
+        max_runtime_promotions: int = 0,
+        risk_reserve_controller: Any | None = None,
+    ) -> None:
+        super().__init__(
+            actual_steps=actual_steps,
+            segment_cache=segment_cache,
+        )
+        if sentinel_audio_rows <= 0 or sentinel_video_rows <= 0:
+            raise ValueError("forecast feedback sentinel counts must be positive")
+        if max_runtime_promotions < 0:
+            raise ValueError("forecast feedback promotion limit cannot be negative")
+        if recovery_enabled and max_runtime_promotions == 0:
+            raise ValueError("enabled forecast recovery requires a promotion budget")
+        if risk_reserve_controller is not None and recovery_enabled:
+            raise ValueError(
+                "use either legacy debt recovery or mechanistic risk-reserve control"
+            )
+        if risk_reserve_controller is not None:
+            controller_limit = int(risk_reserve_controller.maximum_promotions)
+            if max_runtime_promotions not in (0, controller_limit):
+                raise ValueError(
+                    "forecast promotion limit disagrees with risk-reserve controller"
+                )
+            max_runtime_promotions = controller_limit
+        self.sentinel_audio_rows = int(sentinel_audio_rows)
+        self.sentinel_video_rows = int(sentinel_video_rows)
+        self.recovery_enabled = bool(recovery_enabled)
+        self.max_runtime_promotions = int(max_runtime_promotions)
+        self.risk_reserve_controller = risk_reserve_controller
+        self.feedback_records: list[dict[str, Any]] = []
+        self._baseline_max: dict[str, float] = {}
+        self._baseline_locked = False
+        self._forecast_debt = 0.0
+        self._runtime_promotions: list[int] = []
+
+    @staticmethod
+    def _row_indices(rows: int, count: int) -> torch.Tensor:
+        chosen = min(int(rows), int(count))
+        return torch.linspace(0, rows - 1, steps=chosen).round().long().unique()
+
+    @staticmethod
+    def _take_rows(
+        value: torch.Tensor,
+        *,
+        start: int,
+        indices: torch.Tensor,
+        channels: int,
+    ) -> torch.Tensor:
+        source = indices.to(device=value.device) + int(start)
+        return (
+            value[:, :channels]
+            .index_select(0, source)
+            .detach()
+            .float()
+            .cpu()
+        )
+
+    @staticmethod
+    def _relative_errors(
+        predicted: torch.Tensor,
+        actual: torch.Tensor,
+    ) -> tuple[float, float]:
+        left = predicted.flatten().float()
+        right = actual.flatten().float()
+        relative_l1 = float(
+            (
+                (left - right).abs().sum()
+                / right.abs().sum().clamp_min(1.0e-8)
+            ).item()
+        )
+        cosine_loss = float(
+            max(
+                0.0,
+                1.0
+                - F.cosine_similarity(left[None], right[None]).item(),
+            )
+        )
+        return relative_l1, cosine_loss
+
+    def should_forecast(self, step_index: int, requested_actual: bool) -> bool:
+        eligible = super().should_forecast(step_index, requested_actual)
+        if not eligible:
+            return False
+        if (
+            self.risk_reserve_controller is not None
+            and self.risk_reserve_controller.should_promote(step_index)
+        ):
+            if int(step_index) not in self._runtime_promotions:
+                self._runtime_promotions.append(int(step_index))
+            return False
+        may_recover = (
+            self.recovery_enabled
+            and len(self._runtime_promotions) < self.max_runtime_promotions
+            and self._forecast_debt >= 1.0
+        )
+        if not may_recover:
+            return True
+        self._forecast_debt -= 1.0
+        self._runtime_promotions.append(int(step_index))
+        return False
+
+    def _on_actual_observation(
+        self,
+        *,
+        step_index: int,
+        anchor_residual: torch.Tensor,
+        tail_residual_host: torch.Tensor,
+        layout: TargetLayout,
+    ) -> None:
+        if len(self.history) < 2:
+            self.feedback_records.append({
+                "step_index": int(step_index),
+                "status": "warming_history",
+            })
+            return
+        older, newer = self.history[-2:]
+        horizon = max(1, int(step_index) - int(newer.step_index))
+        channels = min(
+            int(anchor_residual.shape[1]),
+            int(tail_residual_host.shape[1]),
+        )
+        if channels <= 0:
+            raise ValueError("forecast feedback requires sampled channels")
+        audio_indices = self._row_indices(
+            layout.audio_rows, self.sentinel_audio_rows
+        )
+        video_indices = self._row_indices(
+            layout.video_rows, self.sentinel_video_rows
+        )
+        metrics: dict[str, float] = {}
+        for modality, start, indices in (
+            ("audio", 0, audio_indices),
+            ("video", layout.audio_rows, video_indices),
+        ):
+            current_anchor = self._take_rows(
+                anchor_residual,
+                start=start,
+                indices=indices,
+                channels=channels,
+            )
+            older_anchor = self._take_rows(
+                older.anchor_residual_sample,
+                start=start,
+                indices=indices,
+                channels=channels,
+            )
+            newer_anchor = self._take_rows(
+                newer.anchor_residual_sample,
+                start=start,
+                indices=indices,
+                channels=channels,
+            )
+            gamma, _stats = _directional_gamma(
+                current_anchor,
+                older_anchor,
+                newer_anchor,
+            )
+            older_tail = self._take_rows(
+                older.tail_residual_host,
+                start=start,
+                indices=indices,
+                channels=channels,
+            )
+            newer_tail = self._take_rows(
+                newer.tail_residual_host,
+                start=start,
+                indices=indices,
+                channels=channels,
+            )
+            actual_tail = self._take_rows(
+                tail_residual_host,
+                start=start,
+                indices=indices,
+                channels=channels,
+            )
+            predicted_tail = older_tail.mul(1.0 - gamma).add_(
+                newer_tail.mul(gamma)
+            )
+            relative_l1, cosine_loss = self._relative_errors(
+                predicted_tail, actual_tail
+            )
+            metrics[f"{modality}_relative_l1"] = relative_l1
+            metrics[f"{modality}_cosine_loss"] = cosine_loss
+
+        control_l1 = {
+            # The observed quantity is already the complete tail error at the
+            # current sigma point.  The first GPU calibration showed that an
+            # additional horizon-squared divisor suppressed every legitimate
+            # correction signal by 7--16x, so horizon remains telemetry rather
+            # than an assumed error law.
+            key: value
+            for key, value in metrics.items()
+            if key.endswith("relative_l1")
+        }
+        is_opening_baseline = horizon == 1 and not self._baseline_locked
+        if is_opening_baseline:
+            for key, value in control_l1.items():
+                self._baseline_max[key] = max(
+                    value, self._baseline_max.get(key, 0.0)
+                )
+        elif horizon > 1:
+            self._baseline_locked = True
+
+        risk_ratio = None
+        debt_increment = 0.0
+        if self._baseline_max and horizon > 1:
+            risk_ratio = max(
+                control_l1[key] / max(self._baseline_max[key], 1.0e-8)
+                for key in control_l1
+            )
+            debt_increment = max(0.0, float(risk_ratio) - 1.0)
+            # Stable corrections discharge stale evidence; anomalous growth
+            # accumulates continuously until it can buy one bounded recovery.
+            self._forecast_debt = max(
+                0.0,
+                self._forecast_debt * 0.5 + debt_increment,
+            )
+
+        mechanistic_decision = None
+        if risk_ratio is not None and self.risk_reserve_controller is not None:
+            modality_ratios = {
+                modality: (
+                    control_l1[f"{modality}_relative_l1"]
+                    / max(
+                        self._baseline_max[f"{modality}_relative_l1"],
+                        1.0e-8,
+                    )
+                )
+                for modality in ("audio", "video")
+            }
+            decision = self.risk_reserve_controller.observe_actual(
+                step_index=step_index,
+                audio_risk_ratio=modality_ratios["audio"],
+                video_risk_ratio=modality_ratios["video"],
+            )
+            mechanistic_decision = decision.to_dict()
+
+        self.feedback_records.append({
+            "step_index": int(step_index),
+            "status": "observed",
+            "history_steps": [int(older.step_index), int(newer.step_index)],
+            "horizon": horizon,
+            "sentinel_audio_rows": int(audio_indices.numel()),
+            "sentinel_video_rows": int(video_indices.numel()),
+            "sample_channels": channels,
+            "metrics": metrics,
+            "control_relative_l1": control_l1,
+            "horizon_normalization": "none_gpu_calibrated_v1",
+            "opening_baseline": is_opening_baseline,
+            "baseline_max": dict(sorted(self._baseline_max.items())),
+            "risk_ratio": risk_ratio,
+            "debt_increment": debt_increment,
+            "forecast_debt": self._forecast_debt,
+            "mechanistic_runtime_decision": mechanistic_decision,
+        })
+
+    def export(self) -> dict[str, Any]:
+        report = super().export()
+        report.update({
+            "mode": "request_local_forecast_error_debt",
+            "feedback_policy_id": V24_FORECAST_FEEDBACK_POLICY_ID,
+            "feedback_mode": (
+                "mechanistic_risk_reserve"
+                if self.risk_reserve_controller is not None
+                else "bounded_recovery"
+                if self.recovery_enabled
+                else "observe_only"
+            ),
+            "adds_teacher_evaluations": False,
+            "sentinel_audio_rows": self.sentinel_audio_rows,
+            "sentinel_video_rows": self.sentinel_video_rows,
+            "max_runtime_promotions": self.max_runtime_promotions,
+            "runtime_promotions": list(self._runtime_promotions),
+            "forecast_debt": self._forecast_debt,
+            "baseline_max": dict(sorted(self._baseline_max.items())),
+            "feedback_records": list(self.feedback_records),
+            "mechanistic_runtime": (
+                None
+                if self.risk_reserve_controller is None
+                else self.risk_reserve_controller.export()
+            ),
+        })
+        return report
+
+    def checkpoint_state(self) -> dict[str, Any]:
+        state = super().checkpoint_state()
+        state["schema_version"] = (
+            3 if self.risk_reserve_controller is not None else 2
+        )
+        state["forecast_feedback"] = {
+            "policy_id": V24_FORECAST_FEEDBACK_POLICY_ID,
+            "recovery_enabled": self.recovery_enabled,
+            "max_runtime_promotions": self.max_runtime_promotions,
+            "baseline_max": dict(self._baseline_max),
+            "baseline_locked": self._baseline_locked,
+            "forecast_debt": self._forecast_debt,
+            "runtime_promotions": list(self._runtime_promotions),
+            "feedback_records": list(self.feedback_records),
+            "mechanistic_runtime": (
+                None
+                if self.risk_reserve_controller is None
+                else self.risk_reserve_controller.checkpoint_state()
+            ),
+        }
+        return state
+
+    def restore_checkpoint_state(self, state: dict[str, Any]) -> None:
+        schema_version = state.get("schema_version")
+        if schema_version not in (2, 3):
+            raise ValueError("unsupported forecast feedback checkpoint schema")
+        feedback = state.get("forecast_feedback")
+        if not isinstance(feedback, dict):
+            raise ValueError("forecast feedback checkpoint is missing state")
+        if feedback.get("policy_id") != V24_FORECAST_FEEDBACK_POLICY_ID:
+            raise ValueError("forecast feedback checkpoint policy mismatch")
+        if bool(feedback.get("recovery_enabled")) != self.recovery_enabled:
+            raise ValueError("forecast feedback recovery mode mismatch")
+        if int(feedback.get("max_runtime_promotions", -1)) != self.max_runtime_promotions:
+            raise ValueError("forecast feedback promotion budget mismatch")
+        base_state = dict(state)
+        base_state["schema_version"] = 1
+        base_state.pop("forecast_feedback", None)
+        super().restore_checkpoint_state(base_state)
+        baseline = feedback.get("baseline_max")
+        records = feedback.get("feedback_records")
+        promotions = feedback.get("runtime_promotions")
+        if (
+            not isinstance(baseline, dict)
+            or not isinstance(records, list)
+            or not isinstance(promotions, list)
+        ):
+            raise ValueError("forecast feedback checkpoint is malformed")
+        restored_baseline = {
+            str(key): float(value) for key, value in baseline.items()
+        }
+        debt = float(feedback.get("forecast_debt", float("nan")))
+        restored_promotions = [int(step) for step in promotions]
+        if (
+            any(
+                not math.isfinite(value) or value < 0.0
+                for value in restored_baseline.values()
+            )
+            or not math.isfinite(debt)
+            or debt < 0.0
+            or len(restored_promotions) > self.max_runtime_promotions
+        ):
+            raise ValueError("forecast feedback checkpoint contains invalid values")
+        self._baseline_max = restored_baseline
+        self._baseline_locked = bool(feedback.get("baseline_locked"))
+        self._forecast_debt = debt
+        self._runtime_promotions = restored_promotions
+        self.feedback_records = list(records)
+        runtime_state = feedback.get("mechanistic_runtime")
+        if schema_version == 3:
+            if self.risk_reserve_controller is None or not isinstance(
+                runtime_state, dict
+            ):
+                raise ValueError(
+                    "forecast feedback checkpoint requires mechanistic runtime"
+                )
+            self.risk_reserve_controller.restore_checkpoint_state(runtime_state)
+        elif self.risk_reserve_controller is not None:
+            raise ValueError(
+                "forecast feedback checkpoint omits mechanistic runtime state"
+            )
 
 
 class CalibrationForecastController(DirectionalForecastController):
@@ -771,15 +1298,11 @@ class CurvatureForecastController(DirectionalForecastController):
             1.0 + distance + curvature / gap12,
         )
         predicted = anchor_full
-        device = predicted.device
-        for history, coefficient in zip(
-            (oldest, older, newer), coefficients, strict=True
-        ):
-            tail = history.tail_residual_host.to(
-                device=device, non_blocking=device.type == "cuda"
-            )
-            predicted.addcmul_(tail, coefficient.to(dtype=predicted.dtype))
-            del tail
+        streamed = _apply_forecast_history_terms_(
+            predicted,
+            (oldest, older, newer),
+            coefficients,
+        )
         curvature_values = curvature.detach().float()
         self.records.append(
             {
@@ -791,6 +1314,12 @@ class CurvatureForecastController(DirectionalForecastController):
                 "video": video_stats,
                 "curvature_mean": float(curvature_values.mean().cpu()),
                 "curvature_max": float(curvature_values.max().cpu()),
+                "history_transfer": (
+                    "pageable_chunked" if streamed else "pinned_whole"
+                ),
+                "history_chunk_rows": (
+                    LONG_FORECAST_HISTORY_CHUNK_ROWS if streamed else None
+                ),
                 "prediction_seconds": time.perf_counter() - started,
             }
         )
@@ -843,8 +1372,10 @@ __all__ = [
     "CalibrationForecastController",
     "CurvatureForecastController",
     "DirectionalForecastController",
+    "ForecastErrorDebtController",
     "QualityConstrainedForecastFactory",
     "QualityConstrainedForecastPolicy",
     "TargetLayout",
+    "V24_FORECAST_FEEDBACK_POLICY_ID",
     "target_layout",
 ]

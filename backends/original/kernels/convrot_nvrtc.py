@@ -1,14 +1,16 @@
 """Driver-compatible SM89 SwiGLU + ConvRot + row-INT8 quantizer.
 
-The installed comfy-kitchen CUDA wheel was compiled for a CUDA runtime newer
-than the host driver.  This module deliberately compiles only the preprocessing
-kernel with PyTorch's CUDA 12.6 NVRTC and loads the PTX through the current CUDA
-driver.  It does not replace comfy-kitchen or modify the shared environment.
+This fallback deliberately uses the NVRTC and headers shipped with the active
+PyTorch CUDA runtime, then loads PTX through the current driver.  Runtime
+discovery supports both the unified CUDA 13 wheel layout and the older
+component-per-package CUDA 12 layout; it never silently selects the system
+default ``nvcc`` toolchain.
 """
 
 from __future__ import annotations
 
 import ctypes
+import os
 import sys
 from pathlib import Path
 
@@ -198,17 +200,32 @@ _MODULE = None
 _KERNELS: dict[tuple[torch.dtype, bool], object] = {}
 
 
-def _find_cuda12_component(component: str, filename: str) -> Path:
-    for entry in map(Path, sys.path):
-        candidate = entry / "nvidia" / component / filename
-        if candidate.is_file():
-            return candidate
-    raise RuntimeError(f"CUDA 12.6 component not found: nvidia/{component}/{filename}")
+def _find_runtime_file(*relative_candidates: str) -> Path:
+    roots = [Path(entry) for entry in sys.path if entry]
+    configured = os.environ.get("CUDA_HOME", "").strip()
+    if configured:
+        roots.append(Path(configured))
+    for root in roots:
+        for relative in relative_candidates:
+            candidate = root / relative
+            if candidate.is_file():
+                return candidate
+    joined = ", ".join(relative_candidates)
+    raise RuntimeError(f"active PyTorch CUDA runtime component not found: {joined}")
 
 
 def _compile_ptx() -> bytes:
-    nvrtc_path = _find_cuda12_component("cuda_nvrtc", "lib/libnvrtc.so.12")
-    include_dir = _find_cuda12_component("cuda_runtime", "include/cuda_runtime.h").parent
+    nvrtc_path = _find_runtime_file(
+        "nvidia/cu13/lib/libnvrtc.so.13",
+        "nvidia/cuda_nvrtc/lib/libnvrtc.so.12",
+        "lib64/libnvrtc.so.13",
+        "lib64/libnvrtc.so.12",
+    )
+    include_dir = _find_runtime_file(
+        "nvidia/cu13/include/cuda_runtime.h",
+        "nvidia/cuda_runtime/include/cuda_runtime.h",
+        "include/cuda_runtime.h",
+    ).parent
     nvrtc = ctypes.CDLL(str(nvrtc_path))
     nvrtc.nvrtcGetErrorString.restype = ctypes.c_char_p
 
@@ -265,6 +282,11 @@ def _load() -> None:
         result = driver.cuFuncSetAttribute(kernel.func, 8, 96 * 1024)
         if result != 0:
             raise RuntimeError(f"cuFuncSetAttribute failed with CUDA error {result}")
+        # PyTorch 2.13 validates dynamic shared memory in its Python launch
+        # wrapper before reaching the CUDA driver.  Keep that wrapper metadata
+        # aligned with the driver opt-in above; older PyTorch releases did not
+        # require this explicit call.
+        kernel.set_shared_memory_config(96 * 1024)
 
 
 def warmup_module() -> None:

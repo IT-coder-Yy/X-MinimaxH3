@@ -31,11 +31,17 @@ class ServicePaths:
     def defaults(cls, release_root: Path, *, data_dir: Path | None = None) -> "ServicePaths":
         root = release_root.resolve()
         runtime = Path(os.environ.get("H3_SERVE_RUNTIME_DIR", root / "runtime")).resolve()
-        model_root = Path(os.environ.get("H3_SERVE_MODEL_DIR", root / "models")).resolve()
         return cls(
             release_root=root,
             data_dir=(data_dir or Path(os.environ.get("H3_SERVE_DATA_DIR", root / "data"))).resolve(),
-            model_dir=model_root,
+            # Keep the release-local model mount as the public path even when
+            # development uses a read-only symlink to the shared weight store.
+            # NativeSessionPaths resolves it only at the point of physical
+            # access.  This prevents status/provenance from presenting the old
+            # comparator checkout as though it were the active service root.
+            model_dir=Path(
+                os.environ.get("H3_SERVE_MODEL_DIR", root / "models")
+            ).expanduser().absolute(),
             output_dir=Path(os.environ.get("H3_SERVE_OUTPUT_DIR", root / "output")).resolve(),
             # Preserve a virtualenv's interpreter symlink. Resolving it to the
             # base interpreter would silently discard that venv's site-packages.
@@ -44,12 +50,12 @@ class ServicePaths:
             ).expanduser().absolute(),
             minimax_source_dir=Path(
                 os.environ.get(
-                    "H3_SERVE_MINIMAX_SOURCE", root / "runtime_sources/MiniMax-H3"
+                    "H3_SERVE_MINIMAX_SOURCE", runtime / "vendor/MiniMax-H3"
                 )
             ).resolve(),
             lightx_source_dir=Path(
                 os.environ.get(
-                    "H3_SERVE_LIGHTX_SOURCE", root / "runtime_sources/LightX2V"
+                    "H3_SERVE_LIGHTX_SOURCE", runtime / "vendor/LightX2V"
                 )
             ).resolve(),
             turbo_curve_path=Path(
@@ -65,9 +71,10 @@ class ServicePaths:
             ).resolve(),
             flashvsr_model_dir=Path(
                 os.environ.get(
-                    "H3_SERVE_FLASHVSR_MODELS", model_root / "upscalers/flashvsr-v1.1",
+                    "H3_SERVE_FLASHVSR_MODELS",
+                    root / "models/upscalers/flashvsr-v1.1",
                 )
-            ).resolve(),
+            ).expanduser().absolute(),
             flashvsr_python_executable=Path(
                 os.environ.get(
                     "H3_SERVE_FLASHVSR_PYTHON",

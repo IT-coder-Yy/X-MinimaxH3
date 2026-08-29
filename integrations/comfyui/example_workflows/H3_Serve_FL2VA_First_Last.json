@@ -1,8 +1,8 @@
 {
   "id": "7e96bbc5-4748-49e1-92ec-d21af19913e4",
   "revision": 0,
-  "last_node_id": 5,
-  "last_link_id": 4,
+  "last_node_id": 6,
+  "last_link_id": 6,
   "nodes": [
     {
       "id": 1, "type": "H3ServeConnection", "pos": [40, 60], "size": [380, 150],
@@ -13,7 +13,7 @@
         {"name": "poll_seconds", "type": "FLOAT", "link": null, "widget": {"name": "poll_seconds"}}
       ],
       "outputs": [
-        {"name": "连接", "type": "H3_SERVE_CONNECTION", "links": [1]}
+        {"name": "连接", "type": "H3_SERVE_CONNECTION", "links": [1, 5]}
       ],
       "properties": {"Node name for S&R": "H3ServeConnection"},
       "widgets_values": ["http://127.0.0.1:8090", "", 1.0], "title": "① 连接已就绪的FL2VA服务"
@@ -67,29 +67,48 @@
         {"name": "model_variant", "type": "COMBO", "link": null, "widget": {"name": "model_variant"}},
         {"name": "preview_mode", "type": "COMBO", "link": null, "widget": {"name": "preview_mode"}},
         {"name": "预览位置", "type": "INT", "link": null, "widget": {"name": "预览位置"}},
-        {"name": "预览分辨率", "type": "COMBO", "link": null, "widget": {"name": "预览分辨率"}},
-        {"name": "LoRA预览步数", "type": "INT", "link": null, "widget": {"name": "LoRA预览步数"}},
         {"name": "seed", "type": "INT", "link": null, "widget": {"name": "seed"}},
-        {"name": "upscale", "type": "COMBO", "link": null, "widget": {"name": "upscale"}},
+        {"name": "断点任务ID", "type": "STRING", "link": null, "widget": {"name": "断点任务ID"}},
+        {"name": "断点动作", "type": "COMBO", "link": null, "widget": {"name": "断点动作"}},
         {"name": "first_frame", "type": "IMAGE", "link": 2},
         {"name": "last_frame", "type": "IMAGE", "link": 3}
       ],
       "outputs": [
-        {"name": "最终视频", "type": "VIDEO", "links": null},
+        {"name": "最终视频", "type": "VIDEO", "links": [6]},
         {"name": "预览视频", "type": "VIDEO", "links": null}
       ],
       "properties": {"Node name for S&R": "H3ServeFL2VAPresetGenerate"},
       "widgets_values": [
-        "480p", "16:9", 5.0, 20, 0.0, "原始权重", "关闭", 6, "原分辨率", 4, 4404, "关闭"
+        "480p", "16:9", 5.0, 20, 0.0, "原始权重", "关闭", 6, 4404, "", "", "新建任务"
       ],
       "title": "④ FL2VA首尾帧生成并预览"
+    },
+    {
+      "id": 6, "type": "H3ServeSecondSampling", "pos": [1220, 180], "size": [430, 340],
+      "flags": {}, "order": 5, "mode": 0,
+      "inputs": [
+        {"name": "连接", "type": "H3_SERVE_CONNECTION", "link": 5},
+        {"name": "源视频", "type": "VIDEO", "link": 6},
+        {"name": "目标分辨率", "type": "COMBO", "link": null, "widget": {"name": "目标分辨率"}},
+        {"name": "二次采样步数", "type": "INT", "link": null, "widget": {"name": "二次采样步数"}},
+        {"name": "重绘强度", "type": "COMBO", "link": null, "widget": {"name": "重绘强度"}},
+        {"name": "加速力度", "type": "FLOAT", "link": null, "widget": {"name": "加速力度"}}
+      ],
+      "outputs": [
+        {"name": "二采视频", "type": "VIDEO", "links": null}
+      ],
+      "properties": {"Node name for S&R": "H3ServeSecondSampling"},
+      "widgets_values": ["1080P", 2, "标准 · Denoise 0.20", 75.0],
+      "title": "⑤ Base + SA Solver 二次采样"
     }
   ],
   "links": [
     [1, 1, 0, 4, 0, "H3_SERVE_CONNECTION"],
-    [2, 2, 0, 4, 14, "IMAGE"],
-    [3, 3, 0, 4, 15, "IMAGE"],
-    [4, 5, 0, 4, 1, "STRING"]
+    [2, 2, 0, 4, 13, "IMAGE"],
+    [3, 3, 0, 4, 14, "IMAGE"],
+    [4, 5, 0, 4, 1, "STRING"],
+    [5, 1, 0, 6, 0, "H3_SERVE_CONNECTION"],
+    [6, 4, 0, 6, 1, "VIDEO"]
   ],
   "groups": [], "config": {},
   "extra": {"ds": {"scale": 0.8, "offset": [30, 20]}}, "version": 0.4

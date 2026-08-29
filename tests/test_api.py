@@ -21,7 +21,7 @@ from h3serve.app import (
 )
 from h3serve.backend import CheckpointResult, GenerationResult, JobCancelled
 from h3serve.config import ServicePaths
-from h3serve.contract import GenerationSpec
+from h3serve.contract import GenerationSpec, SecondSamplingSpec
 from h3serve.prompt_enhancer import EnhancementRequest
 from h3serve.memory_policy import HOST_MEMORY_PROFILES
 
@@ -36,10 +36,26 @@ class FakeBackend:
         self.reference_videos: tuple[Path, ...] = ()
         self.reference_audios: tuple[Path, ...] = ()
         self.last_spec = None
+        self.lora_checkpoint: Path | None = None
+        self.fail_lora_checkpoint: str | None = None
 
     async def preload(self, engine: str) -> None:
         self.preloaded = engine
-        self.warm_state = {"status": "ready", "engine": engine}
+        if (
+            self.lora_checkpoint is not None
+            and self.lora_checkpoint.name == self.fail_lora_checkpoint
+        ):
+            self.warm_state = {"status": "failed", "engine": engine}
+            return
+        self.warm_state = {
+            "status": "ready", "engine": engine,
+            "lora_checkpoint": (
+                self.lora_checkpoint.name if self.lora_checkpoint else None
+            ),
+        }
+
+    def configure_lora_checkpoint(self, checkpoint: Path) -> None:
+        self.lora_checkpoint = Path(checkpoint)
 
     async def generate(
         self, spec, _job_id: str, _first_frame: Path | None,
@@ -86,10 +102,39 @@ class FakeBackend:
                 decision = await asyncio.to_thread(wait_decision)
                 if decision != "continue":
                     raise JobCancelled("preview discarded")
+        latent_path = self.video_path.with_suffix(".pt")
+        latent_path.write_bytes(b"clean-h3-av-latent")
         return GenerationResult(
             runtime_key=self.key,
             elapsed_seconds=1.25,
             output_path=self.video_path,
+            final_latents_path=latent_path,
+        )
+
+    async def second_sample(
+        self, spec, second_sampling: SecondSamplingSpec, source_latents_path,
+        job_id, _first_frame, _last_frame, _reference_images,
+        _reference_videos, _reference_audios, cancel_event,
+        progress_callback=None,
+    ) -> GenerationResult:
+        if cancel_event.is_set():
+            raise JobCancelled("cancelled")
+        self.last_spec = spec
+        self.last_second_sampling = second_sampling
+        output = self.video_path.with_name(f"{job_id}.mp4")
+        output.write_bytes(b"h3-second-sampled-video")
+        latent_path = output.with_suffix(".pt")
+        latent_path.write_bytes(b"second-pass-clean-latent")
+        if progress_callback:
+            progress_callback({
+                "percent": 70, "stage": "second_sampling", "detail": "1/1",
+            })
+        return GenerationResult(
+            runtime_key="original:native-sm89",
+            elapsed_seconds=2.0,
+            output_path=output,
+            inference_plan={"ultimate_upscale": {"full_canvas": True}},
+            final_latents_path=latent_path,
         )
 
     async def stop(self) -> None:
@@ -184,9 +229,13 @@ class ApiTest(AioHTTPTestCase):
         self.assertEqual(set(options["engines"]), {"original", "lora"})
         self.assertEqual(options["defaults"]["quality"], "balanced")
         self.assertIn("1080p", options["resolutions"])
-        self.assertEqual(options["duration"]["max_by_resolution"]["1080p"], 8)
-        self.assertEqual(options["duration"]["max_by_preset"]["1080p"]["4:3"], 10.0)
-        self.assertIn("2k", options["advanced_limits"]["upscaler"]["levels"])
+        self.assertNotIn("2k", options["resolutions"])
+        self.assertIn(
+            "1440p", options["advanced_limits"]["second_sampling"]["levels"]
+        )
+        self.assertEqual(options["duration"]["max_by_resolution"]["1080p"], 15)
+        self.assertEqual(options["duration"]["max_by_preset"]["1080p"]["4:3"], 15.0)
+        self.assertIn("1440p", options["advanced_limits"]["upscaler"]["levels"])
         self.assertFalse(options["advanced_limits"]["sparse_attention_available"])
         self.assertEqual(
             options["advanced_limits"]["acceleration"]["scheduler"],
@@ -199,7 +248,7 @@ class ApiTest(AioHTTPTestCase):
                 "lora": "h3_lora_v1_no_forecast_round229",
             },
         )
-        self.assertEqual(self.app["job_service"].backend.preloaded, "first_last")
+        self.assertEqual(self.app["job_service"].backend.preloaded, "fl2va_int8_24gb")
 
         health = await (await self.client.get("/healthz")).json()
         self.assertEqual(health["warm_state"]["status"], "ready")
@@ -235,6 +284,233 @@ class ApiTest(AioHTTPTestCase):
         response = await self.client.get(f"/api/v1/jobs/{job_id}/video", headers=headers)
         self.assertEqual(response.status, 200)
         self.assertEqual(await response.read(), b"test-video")
+
+    async def test_settings_can_discover_and_switch_native_h3_lora(self) -> None:
+        from safetensors.numpy import save_file
+
+        lora_root = self.temporary / "models" / "loras"
+        lora_root.mkdir(parents=True)
+        compatible = lora_root / "release-v2.safetensors"
+        save_file({
+            "blocks.0.attn.to_q.lora_A.weight": np.zeros((1, 1), dtype=np.float16),
+            "blocks.0.attn.to_q.lora_B.weight": np.zeros((1, 1), dtype=np.float16),
+        }, compatible, metadata={"base_model": "MiniMax-H3"})
+        save_file({
+            "diffusion_model.other.weight": np.zeros((1, 1), dtype=np.float16),
+        }, lora_root / "foreign.safetensors")
+        lightx = lora_root / "minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors"
+        lightx_state = {}
+        for index in range(312):
+            prefix = f"synthetic.{index}"
+            lightx_state[f"{prefix}.lora_A.default.weight"] = np.zeros(
+                (1, 1), dtype=np.float16
+            )
+            lightx_state[f"{prefix}.lora_B.default.weight"] = np.zeros(
+                (1, 1), dtype=np.float16
+            )
+        save_file(
+            lightx_state,
+            lightx,
+            metadata={"key_format": "minimax-h3-diffusers", "alpha": "128"},
+        )
+
+        headers = {"X-API-Key": "secret"}
+        response = await self.client.get("/api/v1/settings/lora", headers=headers)
+        self.assertEqual(response.status, 200)
+        catalog = await response.json()
+        by_id = {item["id"]: item for item in catalog["available"]}
+        self.assertTrue(by_id["release-v2.safetensors"]["compatible"])
+        self.assertEqual(by_id["release-v2.safetensors"]["pair_count"], 1)
+        self.assertFalse(by_id["foreign.safetensors"]["compatible"])
+        lightx_item = by_id[lightx.name]
+        self.assertTrue(lightx_item["compatible"])
+        self.assertEqual(lightx_item["pair_count"], 312)
+        self.assertEqual(
+            lightx_item["profile"]["profile_id"],
+            "lightx2v_fl2v_4step_v1_1_768p",
+        )
+        self.assertEqual(lightx_item["profile"]["default_steps"], 4)
+
+        response = await self.client.put(
+            "/api/v1/settings/lora", headers=headers,
+            json={"checkpoint": "release-v2.safetensors"},
+        )
+        self.assertEqual(response.status, 200)
+        changed = await response.json()
+        self.assertTrue(changed["changed"])
+        self.assertEqual(changed["selected"], "release-v2.safetensors")
+        self.assertEqual(changed["loaded"], "release-v2.safetensors")
+        self.assertEqual(
+            json.loads(
+                (self.temporary / "data/settings/lora.json").read_text(
+                    encoding="utf-8"
+                )
+            )["checkpoint"],
+            "release-v2.safetensors",
+        )
+
+        response = await self.client.put(
+            "/api/v1/settings/lora", headers=headers,
+            json={"checkpoint": "foreign.safetensors"},
+        )
+        self.assertEqual(response.status, 400)
+
+        failing = lora_root / "broken-build.safetensors"
+        save_file({
+            "blocks.0.attn.to_q.lora_A.weight": np.zeros((1, 1), dtype=np.float16),
+            "blocks.0.attn.to_q.lora_B.weight": np.zeros((1, 1), dtype=np.float16),
+        }, failing, metadata={"base_model": "MiniMax-H3"})
+        backend = self.app["job_service"].backend
+        backend.fail_lora_checkpoint = failing.name
+        response = await self.client.put(
+            "/api/v1/settings/lora", headers=headers,
+            json={"checkpoint": failing.name},
+        )
+        self.assertEqual(response.status, 500)
+        self.assertEqual(backend.lora_checkpoint.name, "release-v2.safetensors")
+        self.assertEqual(backend.warm_state["status"], "ready")
+        persisted = json.loads(
+            (self.temporary / "data/settings/lora.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted["checkpoint"], "release-v2.safetensors")
+
+    async def test_completed_card_can_queue_native_h3_second_sampling(self) -> None:
+        headers = {"X-API-Key": "secret"}
+        response = await self.client.post(
+            "/api/v1/generations", headers=headers, json={
+                "prompt": "low resolution selectable card",
+                "resolution": "480p", "aspect_ratio": "16:9",
+                "duration_seconds": 15,
+                "model_variant": "lora",
+            },
+        )
+        source_id = (await response.json())["id"]
+        for _ in range(80):
+            source = await (
+                await self.client.get(
+                    f"/api/v1/jobs/{source_id}", headers=headers
+                )
+            ).json()
+            if source["status"] in {"succeeded", "failed"}:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(source["status"], "succeeded")
+        self.assertEqual(source["request"]["model_variant"], "lora")
+        self.assertTrue(source["second_sampling_available"])
+
+        response = await self.client.post(
+            f"/api/v1/jobs/{source_id}/second-sampling",
+            headers=headers,
+            json={
+                "resolution": "1080p", "steps": 1,
+                "acceleration": 75, "strength": "enhance",
+                "memory_mode": "auto",
+                "temporal_window_frames": 119,
+            },
+        )
+        self.assertEqual(response.status, 202, await response.text())
+        child_id = (await response.json())["id"]
+        for _ in range(80):
+            child = await (
+                await self.client.get(
+                    f"/api/v1/jobs/{child_id}", headers=headers
+                )
+            ).json()
+            if child["status"] in {"succeeded", "failed"}:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(child["status"], "succeeded")
+        self.assertEqual(child["second_sampling"]["source_job_id"], source_id)
+        self.assertEqual(child["request"]["model_variant"], "base")
+        self.assertEqual(child["second_sampling"]["model_variant"], "base")
+        self.assertEqual(child["second_sampling"]["strength"], "enhance")
+        self.assertEqual(child["second_sampling"]["denoise"], 0.25)
+        self.assertEqual(
+            child["second_sampling"]["temporal_window_frames"], 119
+        )
+        self.assertEqual(
+            (child["second_sampling"]["width"], child["second_sampling"]["height"]),
+            (1920, 1088),
+        )
+        self.assertTrue(child["inference_plan"]["ultimate_upscale"]["full_canvas"])
+        video = await self.client.get(
+            f"/api/v1/jobs/{child_id}/video", headers=headers
+        )
+        self.assertEqual(await video.read(), b"h3-second-sampled-video")
+
+    async def test_latent_cache_clear_keeps_history_and_videos(self) -> None:
+        service = self.app["job_service"]
+        latent_root = service.output_root / ".h3-latents"
+        latent_root.mkdir(parents=True, exist_ok=True)
+        latent = latent_root / "cache-test.pt"
+        latent.write_bytes(b"reproducible-clean-av-latent")
+        checkpoint = service.data_dir / "checkpoints" / "cache-test.pt"
+        checkpoint.write_bytes(b"formal-checkpoint-tensor")
+        spec = GenerationSpec.from_mapping({
+            "prompt": "cache cleanup card", "resolution": "480p",
+        })
+        job = JobRecord(
+            id="cache-test", spec=spec, status="succeeded",
+            output_path=self.video, final_latents_path=latent,
+            checkpoint_path=checkpoint, checkpoint_retained=True,
+        )
+        service.jobs[job.id] = job
+        service.persist(job)
+
+        response = await self.client.delete(
+            "/api/v1/cache/latents", headers={"X-API-Key": "secret"}
+        )
+        self.assertEqual(response.status, 200, await response.text())
+        result = await response.json()
+        self.assertEqual(result["removed_files"], 2)
+        self.assertEqual(result["removed_checkpoint_files"], 1)
+        self.assertFalse(latent.exists())
+        self.assertFalse(checkpoint.exists())
+        self.assertTrue(self.video.exists())
+        self.assertIn(job.id, service.jobs)
+        self.assertIsNone(service.jobs[job.id].final_latents_path)
+        self.assertIsNone(service.jobs[job.id].checkpoint_path)
+        self.assertFalse(service.serialize(service.jobs[job.id])["second_sampling_available"])
+
+    async def test_w4a8_completed_card_exposes_second_sampling_entry(self) -> None:
+        service = self.app["job_service"]
+        latent_root = service.output_root / ".h3-latents"
+        latent_root.mkdir(parents=True, exist_ok=True)
+        latent = latent_root / "w4a8-source.pt"
+        latent.write_bytes(b"retained-w4a8-clean-av-latent")
+        spec = GenerationSpec.from_mapping({
+            "prompt": "8GB selectable card",
+            "runtime_launcher": "fl2va_w4a8_8gb",
+            "resolution": "480p",
+        })
+        job = JobRecord(
+            id="w4a8-source",
+            spec=spec,
+            status="succeeded",
+            output_path=self.video,
+            final_latents_path=latent,
+        )
+        self.assertTrue(service.serialize(job)["second_sampling_available"])
+
+    async def test_public_second_sampling_uses_1440p_name(self) -> None:
+        service = self.app["job_service"]
+        source = GenerationSpec.from_mapping({
+            "prompt": "public resolution name",
+            "resolution": "480p",
+        })
+        second = SecondSamplingSpec.from_mapping({
+            "resolution": "1440p",
+            "steps": 1,
+        }, source=source)
+        job = JobRecord(
+            id="public-1440p",
+            spec=source,
+            status="queued",
+            second_sampling=second,
+        )
+        public = service.serialize(job)
+        self.assertEqual(second.resolution, "2k")
+        self.assertEqual(public["second_sampling"]["resolution"], "1440p")
 
     async def test_generation_limits_are_saved_and_drive_options_and_validation(self) -> None:
         headers = {"X-API-Key": "secret"}
@@ -306,42 +582,57 @@ class ApiTest(AioHTTPTestCase):
         rejected = await self.client.post(
             "/api/v1/generations", headers=headers, json={
                 "prompt": "too long at 1080p", "resolution": "1080p",
-                "aspect_ratio": "16:9", "duration_seconds": 8.5,
+                "aspect_ratio": "16:9", "duration_seconds": 15.5,
             },
         )
         rejected_body = await rejected.text()
         self.assertEqual(rejected.status, 400, rejected_body)
-        self.assertIn("at most 8.000 seconds", rejected_body)
+        self.assertIn("at most 15.000 seconds", rejected_body)
 
         accepted = await self.client.post(
             "/api/v1/generations", headers=headers, json={
                 "prompt": "validated 1080p", "resolution": "1080p",
-                "aspect_ratio": "16:9", "duration_seconds": 8,
+                "aspect_ratio": "16:9", "duration_seconds": 15,
             },
         )
         self.assertEqual(accepted.status, 202, await accepted.text())
         request = (await accepted.json())["request"]
         self.assertEqual((request["width"], request["height"]), (1920, 1088))
-        self.assertEqual(request["frames"], 192)
+        self.assertEqual(request["frames"], 362)
 
         accepted_four_three = await self.client.post(
             "/api/v1/generations", headers=headers, json={
                 "prompt": "validated longer 1080p 4:3", "resolution": "1080p",
-                "aspect_ratio": "4:3", "duration_seconds": 10,
+                "aspect_ratio": "4:3", "duration_seconds": 15,
             },
         )
         self.assertEqual(accepted_four_three.status, 202, await accepted_four_three.text())
         request = (await accepted_four_three.json())["request"]
         self.assertEqual((request["width"], request["height"], request["frames"]),
-                         (1440, 1088, 243))
+                         (1440, 1088, 362))
 
         accepted_square = await self.client.post(
             "/api/v1/generations", headers=headers, json={
                 "prompt": "validated longer 1080p square", "resolution": "1080p",
-                "aspect_ratio": "1:1", "duration_seconds": 13.5,
+                "aspect_ratio": "1:1", "duration_seconds": 15,
             },
         )
         self.assertEqual(accepted_square.status, 202, await accepted_square.text())
+
+    async def test_2k_first_pass_is_rejected_and_reserved_for_second_sampling(self) -> None:
+        response = await self.client.post(
+            "/api/v1/generations",
+            headers={"X-API-Key": "secret"},
+            json={
+                "prompt": "experimental full-context 2k route",
+                "resolution": "2k",
+                "aspect_ratio": "16:9",
+                "duration_seconds": 15,
+                "memory_mode": "auto",
+            },
+        )
+        self.assertEqual(response.status, 400, await response.text())
+        self.assertIn("1080p", await response.text())
 
     async def test_request_can_hot_switch_variant_inside_fixed_family(self) -> None:
         response = await self.client.post(
@@ -388,9 +679,7 @@ class ApiTest(AioHTTPTestCase):
                 "execution_mode": "checkpoint",
                 "checkpoint_step": 3,
                 "checkpoint_retain": True,
-                "checkpoint_preview": True,
-                "checkpoint_preview_steps": 4,
-                "checkpoint_preview_resolution": "360p",
+                "checkpoint_preview": False,
             },
         )
         self.assertEqual(response.status, 202, await response.text())
@@ -406,7 +695,7 @@ class ApiTest(AioHTTPTestCase):
         self.assertEqual(state["checkpoint"]["completed_steps"], 3)
         self.assertEqual(state["checkpoint"]["total_steps"], 8)
         self.assertTrue(state["checkpoint"]["resume_available"])
-        self.assertTrue(state["preview"]["ready"])
+        self.assertNotIn("preview", state)
         self.assertEqual(state["request"]["model_variant"], "lora")
         self.assertEqual(state["request"]["sampling_steps"], 8)
         self.assertEqual(state["request"]["acceleration"], 50.0)
@@ -439,7 +728,40 @@ class ApiTest(AioHTTPTestCase):
         self.assertEqual(state["status"], "succeeded")
         self.assertEqual(state["generation_elapsed_seconds"], 1.75)
 
-    async def test_fork_preview_pauses_and_resumes_the_same_job(self) -> None:
+    async def test_failed_resume_with_retained_checkpoint_can_be_retried(self) -> None:
+        headers = {"X-API-Key": "secret"}
+        response = await self.client.post(
+            "/api/v1/generations", headers=headers, json={
+                "prompt": "retry retained formal checkpoint",
+                "execution_mode": "checkpoint",
+                "checkpoint_step": 3,
+                "checkpoint_retain": True,
+            },
+        )
+        job_id = (await response.json())["id"]
+        for _ in range(100):
+            state = await (
+                await self.client.get(f"/api/v1/jobs/{job_id}", headers=headers)
+            ).json()
+            if state["status"] == "checkpointed":
+                break
+            await asyncio.sleep(0.01)
+        service = self.app["job_service"]
+        job = service.jobs[job_id]
+        job.status = "failed"
+        job.error = "simulated resume failure"
+        service.persist(job)
+        failed_state = await (
+            await self.client.get(f"/api/v1/jobs/{job_id}", headers=headers)
+        ).json()
+        self.assertTrue(failed_state["checkpoint"]["resume_available"])
+
+        retried = await self.client.post(
+            f"/api/v1/jobs/{job_id}/resume", headers=headers
+        )
+        self.assertEqual(retried.status, 202, await retried.text())
+
+    async def test_fork_preview_is_replaced_by_second_sampling(self) -> None:
         headers = {"X-API-Key": "secret"}
         response = await self.client.post(
             "/api/v1/generations", headers=headers, json={
@@ -448,71 +770,159 @@ class ApiTest(AioHTTPTestCase):
                 "preview_branch_steps": 2,
             },
         )
-        self.assertEqual(response.status, 202, await response.text())
-        job_id = (await response.json())["id"]
+        self.assertEqual(response.status, 400)
+        self.assertIn("native H3 second sampling", await response.text())
 
-        state = None
-        for _ in range(100):
-            state = await (
-                await self.client.get(f"/api/v1/jobs/{job_id}", headers=headers)
-            ).json()
-            if state["status"] == "awaiting_preview":
-                break
-            await asyncio.sleep(0.01)
-        self.assertEqual(state["status"], "awaiting_preview")
-        self.assertTrue(state["preview"]["ready"])
-        preview = await self.client.get(
-            f"/api/v1/jobs/{job_id}/preview", headers=headers
-        )
-        self.assertEqual(await preview.read(), b"preview-video")
-
-        response = await self.client.post(
-            f"/api/v1/jobs/{job_id}/preview/continue", headers=headers
-        )
-        self.assertEqual(response.status, 200, await response.text())
-        for _ in range(100):
-            state = await (
-                await self.client.get(f"/api/v1/jobs/{job_id}", headers=headers)
-            ).json()
-            if state["status"] in {"succeeded", "failed", "cancelled"}:
-                break
-            await asyncio.sleep(0.01)
-        self.assertEqual(state["status"], "succeeded")
-        self.assertEqual(state["preview"]["decision"], "continue")
-
-    async def test_fork_preview_can_discard_the_card(self) -> None:
+    async def test_checkpoint_preview_is_generated_and_resumable(self) -> None:
         headers = {"X-API-Key": "secret"}
         response = await self.client.post(
             "/api/v1/generations", headers=headers, json={
-                "prompt": "discard preview", "preview_mode": "pause",
+                "prompt": "retired checkpoint preview",
+                "execution_mode": "checkpoint",
+                "checkpoint_step": 3,
+                "checkpoint_preview": True,
             },
         )
+        self.assertEqual(response.status, 202, await response.text())
         job_id = (await response.json())["id"]
         for _ in range(100):
             state = await (
-                await self.client.get(f"/api/v1/jobs/{job_id}", headers=headers)
+                await self.client.get(
+                    f"/api/v1/jobs/{job_id}", headers=headers
+                )
             ).json()
-            if state["status"] == "awaiting_preview":
+            if state["status"] == "checkpointed":
                 break
             await asyncio.sleep(0.01)
-        self.assertEqual(state["status"], "awaiting_preview")
+        self.assertEqual(state["status"], "checkpointed")
+        self.assertTrue(state["preview"]["ready"])
+        self.assertTrue(state["checkpoint"]["resume_available"])
+
+    async def test_checkpoint_preview_defaults_on_for_legacy_console(self) -> None:
+        headers = {"X-API-Key": "secret"}
         response = await self.client.post(
-            f"/api/v1/jobs/{job_id}/preview/discard", headers=headers
+            "/api/v1/generations", headers=headers, json={
+                "prompt": "legacy console checkpoint",
+                "execution_mode": "checkpoint",
+                "checkpoint_step": 3,
+            },
         )
-        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(response.status, 202, await response.text())
+        job_id = (await response.json())["id"]
         for _ in range(100):
             state = await (
-                await self.client.get(f"/api/v1/jobs/{job_id}", headers=headers)
+                await self.client.get(
+                    f"/api/v1/jobs/{job_id}", headers=headers
+                )
             ).json()
-            if state["status"] in {"succeeded", "failed", "cancelled"}:
+            if state["status"] == "checkpointed":
                 break
             await asyncio.sleep(0.01)
-        self.assertEqual(state["status"], "cancelled")
-        self.assertEqual(state["preview"]["decision"], "discard")
+        self.assertEqual(state["status"], "checkpointed")
+        self.assertTrue(state["request"]["checkpoint_preview"])
+        self.assertTrue(state["preview"]["ready"])
 
-    async def test_optional_upscale_runs_after_generation_and_tracks_breakdown(self) -> None:
-        service = self.app["job_service"]
-        service.upscaler = FakeUpscaler()
+    async def test_stale_same_origin_console_false_still_gets_preview(self) -> None:
+        origin = str(self.client.make_url("/")).rstrip("/")
+        headers = {"X-API-Key": "secret", "Origin": origin}
+        response = await self.client.post(
+            "/api/v1/generations", headers=headers, json={
+                "prompt": "stale console checkpoint",
+                "execution_mode": "checkpoint",
+                "checkpoint_step": 3,
+                "checkpoint_preview": False,
+            },
+        )
+        self.assertEqual(response.status, 202, await response.text())
+        job_id = (await response.json())["id"]
+        for _ in range(100):
+            state = await (
+                await self.client.get(
+                    f"/api/v1/jobs/{job_id}",
+                    headers={"X-API-Key": "secret"},
+                )
+            ).json()
+            if state["status"] == "checkpointed":
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(state["status"], "checkpointed")
+        self.assertTrue(state["request"]["checkpoint_preview"])
+        self.assertTrue(state["preview"]["ready"])
+
+    async def test_multipart_console_without_origin_cannot_disable_preview(self) -> None:
+        form = aiohttp.FormData(default_to_multipart=True)
+        for name, value in {
+            "prompt": "embedded browser checkpoint",
+            "execution_mode": "checkpoint",
+            "checkpoint_step": "3",
+            "checkpoint_preview": "false",
+            "checkpoint_preview_steps": "4",
+            "checkpoint_preview_resolution": "360p",
+        }.items():
+            form.add_field(name, value)
+        response = await self.client.post(
+            "/api/v1/generations",
+            headers={"X-API-Key": "secret"},
+            data=form,
+        )
+        self.assertEqual(response.status, 202, await response.text())
+        job_id = (await response.json())["id"]
+        for _ in range(100):
+            state = await (
+                await self.client.get(
+                    f"/api/v1/jobs/{job_id}",
+                    headers={"X-API-Key": "secret"},
+                )
+            ).json()
+            if state["status"] == "checkpointed":
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(state["status"], "checkpointed")
+        self.assertTrue(state["request"]["checkpoint_preview"])
+        self.assertEqual(state["request"]["checkpoint_preview_steps"], 4)
+        self.assertEqual(
+            state["request"]["checkpoint_preview_resolution"], "360p"
+        )
+        self.assertTrue(state["preview"]["ready"])
+
+    async def test_checkpoint_preview_global_settings_round_trip(self) -> None:
+        headers = {"X-API-Key": "secret"}
+        response = await self.client.put(
+            "/api/v1/settings/checkpoint-preview",
+            headers=headers,
+            json={"steps": 6, "resolution": "480p"},
+        )
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(
+            await response.json(),
+            {
+                "steps": 6,
+                "resolution": "480p",
+                "step_range": {"min": 1, "max": 8},
+                "resolutions": ["360p", "480p", "720p"],
+            },
+        )
+        response = await self.client.post(
+            "/api/v1/generations",
+            headers=headers,
+            json={
+                "prompt": "global checkpoint preview defaults",
+                "execution_mode": "checkpoint",
+                "checkpoint_step": 3,
+                "checkpoint_preview": True,
+            },
+        )
+        self.assertEqual(response.status, 202, await response.text())
+        self.assertEqual(
+            self.app["job_service"].backend.last_spec.checkpoint_preview_steps,
+            6,
+        )
+        self.assertEqual(
+            self.app["job_service"].backend.last_spec.checkpoint_preview_resolution,
+            "480p",
+        )
+
+    async def test_legacy_upscale_request_points_to_native_second_sampling(self) -> None:
         response = await self.client.post(
             "/api/v1/generations", headers={"X-API-Key": "secret"}, json={
                 "prompt": "upscaled scene", "seed": 7,
@@ -520,51 +930,14 @@ class ApiTest(AioHTTPTestCase):
                 "upscale_resolution": "1080p",
             },
         )
-        self.assertEqual(response.status, 202)
-        job_id = (await response.json())["id"]
-        for _ in range(50):
-            job = await (
-                await self.client.get(
-                    f"/api/v1/jobs/{job_id}", headers={"X-API-Key": "secret"}
-                )
-            ).json()
-            if job["status"] in {"succeeded", "failed"}:
-                break
-            await asyncio.sleep(0.01)
-        self.assertEqual(job["status"], "succeeded")
-        self.assertEqual(job["generation_elapsed_seconds"], 1.25)
-        self.assertEqual(job["upscale_elapsed_seconds"], 2.5)
-        self.assertEqual(job["elapsed_seconds"], 3.75)
-        self.assertEqual(job["upscale_peak_allocated_mib"], 9000.0)
-        self.assertEqual(job["request"]["upscale_target_width"], 1944)
-        self.assertEqual(job["request"]["upscale_target_height"], 1080)
+        self.assertEqual(response.status, 400)
+        self.assertIn("native H3 second sampling", await response.text())
 
-    async def test_64gb_upscale_exclusively_releases_and_restores_h3(self) -> None:
-        service = self.app["job_service"]
-        upscaler = FakeUpscaler()
-        service.upscaler = upscaler
-        service.memory_profile_getter = lambda: HOST_MEMORY_PROFILES["generation_hot"]
-        response = await self.client.post(
-            "/api/v1/generations", headers={"X-API-Key": "secret"}, json={
-                "prompt": "exclusive upscale", "seed": 8,
-                "upscale_enabled": True, "upscale_mode": "basic",
-                "upscale_resolution": "720p",
-            },
-        )
-        job_id = (await response.json())["id"]
-        for _ in range(50):
-            job = await (
-                await self.client.get(
-                    f"/api/v1/jobs/{job_id}", headers={"X-API-Key": "secret"}
-                )
-            ).json()
-            if job["status"] in {"succeeded", "failed"}:
-                break
-            await asyncio.sleep(0.01)
-        self.assertEqual(job["status"], "succeeded")
-        self.assertEqual(upscaler.stop_calls, 1)
-        self.assertEqual(service.backend.preloaded, "original")
-        self.assertEqual(service.backend.warm_state["status"], "ready")
+    async def test_default_service_does_not_preload_retired_flashvsr(self) -> None:
+        status = self.app["job_service"].upscaler.status()
+        self.assertFalse(status["ready"])
+        self.assertEqual(status["resident_state"], "removed")
+        self.assertIn("second-sampling", status["replacement"])
 
     async def test_mimo_enhancement_key_is_ephemeral_request_metadata(self) -> None:
         storyboard = {
@@ -857,7 +1230,7 @@ class UnifiedConsoleApiTest(AioHTTPTestCase):
 
         response = await self.client.put("/api/v1/engine", json={"engine": "lora"})
         self.assertEqual(response.status, 200, await response.text())
-        self.assertEqual(self.backend.preloaded, "first_last")
+        self.assertEqual(self.backend.preloaded, "fl2va_int8_24gb")
         options = await (await self.client.get("/api/v1/options")).json()
         self.assertEqual(options["current_engine"], "first_last")
         self.assertEqual(options["current_model_variant"], "lora")
@@ -871,13 +1244,93 @@ class UnifiedConsoleApiTest(AioHTTPTestCase):
 
         response = await self.client.put("/api/v1/engine", json={"engine": "reference"})
         self.assertEqual(response.status, 200, await response.text())
-        self.assertEqual(self.backend.preloaded, "reference")
+        self.assertEqual(self.backend.preloaded, "ref2va_int8_24gb")
 
         response = await self.client.delete("/api/v1/engine")
         self.assertEqual(response.status, 200, await response.text())
         response = await self.client.put("/api/v1/engine", json={"engine": "reference_lora"})
         self.assertEqual(response.status, 200, await response.text())
-        self.assertEqual(self.backend.preloaded, "reference")
+        self.assertEqual(self.backend.preloaded, "ref2va_int8_24gb")
+
+        response = await self.client.delete("/api/v1/engine")
+        self.assertEqual(response.status, 200, await response.text())
+        response = await self.client.put(
+            "/api/v1/engine",
+            json={"launcher": "fl2va_w4a8_8gb", "model_variant": "lora"},
+        )
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(self.backend.preloaded, "fl2va_w4a8_8gb")
+        options = await (await self.client.get("/api/v1/options")).json()
+        self.assertEqual(options["current_launcher"], "fl2va_w4a8_8gb")
+        self.assertEqual(options["active_weight_tier"], "w4a8")
+        self.assertEqual(options["resolutions"], ["360p", "480p", "720p"])
+        self.assertTrue(
+            options["advanced_limits"]["second_sampling"]["available"]
+        )
+        self.assertEqual(
+            options["advanced_limits"]["second_sampling"]["levels"],
+            ["720p", "1080p"],
+        )
+
+        response = await self.client.delete("/api/v1/engine")
+        self.assertEqual(response.status, 200, await response.text())
+        response = await self.client.put(
+            "/api/v1/engine",
+            json={"launcher": "ref2va_int8_16gb"},
+        )
+        self.assertEqual(response.status, 200, await response.text())
+        options = await (await self.client.get("/api/v1/options")).json()
+        self.assertEqual(options["active_vram_profile"], "16gb")
+        self.assertEqual(
+            options["resolutions"], ["360p", "480p", "720p", "1080p"]
+        )
+        self.assertEqual(
+            options["advanced_limits"]["second_sampling"]["levels"],
+            ["720p", "1080p", "1440p"],
+        )
+
+    async def test_16gb_completed_card_can_queue_1440p_second_sampling(self) -> None:
+        response = await self.client.put(
+            "/api/v1/engine", json={"launcher": "ref2va_int8_16gb"}
+        )
+        self.assertEqual(response.status, 200, await response.text())
+        service = self.app["job_service"]
+        latent = service.output_root / ".h3-latents" / "ref16-source.pt"
+        latent.parent.mkdir(parents=True, exist_ok=True)
+        latent.write_bytes(b"ref16-clean-av-latent")
+        source = JobRecord(
+            id="ref16-source",
+            spec=GenerationSpec.from_mapping({
+                "prompt": "16GB 1440P second-sampling release boundary",
+                "runtime_launcher": "ref2va_int8_16gb",
+                "service_family": "reference",
+                "resolution": "480p",
+                "duration_seconds": 15,
+            }),
+            status="succeeded",
+            output_path=self.video,
+            final_latents_path=latent,
+        )
+        service.jobs[source.id] = source
+        response = await self.client.post(
+            f"/api/v1/jobs/{source.id}/second-sampling",
+            json={
+                "resolution": "1440p",
+                "steps": 1,
+                "acceleration": 100,
+                "strength": "preserve",
+            },
+        )
+        self.assertEqual(response.status, 202, await response.text())
+        child = await response.json()
+        self.assertEqual(child["second_sampling"]["resolution"], "1440p")
+        self.assertEqual(
+            (
+                child["second_sampling"]["width"],
+                child["second_sampling"]["height"],
+            ),
+            (2560, 1440),
+        )
 
     async def test_busy_queue_blocks_engine_exit(self) -> None:
         await self.client.put("/api/v1/engine", json={"engine": "original"})

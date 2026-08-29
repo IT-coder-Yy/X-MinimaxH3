@@ -52,6 +52,30 @@ class LowRankUpdate:
 
 
 @dataclass(frozen=True, slots=True)
+class SlicedLowRankUpdate:
+    """Independent LoRA projections that target slices of one fused linear.
+
+    Diffusers stores MiniMax H3 Q/K/V adapters as three separate rank-128
+    projections, while the native runtime deliberately keeps the checkpoint's
+    fused QKV base matrix.  A block-diagonal merge would be exact but would
+    triple the expensive output GEMM and materialize more than a GiB of zeros.
+    Retaining the three updates and writing each into its own output slice is
+    both mathematically exact and faithful to the upstream execution cost.
+    """
+
+    slices: tuple[tuple[int, int, LowRankUpdate], ...]
+
+    def __post_init__(self) -> None:
+        previous_stop = 0
+        for start, stop, update in self.slices:
+            if not 0 <= start < stop or start < previous_stop:
+                raise ValueError("LoRA output slices must be ordered and disjoint")
+            if update.up.shape[0] != stop - start:
+                raise ValueError("LoRA output slice width does not match update")
+            previous_stop = stop
+
+
+@dataclass(frozen=True, slots=True)
 class AdaLNCurveRows:
     """Curve coordinates interpolated once and shared by all 50 blocks."""
 
@@ -62,13 +86,80 @@ class AdaLNCurveRows:
 class RuntimeLoRALinear(nn.Module):
     """Preserve a quantized base path and add the LoRA in activation space."""
 
-    def __init__(self, base: nn.Module, update: LowRankUpdate) -> None:
+    def __init__(
+        self,
+        base: nn.Module,
+        update: LowRankUpdate | SlicedLowRankUpdate,
+    ) -> None:
         super().__init__()
         self.base = base
-        self.update = ResidentLowRankUpdate(update)
+        self.update = (
+            ResidentSlicedLowRankUpdate(update)
+            if isinstance(update, SlicedLowRankUpdate)
+            else ResidentLowRankUpdate(update)
+        )
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return self.update.apply(value, self.base(value))
+
+    def forward_output_slice(
+        self, value: torch.Tensor, start: int, stop: int
+    ) -> torch.Tensor:
+        """Preserve compact Q/K/V projection without dropping the adapter."""
+
+        base_slice = getattr(self.base, "forward_output_slice", None)
+        if not callable(base_slice):
+            raise RuntimeError(
+                "the quantized LoRA base does not support output-row slicing"
+            )
+        return self.update.apply_output_slice(
+            value,
+            base_slice(value, start, stop),
+            start,
+            stop,
+        )
+
+    def prepare_output_slices(self, value: torch.Tensor):
+        """Prepare only the quantized base input; LoRA math stays unchanged."""
+
+        prepare = getattr(self.base, "prepare_output_slices", None)
+        if not callable(prepare):
+            raise RuntimeError(
+                "the quantized LoRA base does not support prepared output slices"
+            )
+        return prepare(value)
+
+    def forward_prepared_output_slice(
+        self,
+        value: torch.Tensor,
+        prepared,
+        row_start: int,
+        row_stop: int,
+        output_start: int,
+        output_stop: int,
+    ) -> torch.Tensor:
+        """Reuse base activation quantization without altering LoRA GEMMs."""
+
+        project = getattr(self.base, "forward_prepared_output_slice", None)
+        if not callable(project):
+            raise RuntimeError(
+                "the quantized LoRA base does not support prepared output slices"
+            )
+        value_rows = value[int(row_start):int(row_stop)]
+        base_output = project(
+            value,
+            prepared,
+            row_start,
+            row_stop,
+            output_start,
+            output_stop,
+        )
+        return self.update.apply_output_slice(
+            value_rows,
+            base_output,
+            output_start,
+            output_stop,
+        )
 
     def set_lora_enabled(self, enabled: bool) -> None:
         self.update.enabled = bool(enabled)
@@ -142,6 +233,112 @@ class ResidentLowRankUpdate(nn.Module):
         )
         return base_output
 
+    def apply_output_slice(
+        self,
+        value: torch.Tensor,
+        base_output: torch.Tensor,
+        start: int,
+        stop: int,
+    ) -> torch.Tensor:
+        """Add only the requested contiguous output rows of one LoRA pair."""
+
+        if not self.enabled:
+            return base_output
+        start, stop = int(start), int(stop)
+        if not 0 <= start < stop <= self.up.shape[0]:
+            raise ValueError("LoRA output slice lies outside the update")
+        if base_output.shape[-1] != stop - start:
+            raise ValueError("LoRA output slice does not match the base projection")
+        if self.down.device != value.device or self.up.device != value.device:
+            raise RuntimeError(
+                "LoRA residency mismatch: weights must move with their owning module"
+            )
+        dtype_mismatch = (
+            self.down.dtype != value.dtype or self.up.dtype != value.dtype
+        )
+        if dtype_mismatch and not self.allow_dtype_conversion:
+            raise RuntimeError(
+                "LoRA dtype mismatch: per-forward weight conversion is forbidden"
+            )
+        down = self.down.to(dtype=value.dtype) if dtype_mismatch else self.down
+        up = self.up[start:stop]
+        up = up.to(dtype=value.dtype) if dtype_mismatch else up
+        low_rank = F.linear(value, down)
+        output_2d = base_output.reshape(-1, base_output.shape[-1])
+        low_rank_2d = low_rank.reshape(-1, low_rank.shape[-1])
+        if torch.is_grad_enabled() and (
+            output_2d.requires_grad
+            or low_rank_2d.requires_grad
+            or up.requires_grad
+        ):
+            return (
+                output_2d + self.scale * low_rank_2d.mm(up.T)
+            ).reshape_as(base_output)
+        torch.addmm(
+            output_2d,
+            low_rank_2d,
+            up.T,
+            beta=1.0,
+            alpha=self.scale,
+            out=output_2d,
+        )
+        return base_output
+
+
+class ResidentSlicedLowRankUpdate(nn.Module):
+    """Resident form of separate Q/K/V LoRAs over one fused projection."""
+
+    def __init__(self, update: SlicedLowRankUpdate) -> None:
+        super().__init__()
+        self.slices = tuple((start, stop) for start, stop, _ in update.slices)
+        self.updates = nn.ModuleList(
+            ResidentLowRankUpdate(item) for _, _, item in update.slices
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return any(update.enabled for update in self.updates)
+
+    @enabled.setter
+    def enabled(self, enabled: bool) -> None:
+        for update in self.updates:
+            update.enabled = bool(enabled)
+
+    def apply(self, value: torch.Tensor, base_output: torch.Tensor) -> torch.Tensor:
+        for (start, stop), update in zip(self.slices, self.updates, strict=True):
+            target = base_output[..., start:stop]
+            base_output[..., start:stop] = update.apply(value, target)
+        return base_output
+
+    def apply_output_slice(
+        self,
+        value: torch.Tensor,
+        base_output: torch.Tensor,
+        start: int,
+        stop: int,
+    ) -> torch.Tensor:
+        start, stop = int(start), int(stop)
+        if base_output.shape[-1] != stop - start:
+            raise ValueError("LoRA output slice does not match the base projection")
+        for (global_start, global_stop), update in zip(
+            self.slices, self.updates, strict=True
+        ):
+            overlap_start = max(start, global_start)
+            overlap_stop = min(stop, global_stop)
+            if overlap_start >= overlap_stop:
+                continue
+            output_start = overlap_start - start
+            output_stop = overlap_stop - start
+            update_start = overlap_start - global_start
+            update_stop = overlap_stop - global_start
+            target = base_output[..., output_start:output_stop]
+            base_output[..., output_start:output_stop] = update.apply_output_slice(
+                value,
+                target,
+                update_start,
+                update_stop,
+            )
+        return base_output
 
 def load_larry_updates(
     state: Mapping[str, torch.Tensor], *, strength: float = 1.0
@@ -210,6 +407,101 @@ def load_larry_updates_from_safetensors(
                 alpha=alpha,
             )
     return updates
+
+
+def _load_lightx2v_updates_from_checkpoint(
+    checkpoint,
+    *,
+    strength: float,
+    device: torch.device | str | None,
+    dtype: torch.dtype | None,
+) -> dict[str, LowRankUpdate | SlicedLowRankUpdate]:
+    keys = set(checkpoint.keys())
+    metadata = checkpoint.metadata() or {}
+    try:
+        alpha = float(metadata.get("alpha", "8"))
+    except (TypeError, ValueError) as error:
+        raise ValueError("LightX2V LoRA metadata has an invalid alpha") from error
+    a_suffix = ".lora_A.default.weight"
+    b_suffix = ".lora_B.default.weight"
+    raw_modules = sorted(key[: -len(a_suffix)] for key in keys if key.endswith(a_suffix))
+    if len(raw_modules) != 312:
+        raise ValueError(f"LightX2V LoRA pair count {len(raw_modules)} != 312")
+
+    def pair(module_name: str) -> LowRankUpdate:
+        a_key = f"{module_name}{a_suffix}"
+        b_key = f"{module_name}{b_suffix}"
+        if a_key not in keys or b_key not in keys:
+            raise KeyError(f"missing paired LightX2V tensors for {module_name!r}")
+        down = checkpoint.get_tensor(a_key)
+        up = checkpoint.get_tensor(b_key)
+        if device is not None or dtype is not None:
+            down = down.to(device=device or down.device, dtype=dtype or down.dtype)
+            up = up.to(device=device or up.device, dtype=dtype or up.dtype)
+        return LowRankUpdate(
+            down=down,
+            up=up,
+            strength=strength,
+            alpha=alpha,
+        )
+
+    updates: dict[str, LowRankUpdate | SlicedLowRankUpdate] = {}
+
+    def convert_stack(source_prefix: str, target_prefix: str, count: int) -> None:
+        for index in range(count):
+            source = f"{source_prefix}.{index}"
+            target = f"{target_prefix}.{index}"
+            q = pair(f"{source}.attn.to_q")
+            k = pair(f"{source}.attn.to_k")
+            v = pair(f"{source}.attn.to_v")
+            q_width = int(q.up.shape[0])
+            k_width = int(k.up.shape[0])
+            v_width = int(v.up.shape[0])
+            updates[f"{target}.attn.qkv_proj"] = SlicedLowRankUpdate((
+                (0, q_width, q),
+                (q_width, q_width + k_width, k),
+                (q_width + k_width, q_width + k_width + v_width, v),
+            ))
+            updates[f"{target}.attn.out_proj"] = pair(f"{source}.attn.to_out.0")
+            updates[f"{target}.mlp.fc1"] = pair(f"{source}.ff.net.0.proj")
+            updates[f"{target}.mlp.fc2"] = pair(f"{source}.ff.net.2")
+
+    convert_stack("transformer_blocks", "blocks", 50)
+    convert_stack("token_refiner.refiner_blocks", "token_refiner.blocks", 2)
+    consumed = 50 * 6 + 2 * 6
+    if consumed != len(raw_modules) or len(updates) != 208:
+        raise RuntimeError("LightX2V LoRA conversion did not consume the full checkpoint")
+    return updates
+
+
+def load_h3_updates_from_safetensors(
+    path: str,
+    *,
+    strength: float = 1.0,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
+) -> dict[str, LowRankUpdate | SlicedLowRankUpdate]:
+    """Load either native-name or LightX2V Diffusers-format H3 adapters."""
+
+    try:
+        from safetensors import safe_open
+    except ImportError as error:
+        raise RuntimeError("safetensors is required to load H3 LoRA") from error
+    with safe_open(path, framework="pt", device="cpu") as checkpoint:
+        keys = set(checkpoint.keys())
+        if any(key.endswith(".lora_A.default.weight") for key in keys):
+            return _load_lightx2v_updates_from_checkpoint(
+                checkpoint,
+                strength=strength,
+                device=device,
+                dtype=dtype,
+            )
+    return load_larry_updates_from_safetensors(
+        path,
+        strength=strength,
+        device=device,
+        dtype=dtype,
+    )
 
 
 def interpolate_curve(table: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:

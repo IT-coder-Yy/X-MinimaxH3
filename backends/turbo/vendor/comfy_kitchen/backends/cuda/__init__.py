@@ -54,6 +54,7 @@ __all__ = [
     "dequantize_convrot_w4a4_weight",
     "dequantize_w4a8_int8_weight",
     "int8_linear",
+    "int8_linear_prequantized",
     "w4a8_int8_linear",
     "int4_linear",
     "convrot_w4a4_linear",
@@ -1773,6 +1774,189 @@ def scaled_mm_nvfp4(
     return out
 
 
+def _int8_linear_quantized_2d(
+    x_qdata: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Run only the GEMM/dequant half of :func:`int8_linear`.
+
+    Keeping this boundary inside the CUDA backend is important: callers that
+    reuse a row-quantized activation still hit the exact same CUTLASS/cuBLAS
+    selection and dequantization code as the ordinary dynamic-INT8 path.
+    """
+
+    if x_qdata.ndim != 2 or x_qdata.dtype != torch.int8:
+        raise ValueError("prequantized INT8 activations must be a rank-two int8 tensor")
+    if x_scale.numel() != x_qdata.shape[0]:
+        raise ValueError("prequantized activation scales must contain one value per row")
+    if weight.ndim != 2 or weight.dtype != torch.int8:
+        raise ValueError("INT8 linear weight must be a rank-two int8 tensor")
+    if x_qdata.shape[1] != weight.shape[1]:
+        raise ValueError("prequantized activation and weight inner dimensions differ")
+    if x_qdata.device != weight.device:
+        raise ValueError("prequantized activation and weight must share one CUDA device")
+    if not x_qdata.is_contiguous():
+        x_qdata = x_qdata.contiguous()
+    if not x_scale.is_contiguous():
+        x_scale = x_scale.contiguous()
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+
+    m, k = x_qdata.shape
+    n = weight.shape[0]
+    output_dtype_code = DTYPE_TO_CODE[out_dtype]
+    stream_ptr = torch.cuda.current_stream(x_qdata.device).cuda_stream
+
+    if m == 1 and k % 4 == 0:
+        weight_scale = _int8_weight_scale_arg(weight_scale, x_qdata.device)
+        out = torch.empty((1, n), dtype=out_dtype, device=x_qdata.device)
+        bias_arg = bias if bias is not None else _empty_cuda_tensor(x_qdata.device, out_dtype)
+        if bias is not None and (
+            bias.device != x_qdata.device
+            or bias.dtype != out_dtype
+            or not bias.is_contiguous()
+        ):
+            bias_arg = bias.to(device=x_qdata.device, dtype=out_dtype).contiguous()
+        _C.int8_gemv_dequant(
+            _wrap_for_dlpack(x_qdata),
+            _wrap_for_dlpack(weight),
+            _wrap_for_dlpack(x_scale),
+            _wrap_for_dlpack(weight_scale),
+            _wrap_for_dlpack(bias_arg),
+            _wrap_for_dlpack(out),
+            output_dtype_code,
+            stream_ptr,
+        )
+        return out
+
+    out = torch.empty((m, n), dtype=out_dtype, device=x_qdata.device)
+    weight_scale = _int8_weight_scale_arg(weight_scale, x_qdata.device)
+    bias_arg = bias if bias is not None else _empty_cuda_tensor(x_qdata.device, out_dtype)
+    if bias is not None and (
+        bias.device != x_qdata.device
+        or bias.dtype != out_dtype
+        or not bias.is_contiguous()
+    ):
+        bias_arg = bias.to(device=x_qdata.device, dtype=out_dtype).contiguous()
+
+    if (
+        _prefer_turing_fused_int8(m, n, k)
+        and _cuda_device_should_use_turing_kernels(x_qdata.get_device())
+        and hasattr(_C, "cutlass_turing_int8_dequant")
+    ):
+        turing_out = _int8_linear_turing_quantized(
+            x_qdata,
+            weight,
+            x_scale,
+            weight_scale,
+            bias_arg if bias is not None else None,
+            out_dtype,
+        )
+        if turing_out is not None:
+            return turing_out
+
+    used_cutlass = False
+    prefer_cublas_fallback = _prefer_cublas_int8_fallback(
+        m,
+        n,
+        k,
+        x_qdata.get_device(),
+    )
+    if (
+        not prefer_cublas_fallback
+        and not _DISABLE_CUTLASS_INT8
+        and _cuda_device_supports_cutlass_int8_dequant(x_qdata)
+    ):
+        ws_cutlass = (
+            weight_scale
+            if weight_scale.numel() == n
+            else weight_scale.expand(n).contiguous()
+        )
+        bias_f32 = (
+            bias_arg.to(torch.float32).contiguous()
+            if bias is not None
+            else bias_arg
+        )
+        used_cutlass = _C.cutlass_int8_dequant(
+            _wrap_for_dlpack(x_qdata),
+            _wrap_for_dlpack(weight),
+            _wrap_for_dlpack(x_scale),
+            _wrap_for_dlpack(ws_cutlass),
+            _wrap_for_dlpack(bias_f32),
+            _wrap_for_dlpack(out),
+            output_dtype_code,
+            stream_ptr,
+        )
+    if not used_cutlass:
+        use_turing_padding = (
+            x_qdata.is_cuda and _cuda_device_is_turing(x_qdata.get_device())
+        )
+        if use_turing_padding:
+            padded_k = _round_up(k, 16)
+            padded_n = _round_up(n, _cublas_int8_n_alignment(x_qdata))
+            cublas_x = _pad_2d_cols(x_qdata, padded_k)
+            cublas_weight = _pad_2d_rows(
+                _pad_2d_cols(weight, padded_k), padded_n
+            )
+        else:
+            padded_n = n
+            cublas_x = x_qdata
+            cublas_weight = weight
+
+        out_int32 = torch.empty(
+            (m, padded_n), dtype=torch.int32, device=x_qdata.device
+        )
+        _C.cublas_gemm_int8(
+            _wrap_for_dlpack(cublas_x),
+            _wrap_for_dlpack(cublas_weight),
+            _wrap_for_dlpack(out_int32),
+            _wrap_for_dlpack(get_cublas_workspace()),
+            stream_ptr,
+        )
+        if padded_n != n:
+            out_int32 = out_int32[:, :n].contiguous()
+        _C.dequantize_int8_linear(
+            _wrap_for_dlpack(out_int32),
+            _wrap_for_dlpack(x_scale),
+            _wrap_for_dlpack(weight_scale),
+            _wrap_for_dlpack(bias_arg),
+            _wrap_for_dlpack(out),
+            output_dtype_code,
+            stream_ptr,
+        )
+    return out
+
+
+def int8_linear_prequantized(
+    x_qdata: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """INT8 linear from a previously ConvRot/row-quantized activation.
+
+    This intentionally accepts only the physical 2-D activation boundary.  It
+    is used by H3's long-sequence QKV stream, where Q and K/V consume identical
+    input rows at different times and can therefore share the exact same
+    quantization result without changing any model arithmetic.
+    """
+
+    return _int8_linear_quantized_2d(
+        x_qdata,
+        x_scale,
+        weight,
+        weight_scale,
+        bias,
+        out_dtype,
+    )
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1886,103 +2070,14 @@ def int8_linear(
             stream_ptr,
         )
 
-    if m == 1 and k % 4 == 0:
-        weight_scale = _int8_weight_scale_arg(weight_scale, x.device)
-        out = torch.empty((1, n), dtype=out_dtype, device=x.device)
-        bias_arg = bias if bias is not None else _empty_cuda_tensor(x.device, out_dtype)
-        if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
-            bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
-        _C.int8_gemv_dequant(
-            _wrap_for_dlpack(x_qdata),
-            _wrap_for_dlpack(weight),
-            _wrap_for_dlpack(x_scale),
-            _wrap_for_dlpack(weight_scale),
-            _wrap_for_dlpack(bias_arg),
-            _wrap_for_dlpack(out),
-            output_dtype_code,
-            stream_ptr,
-        )
-        return out if is_2d_output else out.reshape(*orig_shape[:-1], n)
-
-    out = torch.empty((m, n), dtype=out_dtype, device=x.device)
-    weight_scale = _int8_weight_scale_arg(weight_scale, x.device)
-    bias_arg = bias if bias is not None else _empty_cuda_tensor(x.device, out_dtype)
-    if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
-        bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
-
-    if (
-        _prefer_turing_fused_int8(m, n, k)
-        and _cuda_device_should_use_turing_kernels(x_qdata.get_device())
-        and hasattr(_C, "cutlass_turing_int8_dequant")
-    ):
-        turing_out = _int8_linear_turing_quantized(
-            x_qdata,
-            weight,
-            x_scale,
-            weight_scale,
-            bias_arg if bias is not None else None,
-            out_dtype,
-        )
-        if turing_out is not None:
-            return turing_out if is_2d_output else turing_out.reshape(*orig_shape[:-1], n)
-
-    used_cutlass = False
-    prefer_cublas_fallback = _prefer_cublas_int8_fallback(
-        m,
-        n,
-        k,
-        x_qdata.get_device(),
+    out = _int8_linear_quantized_2d(
+        x_qdata,
+        x_scale,
+        weight,
+        weight_scale,
+        bias,
+        out_dtype,
     )
-    if (
-        not prefer_cublas_fallback
-        and not _DISABLE_CUTLASS_INT8
-        and _cuda_device_supports_cutlass_int8_dequant(x_qdata)
-    ):
-        ws_cutlass = weight_scale if weight_scale.numel() == n else weight_scale.expand(n).contiguous()
-        bias_f32 = bias_arg.to(torch.float32).contiguous() if bias is not None else bias_arg
-        used_cutlass = _C.cutlass_int8_dequant(
-            _wrap_for_dlpack(x_qdata),
-            _wrap_for_dlpack(weight),
-            _wrap_for_dlpack(x_scale),
-            _wrap_for_dlpack(ws_cutlass),
-            _wrap_for_dlpack(bias_f32),
-            _wrap_for_dlpack(out),
-            output_dtype_code,
-            stream_ptr,
-        )
-    if not used_cutlass:
-        # Fallback: cuBLAS int8 GEMM (int32) + separate dequant kernel.
-        use_turing_padding = x_qdata.is_cuda and _cuda_device_is_turing(x_qdata.get_device())
-        if use_turing_padding:
-            padded_k = _round_up(k, 16)
-            padded_n = _round_up(n, _cublas_int8_n_alignment(x_qdata))
-            cublas_x = _pad_2d_cols(x_qdata, padded_k)
-            cublas_weight = _pad_2d_rows(_pad_2d_cols(weight, padded_k), padded_n)
-        else:
-            padded_n = n
-            cublas_x = x_qdata
-            cublas_weight = weight
-
-        out_int32 = torch.empty((m, padded_n), dtype=torch.int32, device=x.device)
-        _C.cublas_gemm_int8(
-            _wrap_for_dlpack(cublas_x),
-            _wrap_for_dlpack(cublas_weight),
-            _wrap_for_dlpack(out_int32),
-            _wrap_for_dlpack(get_cublas_workspace()),
-            stream_ptr,
-        )
-        if padded_n != n:
-            out_int32 = out_int32[:, :n].contiguous()
-        _C.dequantize_int8_linear(
-            _wrap_for_dlpack(out_int32),
-            _wrap_for_dlpack(x_scale),
-            _wrap_for_dlpack(weight_scale),
-            _wrap_for_dlpack(bias_arg),
-            _wrap_for_dlpack(out),
-            output_dtype_code,
-            stream_ptr,
-        )
-
     return out if is_2d_output else out.reshape(*orig_shape[:-1], n)
 
 

@@ -9,8 +9,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from h3serve.backend import NativeBackendManager
-from h3serve.contract import GenerationSpec
+from h3serve.contract import GenerationSpec, SecondSamplingSpec
 from h3serve.native_engine import NativeH3Engine, NativeHotH3Engine
+from h3serve.native_engine.engine import _public_inference_plan
 
 
 class FakePipeline:
@@ -36,14 +37,31 @@ class FakeHotSession:
     def __init__(self) -> None:
         self.requests = []
         self.closed = False
+        self.runtime_config = SimpleNamespace(
+            resource_profile="int8_24gb",
+            max_device_bytes=int(23.25 * 1024**3),
+        )
 
     def generate(self, request):
         self.requests.append(request)
         request.output_path.write_bytes(b"hot-native-video")
+        if request.save_final_latents_path is not None:
+            request.save_final_latents_path.parent.mkdir(parents=True, exist_ok=True)
+            request.save_final_latents_path.write_bytes(b"clean-av-latent")
         return SimpleNamespace(
             output_path=request.output_path,
             phases={"denoise": 0.1},
+            execution_profile={
+                "joint_acceleration": request.acceleration_plan_summary,
+                "memory_execution": {
+                    "requested_mode": request.memory_mode,
+                    "selected_scheme": "low_vram",
+                },
+            },
         )
+
+    def _device_execution_budget_bytes(self):
+        return 23 * 1024**3
 
     def close(self):
         self.closed = True
@@ -102,11 +120,28 @@ class FakeHotFactory:
         session = FakeHotSession()
         self.sessions.append(session)
         return SimpleNamespace(
-            session=session, startup_seconds=0.1, qwen_storage="source"
+            session=session, startup_seconds=0.1, qwen_storage="source",
+            weight_tier="int8", vram_profile="24gb",
         )
 
     def preflight(self, _family):
         return {"ready": True, "checks": {"fake": True}}
+
+
+class FakeProgressHotFactory(FakeHotFactory):
+    def __init__(self) -> None:
+        super().__init__()
+        self.progress_callback = None
+        self.callback_history = []
+
+    def set_progress_callback(self, callback) -> None:
+        self.progress_callback = callback
+        self.callback_history.append(callback)
+
+    def build(self, family):
+        if self.progress_callback is not None:
+            self.progress_callback(42, "model_graphs", "模型组件已准备 2/5")
+        return super().build(family)
 
 
 class FakeSparseHotFactory(FakeHotFactory):
@@ -123,7 +158,8 @@ class FakeCheckpointHotFactory(FakeSparseHotFactory):
         session = FakeCheckpointHotSession()
         self.sessions.append(session)
         return SimpleNamespace(
-            session=session, startup_seconds=0.1, qwen_storage="source"
+            session=session, startup_seconds=0.1, qwen_storage="source",
+            weight_tier="int8", vram_profile="24gb",
         )
 
 
@@ -137,6 +173,61 @@ class NativeEngineBoundaryTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.manager.stop()
         shutil.rmtree(self.temporary, ignore_errors=True)
+
+    def test_public_inference_receipt_keeps_memory_route_with_joint_plan(self) -> None:
+        receipt = _public_inference_plan({
+            "joint_acceleration": {"policy_id": "v24", "accelerated": True},
+            "memory_execution": {
+                "requested_mode": "auto",
+                "selected_scheme": "low_vram",
+                "reason": "whole_query_exceeds_device_budget",
+            },
+            "qwen_conditioning_cache": {
+                "schema_version": 1,
+                "status": "checkpoint_hit",
+                "fallback": None,
+                "persisted_with_latent": True,
+            },
+            "private_debug_payload": {"large": "not public"},
+        })
+        self.assertEqual(receipt["policy_id"], "v24")
+        self.assertEqual(
+            receipt["memory_execution"]["selected_scheme"], "low_vram"
+        )
+        self.assertEqual(
+            receipt["qwen_conditioning_cache"]["status"], "checkpoint_hit"
+        )
+        self.assertNotIn("private_debug_payload", receipt)
+
+    async def test_hot_engine_reports_real_loading_progress_and_finishes_ready(self) -> None:
+        factory = FakeProgressHotFactory()
+        engine = NativeHotH3Engine(factory, output_root=self.temporary)
+        try:
+            await engine.preload("fl2va_int8_24gb")
+            self.assertEqual(engine.warm_state["status"], "ready")
+            self.assertEqual(engine.warm_state["progress_percent"], 100.0)
+            self.assertEqual(engine.warm_state["progress_stage"], "ready")
+            self.assertEqual(engine.warm_state["progress_detail"], "模型引擎已就绪")
+            self.assertEqual(len(factory.callback_history), 2)
+            self.assertTrue(callable(factory.callback_history[0]))
+            self.assertIsNone(factory.callback_history[1])
+        finally:
+            await engine.close()
+
+    def test_public_inference_receipt_can_report_memory_route_without_v24(self) -> None:
+        receipt = _public_inference_plan({
+            "memory_execution": {
+                "requested_mode": "low_vram",
+                "selected_scheme": "low_vram",
+            }
+        })
+        self.assertEqual(
+            receipt,
+            {"memory_execution": {
+                "requested_mode": "low_vram",
+                "selected_scheme": "low_vram",
+            }},
+        )
 
     async def test_original_quality_maps_to_explicit_schedule(self) -> None:
         spec = GenerationSpec.from_mapping({
@@ -236,7 +327,7 @@ class NativeEngineBoundaryTest(unittest.IsolatedAsyncioTestCase):
                     spec, None, None, (), (), (), asyncio.Event(),
                     self.temporary / f"hot-{index}.mp4",
                 )
-            self.assertEqual(factory.builds, ["first_last"])
+            self.assertEqual(factory.builds, ["fl2va_int8_24gb"])
             self.assertEqual(
                 [request.use_lora for request in factory.sessions[0].requests],
                 [False, True, False],
@@ -279,7 +370,7 @@ class NativeEngineBoundaryTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(request.execution_plan.fused_rms_adaln)
             self.assertTrue(request.execution_plan.vae_transformer_block_compile)
-            self.assertEqual(factory.builds, ["first_last"])
+            self.assertEqual(factory.builds, ["fl2va_int8_24gb"])
         finally:
             await engine.close()
 
@@ -324,6 +415,235 @@ class NativeEngineBoundaryTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 request.acceleration_plan_summary["model_variant"], "lora"
             )
+        finally:
+            await engine.close()
+
+    async def test_hot_engine_second_sampling_is_exact_step_and_preserves_audio(self) -> None:
+        factory = FakeV19HotFactory()
+        engine = NativeHotH3Engine(factory, output_root=self.temporary)
+        source_latent = self.temporary / "source.pt"
+        source_latent.write_bytes(b"source-clean-av")
+        final_latent = self.temporary / "second.pt"
+        try:
+            target = GenerationSpec.from_mapping({
+                "prompt": "same H3 conditioning",
+                "engine": "original",
+                "mode": "advanced",
+                "width": 1920,
+                "height": 1088,
+                "frames": 124,
+                "duration_seconds": 124 / 24,
+                "actual_steps": 20,
+                "seed": 12,
+                "memory_mode": "auto",
+            })
+            second = SecondSamplingSpec(
+                resolution="1080p", width=1920, height=1088,
+                steps=1, acceleration=75.0, denoise=0.2,
+                memory_mode="auto",
+            )
+            result = await engine.generate(
+                target, None, None, (), (), (), asyncio.Event(),
+                self.temporary / "second.mp4",
+                final_latents_path=final_latent,
+                second_sampling=second,
+                refinement_latents_path=source_latent,
+            )
+            request = factory.sessions[0].requests[-1]
+            self.assertEqual(request.steps, 1)
+            self.assertEqual(request.actual_step_indices, (0,))
+            self.assertIsNone(request.v19_acceleration)
+            self.assertEqual(request.refinement_latents_path, source_latent)
+            self.assertEqual(
+                request.conditioning_cache_source_path, source_latent.resolve()
+            )
+            self.assertEqual(request.refinement_denoise, 0.2)
+            self.assertEqual(request.refinement_spatial_mode, "learned_3d")
+            self.assertTrue(request.preserve_refinement_audio)
+            self.assertEqual(result.final_latents_path, final_latent)
+            self.assertTrue(result.inference_plan["ultimate_upscale"]["full_canvas"])
+            self.assertEqual(
+                result.inference_plan["ultimate_upscale"]["redundancy_ratio"],
+                1.0,
+            )
+            solver = result.inference_plan["second_sampling_solver"]
+            self.assertEqual(solver["model_variant"], "base")
+            self.assertEqual(solver["sampler"], "sa_solver")
+            self.assertEqual(solver["scheduler"], "simple")
+            self.assertAlmostEqual(solver["start_sigma"], 0.6)
+            self.assertFalse(solver["forecast_enabled"])
+        finally:
+            await engine.close()
+
+    async def test_2k15_second_sampling_uses_three_native_temporal_windows(self) -> None:
+        import torch
+        from h3serve.native_engine.hot_session import HotSessionResult
+
+        class WindowSession:
+            def __init__(self):
+                self.requests = []
+                self.decode_request = None
+                self.runtime_config = SimpleNamespace(
+                    resource_profile="int8_24gb",
+                    max_device_bytes=int(23.25 * 1024**3),
+                )
+
+            def _device_execution_budget_bytes(self):
+                return 23 * 1024**3
+
+            def generate(self, request):
+                self.requests.append(request)
+                self._last_conditioning_cache_payload = cached_conditioning
+                source = torch.load(
+                    request.refinement_latents_path,
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                torch.save(
+                    {
+                        **source,
+                        "width": request.width,
+                        "height": request.height,
+                    },
+                    request.save_final_latents_path,
+                )
+                return HotSessionResult(
+                    output_path=request.output_path,
+                    total_seconds=0.1,
+                    phases={"denoise": 0.1},
+                    step_seconds=(0.1,),
+                    forecast_profile={"mode": "disabled"},
+                    execution_profile={
+                        "window": request.frames,
+                        "qwen_conditioning_cache": {
+                            "schema_version": 1,
+                            "status": "hot_session_hit",
+                            "fallback": None,
+                            "persisted_with_latent": False,
+                        },
+                    },
+                    peak_allocated_gib=8.0,
+                    peak_reserved_gib=9.0,
+                )
+
+            def decode_latent_checkpoint(self, request, checkpoint_path):
+                self.decode_request = request
+                request.output_path.write_bytes(b"windowed-2k-video")
+                return HotSessionResult(
+                    output_path=request.output_path,
+                    total_seconds=0.1,
+                    phases={"decode": 0.1},
+                    step_seconds=(),
+                    forecast_profile={"mode": "decode_only"},
+                    execution_profile={"decode": True},
+                    peak_allocated_gib=7.0,
+                    peak_reserved_gib=8.0,
+                )
+
+            def close(self):
+                pass
+
+        class WindowFactory(FakeV19HotFactory):
+            def build(self, family):
+                session = WindowSession()
+                self.sessions.append(session)
+                return SimpleNamespace(
+                    session=session, startup_seconds=0.1, qwen_storage="source",
+                    weight_tier="int8", vram_profile="24gb",
+                )
+
+        factory = WindowFactory()
+        engine = NativeHotH3Engine(factory, output_root=self.temporary)
+        source_latent = self.temporary / "source-480p15.pt"
+        original_audio = torch.arange(603.0).view(1, 1, 1, 603)
+        cached_embeds = torch.zeros((1, 2, 5120), dtype=torch.bfloat16)
+        cached_tags = torch.ones((2,), dtype=torch.long)
+        cached_conditioning = {
+            "schema_version": 1,
+            "fingerprint": "test-fingerprint",
+            "prompt_embeds": cached_embeds,
+            "text_token_tags": cached_tags,
+        }
+        torch.save(
+            {
+                "video": torch.zeros((1, 1, 107, 1, 1)),
+                "audio": original_audio,
+                "frames": 362,
+                "fps": 24,
+                "width": 864,
+                "height": 480,
+                "engine": "original",
+                "seed": 12,
+            },
+            source_latent,
+        )
+        final_latent = self.temporary / "second-2k.pt"
+        try:
+            target = GenerationSpec.from_mapping(
+                {
+                    "prompt": "same H3 conditioning",
+                    "engine": "original",
+                    "mode": "advanced",
+                    "width": 2560,
+                    "height": 1440,
+                    "frames": 362,
+                    "duration_seconds": 362 / 24,
+                    "actual_steps": 20,
+                    "seed": 12,
+                },
+                allow_second_sampling_target=True,
+            )
+            second = SecondSamplingSpec(
+                resolution="2k",
+                width=2560,
+                height=1440,
+                steps=1,
+                acceleration=75.0,
+                denoise=0.2,
+                memory_mode="auto",
+            )
+            result = await engine.generate(
+                target,
+                None,
+                None,
+                (),
+                (),
+                (),
+                asyncio.Event(),
+                self.temporary / "second-2k.mp4",
+                final_latents_path=final_latent,
+                second_sampling=second,
+                refinement_latents_path=source_latent,
+            )
+            session = factory.sessions[0]
+            self.assertEqual(
+                [request.frames for request in session.requests],
+                [136, 136, 124],
+            )
+            self.assertTrue(all(request.latent_only for request in session.requests))
+            self.assertTrue(all(
+                request.conditioning_cache_source_path == source_latent.resolve()
+                for request in session.requests
+            ))
+            self.assertEqual(session.decode_request.execution_plan.vae_temporal_tile, 6)
+            stitched = torch.load(final_latent, map_location="cpu", weights_only=True)
+            self.assertEqual(stitched["video"].shape[2], 107)
+            self.assertTrue(torch.equal(stitched["audio"], original_audio))
+            self.assertTrue(torch.equal(
+                stitched["qwen_conditioning_cache"]["prompt_embeds"],
+                cached_embeds,
+            ))
+            self.assertTrue(torch.equal(
+                stitched["qwen_conditioning_cache"]["text_token_tags"],
+                cached_tags,
+            ))
+            self.assertTrue(result.output_path.is_file())
+            self.assertFalse(result.inference_plan["ultimate_upscale"]["full_canvas"])
+            self.assertEqual(
+                result.inference_plan["qwen_conditioning_cache"]["status"],
+                "hot_session_hit",
+            )
+            self.assertEqual(result.inference_plan["ultimate_upscale"]["temporal"][0]["frame_stop"], 136)
         finally:
             await engine.close()
 
@@ -445,6 +765,44 @@ class NativeEngineBoundaryTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(request.preview_branch_use_lora)
             self.assertEqual(request.preview_branch_steps, 4)
             self.assertAlmostEqual(request.preview_branch_spatial_scale, 360 / 736)
+        finally:
+            await engine.close()
+
+    async def test_v19_checkpoint_and_resume_keep_scheduler_anchor(self) -> None:
+        factory = FakeV19HotFactory()
+        engine = NativeHotH3Engine(factory, output_root=self.temporary)
+        checkpoint_path = self.temporary / "checkpoints" / "v19.pt"
+        output_path = self.temporary / "v19-checkpoint.mp4"
+        spec = GenerationSpec.from_mapping({
+            "prompt": "V19 invariant checkpoint route",
+            "engine": "original",
+            "mode": "advanced",
+            "width": 1280,
+            "height": 736,
+            "duration_seconds": 5,
+            "sampling_steps": 20,
+            "acceleration": 50,
+            "execution_mode": "checkpoint",
+            "checkpoint_step": 10,
+            "checkpoint_retain": True,
+            "checkpoint_preview": True,
+            "seed": 4404,
+        })
+        try:
+            await engine.generate(
+                spec, None, None, (), (), (), asyncio.Event(), output_path,
+                checkpoint_path=checkpoint_path,
+            )
+            first = factory.sessions[0].requests[-1]
+            await engine.generate(
+                spec, None, None, (), (), (), asyncio.Event(), output_path,
+                resume_checkpoint_path=checkpoint_path,
+            )
+            resumed = factory.sessions[0].requests[-1]
+            self.assertEqual(first.scheduler_required_actual_step_indices, (9,))
+            self.assertEqual(resumed.scheduler_required_actual_step_indices, (9,))
+            self.assertEqual(first.preview_step_index, 9)
+            self.assertIsNone(resumed.preview_step_index)
         finally:
             await engine.close()
 

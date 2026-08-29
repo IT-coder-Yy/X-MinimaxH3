@@ -1,0 +1,76 @@
+{
+  "schema_version": "h3_v24_forecast_error_model_v1",
+  "model_role": "mechanistic secant-tail local-error model; never a Human acceptance classifier",
+  "policy_identity": "directional_forecast_depth3_secant_v1",
+  "reference_total_steps": 20,
+  "reference_packed_tokens": 67535,
+  "features": [
+    "intercept",
+    "normalized_step",
+    "normalized_step_squared",
+    "log_horizon",
+    "normalized_step_times_log_horizon",
+    "log_packed_tokens_ratio"
+  ],
+  "target_transform": "log_relative_l1",
+  "fit": {
+    "solver": "ordinary_least_squares",
+    "sample_count": 24,
+    "audio": {
+      "coefficients": [-1.320127298598928, -1.7296976313224914, 1.8693866408856796, 0.7411513779060495, -0.5634089107941564, 0.08213065225798374],
+      "log_rmse": 0.09649128853133472,
+      "absolute_log_residual_q95": 0.1816891716181242,
+      "leave_one_workload_out_max_relative_error": 0.3877415362693949
+    },
+    "video": {
+      "coefficients": [-0.1595057654310035, -2.6950930355265554, 1.5353396028800592, 0.6274071335636529, -0.4541581401119936, -0.057854921946306676],
+      "log_rmse": 0.0614727254336621,
+      "absolute_log_residual_q95": 0.11652328457023255,
+      "leave_one_workload_out_max_relative_error": 0.2599241831953768
+    }
+  },
+  "samples": [
+    {"workload": "short", "packed_tokens": 34871, "step": 2, "horizon": 1, "audio_relative_l1": 0.2751518487930298, "video_relative_l1": 0.7250319719314575},
+    {"workload": "short", "packed_tokens": 34871, "step": 3, "horizon": 1, "audio_relative_l1": 0.2014024555683136, "video_relative_l1": 0.5772760510444641},
+    {"workload": "short", "packed_tokens": 34871, "step": 4, "horizon": 1, "audio_relative_l1": 0.1705334186553955, "video_relative_l1": 0.5404297113418579},
+    {"workload": "short", "packed_tokens": 34871, "step": 8, "horizon": 4, "audio_relative_l1": 0.305271714925766, "video_relative_l1": 0.6664595603942871},
+    {"workload": "short", "packed_tokens": 34871, "step": 12, "horizon": 4, "audio_relative_l1": 0.2807556390762329, "video_relative_l1": 0.5356183648109436},
+    {"workload": "short", "packed_tokens": 34871, "step": 15, "horizon": 3, "audio_relative_l1": 0.29238808155059814, "video_relative_l1": 0.3510674238204956},
+    {"workload": "short", "packed_tokens": 34871, "step": 18, "horizon": 3, "audio_relative_l1": 0.3565492630004883, "video_relative_l1": 0.36058810353279114},
+    {"workload": "short", "packed_tokens": 34871, "step": 19, "horizon": 1, "audio_relative_l1": 0.32677116990089417, "video_relative_l1": 0.2840229570865631},
+
+    {"workload": "medium", "packed_tokens": 67535, "step": 2, "horizon": 1, "audio_relative_l1": 0.2127922624349594, "video_relative_l1": 0.5809661149978638},
+    {"workload": "medium", "packed_tokens": 67535, "step": 3, "horizon": 1, "audio_relative_l1": 0.20072059333324432, "video_relative_l1": 0.5372128486633301},
+    {"workload": "medium", "packed_tokens": 67535, "step": 4, "horizon": 1, "audio_relative_l1": 0.1789228469133377, "video_relative_l1": 0.4846884310245514},
+    {"workload": "medium", "packed_tokens": 67535, "step": 8, "horizon": 4, "audio_relative_l1": 0.35083240270614624, "video_relative_l1": 0.6435521245002747},
+    {"workload": "medium", "packed_tokens": 67535, "step": 12, "horizon": 4, "audio_relative_l1": 0.3338324725627899, "video_relative_l1": 0.46320831775665283},
+    {"workload": "medium", "packed_tokens": 67535, "step": 15, "horizon": 3, "audio_relative_l1": 0.29503384232521057, "video_relative_l1": 0.3255859613418579},
+    {"workload": "medium", "packed_tokens": 67535, "step": 18, "horizon": 3, "audio_relative_l1": 0.32062461972236633, "video_relative_l1": 0.32030925154685974},
+    {"workload": "medium", "packed_tokens": 67535, "step": 19, "horizon": 1, "audio_relative_l1": 0.29456627368927, "video_relative_l1": 0.2611149251461029},
+
+    {"workload": "long", "packed_tokens": 100141, "step": 2, "horizon": 1, "audio_relative_l1": 0.21538859605789185, "video_relative_l1": 0.6496800780296326},
+    {"workload": "long", "packed_tokens": 100141, "step": 3, "horizon": 1, "audio_relative_l1": 0.24821686744689941, "video_relative_l1": 0.6521337032318115},
+    {"workload": "long", "packed_tokens": 100141, "step": 4, "horizon": 1, "audio_relative_l1": 0.22158201038837433, "video_relative_l1": 0.5471941232681274},
+    {"workload": "long", "packed_tokens": 100141, "step": 8, "horizon": 4, "audio_relative_l1": 0.39111849665641785, "video_relative_l1": 0.6404609084129333},
+    {"workload": "long", "packed_tokens": 100141, "step": 12, "horizon": 4, "audio_relative_l1": 0.4033534824848175, "video_relative_l1": 0.4696582555770874},
+    {"workload": "long", "packed_tokens": 100141, "step": 15, "horizon": 3, "audio_relative_l1": 0.3263024091720581, "video_relative_l1": 0.3304983675479889},
+    {"workload": "long", "packed_tokens": 100141, "step": 18, "horizon": 3, "audio_relative_l1": 0.3291294276714325, "video_relative_l1": 0.32182732224464417},
+    {"workload": "long", "packed_tokens": 100141, "step": 19, "horizon": 1, "audio_relative_l1": 0.30345529317855835, "video_relative_l1": 0.2660472095012665}
+  ],
+  "provenance": [
+    {
+      "path": "runtime/pareto/v24_deployment_20260825/runs/feedback_calibration_720p5/v24_feedback_observe_a100_hot_session.json",
+      "sha256": "f64a53c4a185bf117a5e02e922be8a65e994161f08c82c68a34f89d230d3a86e"
+    },
+    {
+      "path": "runtime/pareto/v24_deployment_20260825/runs/feedback_calibration_720p10_15/v24_feedback_observe_a100_hot_session.json",
+      "sha256": "e634560eddfc3e2d27f43be93d4265bad96a64553b66dc5a9033d97cfb254450"
+    }
+  ],
+  "limitations": [
+    "All 24 observations come from Human-accepted trajectories; they identify local secant-tail error, not an acceptance threshold.",
+    "Reference image/audio/video conditioning is not represented.",
+    "Workloads above 100141 packed tokens require explicit epistemic inflation and remain out of calibration.",
+    "A rejected trajectory must be observed before this model may drive online recovery."
+  ]
+}

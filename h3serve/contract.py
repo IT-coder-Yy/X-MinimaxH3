@@ -5,9 +5,21 @@ import secrets
 from dataclasses import dataclass
 from typing import Any
 
+from .deployment_profiles import (
+    LAUNCHER_DEFINITIONS,
+    LEGACY_MODEL_LAUNCHERS,
+    RESOURCE_BACKENDS,
+)
+
 
 FPS = 24
-RESOLUTIONS = {"360p": 360, "480p": 480, "720p": 720, "1080p": 1080}
+RESOLUTIONS = {
+    "360p": 360,
+    "480p": 480,
+    "720p": 720,
+    "1080p": 1080,
+    "2k": 1440,
+}
 ASPECT_RATIOS = {
     "1:1": (1, 1),
     "4:3": (4, 3),
@@ -18,8 +30,40 @@ ASPECT_RATIOS = {
 ENGINES = ("original", "lora", "reference", "reference_lora")
 SERVICE_FAMILIES = ("first_last", "reference")
 MODEL_VARIANTS = ("base", "lora")
+WEIGHT_TIERS = ("int8", "w4a8")
+VRAM_PROFILES = ("24gb", "16gb", "8gb")
+MODEL_LAUNCHERS = tuple(LAUNCHER_DEFINITIONS)
+# Persisted jobs and third-party clients may still contain the four launcher
+# identifiers used before the resource backends were separated.  They resolve
+# to the matching release backend but are never advertised by the new UI.
+LAUNCHER_CONFIGS = {
+    launcher_id: (
+        definition.service_family,
+        definition.weight_tier,
+        definition.vram_profile,
+    )
+    for launcher_id, definition in LAUNCHER_DEFINITIONS.items()
+}
 PREVIEW_MODES = ("off", "auto", "pause")
 EXECUTION_MODES = ("complete", "checkpoint")
+# Product requests no longer select physical execution implementations.  Keep
+# the former spellings only for persisted-job/API compatibility and normalize
+# every accepted value onto the unified device-budget optimizer.
+MEMORY_MODES = ("auto",)
+LEGACY_MEMORY_MODES = ("auto", "performance", "low_vram")
+SECOND_SAMPLING_RESOLUTIONS = ("720p", "1080p", "2k")
+SECOND_SAMPLING_STEPS = (1, 8)
+SECOND_SAMPLING_DENOISE = (0.05, 0.50)
+SECOND_SAMPLING_TEMPORAL_WINDOW_FRAMES = (68, 362)
+SECOND_SAMPLING_STRENGTHS = {
+    # Keep the author workflow's 0.20 operating point as the default.  The
+    # upper bound stops at the community's commonly reported 0.30 repair
+    # setting: beyond it, identity and motion drift rise quickly.
+    "preserve": 0.10,
+    "standard": 0.20,
+    "enhance": 0.25,
+    "strong": 0.30,
+}
 CHECKPOINT_PREVIEW_RESOLUTIONS = ("source", "360p", "480p", "720p")
 REFERENCE_MEDIA_RESOLUTIONS = ("original", "360p", "480p", "720p")
 DEFAULT_REFERENCE_IMAGE_RESOLUTION = "720p"
@@ -30,17 +74,22 @@ BASE_SAMPLING_STEPS = (5, 30)
 LORA_SAMPLING_STEPS = (4, 10)
 ACCELERATION_RANGE = (0.0, 100.0)
 MIN_CUSTOM_DIMENSION = 192
-MAX_CUSTOM_DIMENSION = 1920
-MAX_CUSTOM_SHORT_EDGE = 1088
-MAX_CUSTOM_PIXELS = 1920 * 1088
+MAX_CUSTOM_DIMENSION = 2560
+MAX_CUSTOM_SHORT_EDGE = 1440
+MAX_CUSTOM_PIXELS = 2560 * 1440
 MAX_DURATION_SECONDS = 15
-MAX_HIGH_RESOLUTION_DURATION_SECONDS = 8
-# The validated high-resolution reference point is 1920x1088 at 192 frames
-# (8 seconds). Other aspect ratios share this exact spatial-temporal budget
-# instead of inheriting an unnecessarily blunt "1080p = 8 seconds" cap.
-MAX_NATIVE_PIXEL_FRAMES = 1920 * 1088 * 192
+MAX_HIGH_RESOLUTION_DURATION_SECONDS = 15
+# The compact full-context route has completed a real 2K/15s H3 DiT checkpoint
+# step at 2560x1440 on the 362-frame grid.  The public spatial-temporal contract
+# therefore reaches that experimental boundary; admission remains request- and
+# device-specific through the unified VRAM planner rather than being inferred
+# from this geometric ceiling alone.
+MAX_NATIVE_PIXEL_FRAMES = 2560 * 1440 * 362
 # H3's nominal 720p preset is aligned to a 736-pixel short edge.
 LONG_DURATION_SHORT_EDGE_MAX = 736
+W4A8_MAX_SHORT_EDGE = 736
+W4A8_MAX_PIXELS = 1280 * 736
+W4A8_MAX_PIXEL_FRAMES = W4A8_MAX_PIXELS * 362
 # Backward-compatible conservative hints for older clients. New clients use
 # duration.max_by_preset / max_native_pixel_frames from public_options().
 RESOLUTION_MAX_DURATION_SECONDS = {
@@ -55,6 +104,17 @@ UPSCALE_LEVELS = {"720p": 720, "1080p": 1080, "2k": 1440}
 MIN_UPSCALE_DIMENSION = 256
 MAX_UPSCALE_DIMENSION = 3840
 MAX_UPSCALE_PIXELS = 3840 * 2160
+
+
+def normalize_resolution_name(value: Any) -> str:
+    """Map the public 1440P spelling onto the legacy internal 2k key."""
+
+    resolution = str(value).strip().lower()
+    return "2k" if resolution == "1440p" else resolution
+
+
+def public_resolution_name(value: str) -> str:
+    return "1440p" if value == "2k" else value
 
 
 ORIGINAL_PRESETS: dict[str, dict[str, Any]] = {
@@ -102,6 +162,15 @@ class ContractError(ValueError):
     pass
 
 
+def _unified_memory_policy(payload: dict[str, Any]) -> str:
+    legacy = str(payload.get("memory_mode", "auto")).strip().lower()
+    if legacy not in LEGACY_MEMORY_MODES:
+        raise ContractError(
+            "memory_mode is retired; omit it to use unified VRAM planning"
+        )
+    return "auto"
+
+
 def engine_family(engine: str) -> str:
     if engine in ("original", "lora"):
         return "first_last"
@@ -129,6 +198,72 @@ def resolve_engine(family: str, variant: str) -> str:
         ("reference", "base"): "reference",
         ("reference", "lora"): "reference_lora",
     }[(family, variant)]
+
+
+def launcher_family(launcher: str) -> str:
+    try:
+        return LAUNCHER_CONFIGS[normalize_launcher(launcher)][0]
+    except KeyError as error:
+        raise ContractError(f"unsupported model launcher: {launcher}") from error
+
+
+def launcher_weight_tier(launcher: str) -> str:
+    try:
+        return LAUNCHER_CONFIGS[normalize_launcher(launcher)][1]
+    except KeyError as error:
+        raise ContractError(f"unsupported model launcher: {launcher}") from error
+
+
+def launcher_vram_profile(launcher: str) -> str:
+    try:
+        return LAUNCHER_CONFIGS[normalize_launcher(launcher)][2]
+    except KeyError as error:
+        raise ContractError(f"unsupported model launcher: {launcher}") from error
+
+
+def resolve_launcher(
+    family: str,
+    weight_tier: str = "int8",
+    vram_profile: str | None = None,
+) -> str:
+    if family not in SERVICE_FAMILIES:
+        raise ContractError(f"unsupported service_family: {family}")
+    if weight_tier not in WEIGHT_TIERS:
+        raise ContractError(f"unsupported weight_tier: {weight_tier}")
+    if vram_profile is None:
+        vram_profile = "8gb" if weight_tier == "w4a8" else "24gb"
+    if vram_profile not in VRAM_PROFILES:
+        raise ContractError(f"unsupported vram_profile: {vram_profile}")
+    if (weight_tier, vram_profile) not in {
+        ("int8", "24gb"), ("int8", "16gb"), ("w4a8", "8gb")
+    }:
+        raise ContractError(
+            f"{weight_tier} weights do not support the {vram_profile} backend"
+        )
+    launchers_by_capability = {
+        (
+            definition.service_family,
+            definition.weight_tier,
+            definition.vram_profile,
+        ): launcher_id
+        for launcher_id, definition in LAUNCHER_DEFINITIONS.items()
+    }
+    return launchers_by_capability[(family, weight_tier, vram_profile)]
+
+
+def normalize_launcher(value: str) -> str:
+    """Canonicalize launcher keys while retaining old family/engine aliases."""
+
+    value = str(value).strip()
+    if value in MODEL_LAUNCHERS:
+        return value
+    if value in LEGACY_MODEL_LAUNCHERS:
+        return LEGACY_MODEL_LAUNCHERS[value]
+    if value in ENGINES:
+        return resolve_launcher(engine_family(value), "int8")
+    if value in SERVICE_FAMILIES:
+        return resolve_launcher(value, "int8")
+    raise ContractError(f"unsupported model launcher: {value}")
 
 
 def default_quality(engine: str) -> str:
@@ -245,6 +380,7 @@ def resolve_upscale_geometry(
 ) -> tuple[int, int]:
     """Resolve a named delivery size while preserving the generated ratio."""
 
+    level = normalize_resolution_name(level)
     try:
         short_edge = UPSCALE_LEVELS[level]
     except KeyError as error:
@@ -252,6 +388,171 @@ def resolve_upscale_geometry(
     if width >= height:
         return _nearest_even(short_edge * width / height), short_edge
     return short_edge, _nearest_even(short_edge * height / width)
+
+
+@dataclass(frozen=True)
+class SecondSamplingSpec:
+    """Request-local H3 latent re-sampling controls.
+
+    This is deliberately not folded into :class:`GenerationSpec`.  The first
+    pass is a completed, selectable card; a second pass is a new job whose
+    input is that card's clean AV latent.  Keeping the contracts separate also
+    prevents the one-to-eight low-noise solver steps from being confused with
+    the five-to-thirty-step first-pass trajectory.
+    """
+
+    resolution: str
+    width: int
+    height: int
+    steps: int = 1
+    acceleration: float = 75.0
+    denoise: float = 0.20
+    strength: str = "standard"
+    model_variant: str = "base"
+    memory_mode: str = "auto"
+    spatial_mode: str = "learned_3d"
+    preserve_audio: bool = True
+    temporal_window_frames: int | None = None
+
+    @classmethod
+    def from_mapping(
+        cls,
+        payload: dict[str, Any],
+        *,
+        source: "GenerationSpec",
+    ) -> "SecondSamplingSpec":
+        resolution = normalize_resolution_name(
+            payload.get("resolution", "1080p")
+        )
+        if resolution not in SECOND_SAMPLING_RESOLUTIONS:
+            raise ContractError(
+                "second-sampling resolution must be 720p, 1080p or 1440p"
+            )
+
+        # Named H3 canvases use the same 32-pixel geometry as first-pass
+        # generation.  Advanced/custom sources retain their actual pixel ratio
+        # instead of trusting a possibly stale UI aspect-ratio label.
+        if not source.advanced and source.aspect_ratio in ASPECT_RATIOS:
+            width, height = resolve_geometry(resolution, source.aspect_ratio)
+        else:
+            short_edge = RESOLUTIONS[resolution]
+            if source.width >= source.height:
+                height = _nearest_multiple(short_edge)
+                width = _nearest_multiple(short_edge * source.width / source.height)
+            else:
+                width = _nearest_multiple(short_edge)
+                height = _nearest_multiple(short_edge * source.height / source.width)
+        if width <= source.width or height <= source.height:
+            raise ContractError(
+                "second-sampling target must be larger than the source canvas"
+            )
+        validate_native_spatiotemporal_budget(width, height, source.frames)
+
+        try:
+            steps = int(payload.get("steps", 1))
+        except (TypeError, ValueError) as error:
+            raise ContractError("second-sampling steps must be an integer") from error
+        if not SECOND_SAMPLING_STEPS[0] <= steps <= SECOND_SAMPLING_STEPS[1]:
+            raise ContractError("second-sampling steps must be between 1 and 8")
+
+        try:
+            acceleration = float(payload.get("acceleration", 75))
+        except (TypeError, ValueError) as error:
+            raise ContractError(
+                "second-sampling acceleration must be numeric"
+            ) from error
+        if not math.isfinite(acceleration) or not (
+            ACCELERATION_RANGE[0] <= acceleration <= ACCELERATION_RANGE[1]
+        ):
+            raise ContractError(
+                "second-sampling acceleration must be between 0 and 100"
+            )
+
+        strength_value = payload.get("strength")
+        if strength_value in (None, ""):
+            # Preserve old API clients while projecting their continuous value
+            # onto the new four-point product contract.
+            try:
+                legacy_denoise = float(payload.get("denoise", 0.20))
+            except (TypeError, ValueError) as error:
+                raise ContractError("second-sampling denoise must be numeric") from error
+            if not math.isfinite(legacy_denoise) or not (
+                SECOND_SAMPLING_DENOISE[0]
+                <= legacy_denoise
+                <= SECOND_SAMPLING_DENOISE[1]
+            ):
+                raise ContractError(
+                    "second-sampling denoise must be between 0.05 and 0.50"
+                )
+            strength = min(
+                SECOND_SAMPLING_STRENGTHS,
+                key=lambda name: abs(
+                    SECOND_SAMPLING_STRENGTHS[name] - legacy_denoise
+                ),
+            )
+        else:
+            strength = str(strength_value).strip().lower()
+            if strength not in SECOND_SAMPLING_STRENGTHS:
+                raise ContractError(
+                    "second-sampling strength must be preserve, standard, enhance or strong"
+                )
+        denoise = SECOND_SAMPLING_STRENGTHS[strength]
+
+        requested_variant = str(payload.get("model_variant", "base")).strip().lower()
+        if requested_variant != "base":
+            raise ContractError(
+                "H3 second sampling uses the Base weights only; LoRA is not supported"
+            )
+        model_variant = "base"
+
+        raw_window = payload.get("temporal_window_frames")
+        if raw_window in (None, "", "auto", 0, "0"):
+            temporal_window_frames = None
+        else:
+            try:
+                temporal_window_frames = int(raw_window)
+            except (TypeError, ValueError) as error:
+                raise ContractError(
+                    "second-sampling temporal window must be an integer frame count"
+                ) from error
+            if not (
+                SECOND_SAMPLING_TEMPORAL_WINDOW_FRAMES[0]
+                <= temporal_window_frames
+                <= SECOND_SAMPLING_TEMPORAL_WINDOW_FRAMES[1]
+            ):
+                raise ContractError(
+                    "second-sampling temporal window must be between 68 and 362 frames"
+                )
+
+        memory_mode = _unified_memory_policy(payload)
+        return cls(
+            resolution=resolution,
+            width=width,
+            height=height,
+            steps=steps,
+            acceleration=round(acceleration, 1),
+            denoise=round(denoise, 3),
+            strength=strength,
+            model_variant=model_variant,
+            memory_mode=memory_mode,
+            temporal_window_frames=temporal_window_frames,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "resolution": self.resolution,
+            "width": self.width,
+            "height": self.height,
+            "steps": self.steps,
+            "acceleration": self.acceleration,
+            "denoise": self.denoise,
+            "strength": self.strength,
+            "model_variant": self.model_variant,
+            "memory_mode": self.memory_mode,
+            "spatial_mode": self.spatial_mode,
+            "preserve_audio": self.preserve_audio,
+            "temporal_window_frames": self.temporal_window_frames,
+        }
 
 
 def actual_step_schedule(count: int) -> tuple[int, ...]:
@@ -292,6 +593,13 @@ class GenerationSpec:
     height: int
     frames: int
     actual_duration_seconds: float
+    # Runtime provenance. W4A8 is the same H3 topology with a lower-bit base;
+    # task-level Base/LoRA selection remains orthogonal to this field.
+    weight_tier: str = "int8"
+    # Physical resource backend selected before model loading.  Unlike the old
+    # inferred device budget this identity is persisted with every job, so a
+    # 16GB checkpoint can never silently resume through the 24GB executor.
+    vram_profile: str = "24gb"
     advanced: bool = False
     custom_actual_steps: int | None = None
     custom_lora_steps: int | None = None
@@ -301,6 +609,9 @@ class GenerationSpec:
     # and legacy API clients; new UI/API requests set both fields together.
     sampling_steps: int | None = None
     acceleration: float | None = None
+    # Persisted compatibility field. New requests always normalize to ``auto``
+    # and the physical graph is selected only from the device VRAM budget.
+    memory_mode: str = "auto"
     upscale_enabled: bool = False
     upscale_resolution: str | None = None
     upscale_target_width: int | None = None
@@ -328,6 +639,7 @@ class GenerationSpec:
         *,
         max_native_pixel_frames: int = MAX_NATIVE_PIXEL_FRAMES,
         max_duration_by_preset: dict[str, dict[str, float]] | None = None,
+        allow_second_sampling_target: bool = False,
     ) -> "GenerationSpec":
         # ``prompt`` is the final model-facing text for REST/ComfyUI clients.
         # Validate it without rewriting it: callers may deliberately use
@@ -356,6 +668,47 @@ class GenerationSpec:
             raise ContractError(f"unsupported engine: {engine}")
         if quality not in QUALITY_LEVELS:
             raise ContractError(f"unsupported quality level: {quality}")
+
+        raw_launcher = payload.get("runtime_launcher", payload.get("launcher"))
+        if raw_launcher not in (None, ""):
+            launcher = normalize_launcher(str(raw_launcher))
+            if launcher_family(launcher) != engine_family(engine):
+                raise ContractError(
+                    "runtime_launcher disagrees with service_family"
+                )
+            weight_tier = launcher_weight_tier(launcher)
+            vram_profile = launcher_vram_profile(launcher)
+            explicit_tier = payload.get("weight_tier")
+            if explicit_tier not in (None, "", weight_tier):
+                raise ContractError(
+                    "weight_tier disagrees with runtime_launcher"
+                )
+            explicit_profile = payload.get("vram_profile")
+            if explicit_profile not in (None, "", vram_profile):
+                raise ContractError(
+                    "vram_profile disagrees with runtime_launcher"
+                )
+        else:
+            weight_tier = str(payload.get("weight_tier", "int8")).strip().lower()
+            if weight_tier not in WEIGHT_TIERS:
+                raise ContractError(
+                    "weight_tier must be int8 or w4a8"
+                )
+            vram_profile = str(
+                payload.get(
+                    "vram_profile",
+                    "8gb" if weight_tier == "w4a8" else "24gb",
+                )
+            ).strip().lower()
+            # Resolve once to validate the quantization/resource pairing.
+            launcher = resolve_launcher(
+                engine_family(engine), weight_tier, vram_profile
+            )
+
+        deployment = LAUNCHER_DEFINITIONS[launcher]
+        resource_backend = deployment.backend
+
+        memory_mode = _unified_memory_policy(payload)
 
         reference_image_resolution = str(
             payload.get(
@@ -466,10 +819,10 @@ class GenerationSpec:
                 raise ContractError("width and height must be multiples of 32")
             if min(width, height) > MAX_CUSTOM_SHORT_EDGE:
                 raise ContractError(
-                    "custom canvas short edge exceeds the validated 1080p envelope"
+                "custom canvas short edge exceeds the validated native 2K envelope"
                 )
             if width * height > MAX_CUSTOM_PIXELS:
-                raise ContractError("custom canvas exceeds the validated 4090 pixel envelope")
+                raise ContractError("custom canvas exceeds the validated native 2K pixel envelope")
             if frames < 5 or frames > 362 or (frames - 5) % 17:
                 raise ContractError("frames must be 5..362 and satisfy 17*n+5")
             requested_duration = frames / FPS
@@ -502,6 +855,29 @@ class GenerationSpec:
                 validate_native_spatiotemporal_budget(
                     width, height, frames, max_native_pixel_frames
                 )
+
+        maximum_short_edge = resource_backend.maximum_short_edge
+        maximum_pixels = resource_backend.maximum_pixels
+        if (
+            not allow_second_sampling_target
+            and (
+                min(width, height) > maximum_short_edge
+                or width * height > maximum_pixels
+            )
+        ):
+            maximum_label = resource_backend.first_generation_levels[-1]
+            raise ContractError(
+                f"the {vram_profile} backend supports first generation up to "
+                f"{maximum_label}"
+            )
+        if (
+            resource_backend.maximum_pixel_frames is not None
+            and width * height * frames
+            > resource_backend.maximum_pixel_frames
+        ):
+            raise ContractError(
+                "the 8GB W4A8 backend supports up to 720p for 15 seconds"
+            )
 
         sampling_steps = None
         acceleration = None
@@ -579,7 +955,14 @@ class GenerationSpec:
                     "checkpoint tasks must retain state, generate a preview, or both"
                 )
             if checkpoint_preview_resolution != "source":
-                preview_short_edge = RESOLUTIONS[checkpoint_preview_resolution]
+                # Product resolution labels are nominal; every public canvas
+                # is aligned to the nearest 32 pixels (360p becomes 352).
+                # Compare aligned sizes so a 360p task can request its fixed
+                # 360p checkpoint preview instead of being rejected as an
+                # accidental upscale.
+                preview_short_edge = _nearest_multiple(
+                    RESOLUTIONS[checkpoint_preview_resolution]
+                )
                 if preview_short_edge > min(width, height):
                     raise ContractError(
                         "checkpoint preview resolution cannot exceed the generated canvas"
@@ -689,6 +1072,8 @@ class GenerationSpec:
             height=height,
             frames=frames,
             actual_duration_seconds=actual_duration,
+            weight_tier=weight_tier,
+            vram_profile=vram_profile,
             advanced=advanced,
             custom_actual_steps=custom_actual_steps,
             custom_lora_steps=custom_lora_steps,
@@ -696,6 +1081,7 @@ class GenerationSpec:
             sparse_scope=sparse_scope,
             sampling_steps=sampling_steps,
             acceleration=acceleration,
+            memory_mode=memory_mode,
             upscale_enabled=upscale_enabled,
             upscale_resolution=upscale_resolution,
             upscale_target_width=upscale_target_width,
@@ -721,6 +1107,12 @@ class GenerationSpec:
     @property
     def model_variant(self) -> str:
         return engine_variant(self.engine)
+
+    @property
+    def runtime_launcher(self) -> str:
+        return resolve_launcher(
+            self.service_family, self.weight_tier, self.vram_profile
+        )
 
     @property
     def joint_acceleration_enabled(self) -> bool:
@@ -766,6 +1158,9 @@ class GenerationSpec:
             "engine": self.engine,
             "service_family": self.service_family,
             "model_variant": self.model_variant,
+            "runtime_launcher": self.runtime_launcher,
+            "weight_tier": self.weight_tier,
+            "vram_profile": self.vram_profile,
             "quality": self.quality,
             "resolution": self.resolution,
             "aspect_ratio": self.aspect_ratio,
@@ -779,6 +1174,7 @@ class GenerationSpec:
             "experimental_duration": self.requested_duration_seconds < 5,
             "advanced": self.advanced,
             "mode": "advanced" if self.advanced else "preset",
+            "memory_mode": self.memory_mode,
             "preview_mode": self.preview_mode,
             "preview_step_index": self.preview_step_index,
             "preview_branch_steps": self.preview_branch_steps,
@@ -834,10 +1230,11 @@ def public_options(
     max_native_pixel_frames: int = MAX_NATIVE_PIXEL_FRAMES,
     max_duration_by_preset: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, Any]:
-    if fixed_engine in ENGINES:
-        fixed_engine = engine_family(str(fixed_engine))
-    if fixed_engine is not None and fixed_engine not in SERVICE_FAMILIES:
-        raise ContractError(f"unsupported service family: {fixed_engine}")
+    fixed_launcher = (
+        None if fixed_engine is None else normalize_launcher(str(fixed_engine))
+    )
+    if fixed_launcher is not None:
+        fixed_engine = launcher_family(fixed_launcher)
     geometry = {
         resolution: {
             ratio: {"width": resolve_geometry(resolution, ratio)[0],
@@ -896,15 +1293,35 @@ def public_options(
             "variants": ["base", "lora"],
         },
     }
+    launchers = {
+        launcher_id: {
+            "label": definition.label,
+            "short_label": definition.short_label,
+            "description": definition.description,
+            "service_family": definition.service_family,
+            "weight_tier": definition.weight_tier,
+            "vram_profile": definition.vram_profile,
+            "variants": ["base", "lora"],
+            "second_sampling": bool(
+                definition.backend.second_sampling_levels
+            ),
+        }
+        for launcher_id, definition in LAUNCHER_DEFINITIONS.items()
+    }
+    selected_launcher = fixed_launcher or "fl2va_int8_24gb"
     return {
         "deployment_mode": "fixed_engine" if fixed_engine else "multi_engine",
         "current_engine": selected_engine,
+        "current_launcher": selected_launcher,
+        "active_weight_tier": launcher_weight_tier(selected_launcher),
+        "active_vram_profile": launcher_vram_profile(selected_launcher),
         "current_engine_options": families[selected_engine],
         "engines": {
             key: value for key, value in engines.items()
             if fixed_engine is None or engine_family(key) == fixed_engine
         },
         "service_families": families,
+        "model_launchers": launchers,
         "model_variants": {
             "base": {"label": "原始权重", "presets": _public_presets(ORIGINAL_PRESETS)},
             "lora": {"label": "LoRA 极速", "presets": _public_presets(LORA_PRESETS)},
@@ -928,6 +1345,9 @@ def public_options(
         },
         "defaults": {
             "service_family": selected_engine,
+            "runtime_launcher": selected_launcher,
+            "weight_tier": launcher_weight_tier(selected_launcher),
+            "vram_profile": launcher_vram_profile(selected_launcher),
             "model_variant": selected_variant,
             "engine": resolve_engine(selected_engine, selected_variant),
             "quality": default_quality(resolve_engine(selected_engine, selected_variant)),
@@ -951,7 +1371,32 @@ def public_options(
         },
         "validated_duration_seconds": [5, 15],
         "execution_modes": list(EXECUTION_MODES),
-        "checkpoint_preview_resolutions": list(CHECKPOINT_PREVIEW_RESOLUTIONS),
+        "device_memory_backend": {
+            "policy": "startup_fixed_profile_then_minimum_latency_graph",
+            "selection": "automatic_inside_selected_profile",
+            "cross_profile_routing": False,
+            "user_execution_modes": False,
+            "weight_tier": launcher_weight_tier(selected_launcher),
+            "vram_profile": launcher_vram_profile(selected_launcher),
+            "profiles": {
+                backend.vram_profile: {
+                    "first_generation": list(
+                        backend.first_generation_levels
+                    ),
+                    "maximum_duration_seconds": (
+                        backend.maximum_duration_seconds
+                    ),
+                    "boundary_720p15_reference_items": (
+                        backend.boundary_reference_items
+                    ),
+                    "second_sampling": [
+                        public_resolution_name(level)
+                        for level in backend.second_sampling_levels
+                    ],
+                }
+                for backend in RESOURCE_BACKENDS.values()
+            },
+        },
         "advanced_limits": {
             "dimension_min": MIN_CUSTOM_DIMENSION,
             "dimension_max": MAX_CUSTOM_DIMENSION,
@@ -967,25 +1412,56 @@ def public_options(
             "acceleration": {
                 "min": ACCELERATION_RANGE[0], "max": ACCELERATION_RANGE[1],
                 "step": 1, "default": 0,
-                "meaning": "0=Dense计算；100=当前质量保护边界内的最快调度",
+                "meaning": (
+                    "0=Dense计算；75=Human审阅质量拐点；"
+                    "75–100=明确允许质量风险的激进区"
+                ),
             },
-            "checkpoint_preview_steps": {"min": 1, "max": 8, "default": 4},
             "quality_protection": "internal_non_disableable",
             "legacy_execution_controls": {
                 "status": "accepted_for_persisted_clients_but_not_exposed",
                 "fields": ["actual_steps", "lora_steps", "attention_keep_ratio", "sparse_scope"],
             },
             "upscaler": {
-                "levels": list(UPSCALE_LEVELS),
+                "levels": [
+                    public_resolution_name(level) for level in UPSCALE_LEVELS
+                ],
                 "dimension_min": MIN_UPSCALE_DIMENSION,
                 "dimension_max": MAX_UPSCALE_DIMENSION,
                 "max_pixels": MAX_UPSCALE_PIXELS,
                 "preserve_aspect_ratio": True,
+                "deprecated": True,
+                "replacement": "h3_second_sampling",
+            },
+            "second_sampling": {
+                "implementation": "h3_learned_3d_second_sampling_v2",
+                "latent_initialization": "learned_3d_bf16",
+                "sampler": "sa_solver",
+                "levels": list(SECOND_SAMPLING_RESOLUTIONS),
+                "steps": {
+                    "min": SECOND_SAMPLING_STEPS[0],
+                    "max": SECOND_SAMPLING_STEPS[1],
+                    "default": 1,
+                },
+                "model_variants": ["base"],
+                "strengths": {
+                    name: {"denoise": denoise}
+                    for name, denoise in SECOND_SAMPLING_STRENGTHS.items()
+                },
+                "denoise": {
+                    "min": SECOND_SAMPLING_DENOISE[0],
+                    "max": SECOND_SAMPLING_DENOISE[1],
+                    "default": 0.20,
+                },
+                "memory_execution": "automatic_device_budget_optimizer",
+                "preserve_audio": True,
+                "conditioning": "reuse_source_prompt_and_reference_media",
+                "full_canvas_preferred": True,
             },
             "preview": {
-                "modes": list(PREVIEW_MODES),
-                "branch_steps": {"min": 1, "max": 3, "default": 2},
-                "default": "off",
+                "available": False,
+                "deprecated": True,
+                "replacement": "h3_second_sampling",
             },
         },
     }

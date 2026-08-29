@@ -90,14 +90,34 @@ class ExecutionPlan:
     segment_cache_sequential_conservative_hold: bool = False
     compile_bucket: str | None = None
     long_video_motion_detail_attention: bool = False
+    long_sequence_query_chunk_tokens: int | None = None
+    long_sequence_projection_chunk_tokens: int = 8192
+    long_sequence_split_qkv_outputs: bool = False
+    long_sequence_shared_qkv_quantization: bool = False
+    long_sequence_compact_kv: bool = False
+    long_sequence_exact_helper_stack: bool = False
+    long_sequence_single_qknorm_rope: bool = False
+    long_sequence_parallel_sparse_lut: bool = False
+    long_sequence_partial_sparse_topk: bool = False
+    long_sequence_fused_prefix_k_quant: bool = False
+    # Byte-exact layout-only optimizations.  The runtime release gate enables
+    # only the engine/tier combinations backed by physical workload evidence;
+    # these fields also remain available for isolated research scenarios.
+    long_sequence_fused_query_projection: bool = False
+    long_sequence_fused_qknorm_hnd_layout: bool = False
+    long_sequence_direct_nhd_output: bool = False
+    long_sequence_direct_nhd_kv: bool = False
+    long_sequence_direct_hnd_fp8_value: bool = False
 
     def __post_init__(self) -> None:
         if self.mlp_chunk_tokens <= 0:
             raise ValueError("mlp_chunk_tokens must be positive")
-        if self.offload_mode is OffloadMode.BLOCK and self.block_buffer_count != 2:
-            raise ValueError("H3 block offload requires exactly two buffers")
+        if self.offload_mode is OffloadMode.BLOCK and self.block_buffer_count not in (1, 2):
+            raise ValueError("H3 block offload supports one or two buffers")
         if self.prefetch_depth not in (0, 1):
             raise ValueError("single-GPU H3 supports prefetch depth 0 or 1")
+        if self.block_buffer_count == 1 and self.prefetch_depth:
+            raise ValueError("single-buffer block offload cannot prefetch")
         if self.resident_block_count < 0:
             raise ValueError("resident_block_count cannot be negative")
         if self.vae_temporal_tile is not None and self.vae_temporal_tile <= 0:
@@ -110,6 +130,67 @@ class ExecutionPlan:
             raise ValueError("sparse_scope must be middle_only, guarded or full")
         if self.dense_qk_quant_gran not in ("per_thread", "per_warp"):
             raise ValueError("dense_qk_quant_gran must be per_thread or per_warp")
+        if self.long_sequence_query_chunk_tokens is not None and (
+            self.long_sequence_query_chunk_tokens < 128
+            or self.long_sequence_query_chunk_tokens % 128
+        ):
+            raise ValueError(
+                "long-sequence Query chunks must be positive multiples of 128"
+            )
+        if self.long_sequence_projection_chunk_tokens <= 0:
+            raise ValueError("long-sequence projection chunks must be positive")
+        if (
+            self.long_sequence_query_chunk_tokens is not None
+            and self.long_sequence_projection_chunk_tokens
+            > self.long_sequence_query_chunk_tokens
+        ):
+            raise ValueError(
+                "long-sequence projection chunks cannot exceed Query chunks"
+            )
+        if (
+            self.long_sequence_split_qkv_outputs
+            and self.long_sequence_query_chunk_tokens is None
+        ):
+            raise ValueError(
+                "split QKV outputs require long-sequence Query streaming"
+            )
+        if self.long_sequence_compact_kv and not self.long_sequence_split_qkv_outputs:
+            raise ValueError("compact K/V requires split streamed QKV outputs")
+        if (
+            self.long_sequence_exact_helper_stack
+            or self.long_sequence_shared_qkv_quantization
+            or self.long_sequence_single_qknorm_rope
+            or self.long_sequence_parallel_sparse_lut
+            or self.long_sequence_partial_sparse_topk
+            or self.long_sequence_fused_prefix_k_quant
+            or self.long_sequence_fused_query_projection
+            or self.long_sequence_fused_qknorm_hnd_layout
+            or self.long_sequence_direct_nhd_output
+            or self.long_sequence_direct_nhd_kv
+            or self.long_sequence_direct_hnd_fp8_value
+        ) and not self.long_sequence_split_qkv_outputs:
+            raise ValueError(
+                "long-sequence helper experiments require split QKV outputs"
+            )
+        if self.long_sequence_compact_kv and self.long_sequence_direct_nhd_kv:
+            raise ValueError("direct NHD K/V is incompatible with compact K/V")
+        if self.long_sequence_direct_hnd_fp8_value and (
+            self.long_sequence_compact_kv
+            or self.long_sequence_direct_nhd_kv
+        ):
+            raise ValueError(
+                "direct HND FP8 V requires non-compact HND K/V streaming"
+            )
+        if self.long_sequence_fused_qknorm_hnd_layout and (
+            not self.long_sequence_single_qknorm_rope
+            or not self.long_sequence_fused_query_projection
+            or self.long_sequence_compact_kv
+            or self.long_sequence_direct_nhd_kv
+        ):
+            raise ValueError(
+                "fused QK-Norm HND layout requires single QK-Norm, fused "
+                "Query projection, non-compact K/V and HND K/V"
+            )
         if self.frame_interleave_stride <= 0:
             raise ValueError("frame_interleave_stride must be positive")
         if not (
@@ -359,9 +440,9 @@ class CalibratedProfile:
             if minimum is not None and maximum is not None and minimum > maximum:
                 raise ValueError(f"min_{name} cannot exceed max_{name}")
         if self.allowed_condition_counts is not None and any(
-            value < 0 or value > 9 for value in self.allowed_condition_counts
+            value < 0 or value > 15 for value in self.allowed_condition_counts
         ):
-            raise ValueError("allowed condition counts must be between 0 and 9")
+            raise ValueError("allowed condition counts must be between 0 and 15")
         if self.vae_tile_candidates is not None:
             if self.plan.vae_spatial_tile is not None:
                 raise ValueError("fixed and adaptive VAE tile policies cannot coexist")

@@ -28,6 +28,40 @@ class UpscaleError(RuntimeError):
     pass
 
 
+class RetiredFlashVSRUpscaler:
+    """No-op compatibility surface after H3 second sampling replaced FlashVSR.
+
+    Older persisted jobs still deserialize their historical upscale metadata,
+    but a normal service process no longer imports model weights, starts a
+    daemon, or claims CPU/GPU resources for the retired post-processor.
+    """
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "ready": False,
+            "implementation": "retired_flashvsr_replaced_by_h3_second_sampling",
+            "resident_state": "removed",
+            "missing": [],
+            "replacement": "POST /api/v1/jobs/{job_id}/second-sampling",
+            "last_error": None,
+        }
+
+    def configure_data_dir(self, _data_dir: Path) -> None:
+        return None
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    async def upscale(self, *_args: Any, **_kwargs: Any) -> UpscaleResult:
+        raise UpscaleError(
+            "FlashVSR has been replaced by native H3 second sampling; "
+            "submit it from the completed source job"
+        )
+
+
 @dataclass(frozen=True)
 class UpscaleResult:
     output_path: Path
@@ -44,7 +78,7 @@ class FlashVSRUpscaler:
     FlashVSR keeps its immutable weights in CPU RAM between jobs. A request
     moves only the active modules to CUDA; completion offloads those modules
     and clears task-local caches. Process isolation keeps FlashVSR's Torch 2.6
-    ABI separate from the H3 service's Torch 2.8 runtime.
+    ABI separate from the H3 service's Torch 2.13 runtime.
     """
 
     def __init__(self, paths: ServicePaths) -> None:

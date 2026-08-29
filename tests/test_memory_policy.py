@@ -39,13 +39,13 @@ class HostMemoryPolicyTests(unittest.TestCase):
         compact = HOST_MEMORY_PROFILES["compact"]
         validate_workload_for_profile(compact, width=864, height=480, frames=362)
         validate_workload_for_profile(compact, width=1280, height=736, frames=362)
-        validate_workload_for_profile(compact, width=1920, height=1088, frames=192)
-        validate_workload_for_profile(compact, width=1440, height=1088, frames=243)
-        validate_workload_for_profile(compact, width=1088, height=1088, frames=328)
-        with self.assertRaisesRegex(ValueError, r"width\*height\*frames"):
-            validate_workload_for_profile(compact, width=1920, height=1088, frames=209)
+        validate_workload_for_profile(compact, width=1920, height=1088, frames=362)
+        validate_workload_for_profile(compact, width=1440, height=1088, frames=362)
+        validate_workload_for_profile(compact, width=1088, height=1088, frames=362)
         with self.assertRaisesRegex(ValueError, "spatial-temporal"):
-            validate_workload_for_profile(compact, width=1920, height=1120, frames=192)
+            validate_workload_for_profile(compact, width=1920, height=1088, frames=379)
+        with self.assertRaisesRegex(ValueError, "spatial-temporal"):
+            validate_workload_for_profile(compact, width=2560, height=1472, frames=192)
         validate_workload_for_profile(
             HOST_MEMORY_PROFILES["generation_hot"],
             width=1280, height=736, frames=362,

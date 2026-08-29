@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "anchor": "ref2va_multiref_8s.json",
+  "invariants": {
+    "checkpoint": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+    "resolution": "864x480",
+    "frames": 192,
+    "fps": 24,
+    "steps": 20,
+    "seed": 82416,
+    "offload_mode": "block",
+    "prefetch_depth": 1,
+    "mlp_chunk_tokens": 8192,
+    "vae_tile_size": 288,
+    "memory_profile": "compact"
+  },
+  "candidates": [
+    {
+      "version": "v00_dense20",
+      "class": "baseline",
+      "actual_steps": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+      "cache_condition_rows": false,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": false,
+      "quality_claim": "reference baseline"
+    },
+    {
+      "version": "v01_exact_condition_rows",
+      "class": "exact_mechanical",
+      "actual_steps": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": false,
+      "quality_claim": "same mathematical path; immutable per-step rows reused"
+    },
+    {
+      "version": "v02_exact_reference_latents_repeat2",
+      "class": "exact_online",
+      "repeat": 2,
+      "actual_steps": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": true,
+      "quality_claim": "second request reuses only deterministic reference VAE latents"
+    },
+    {
+      "version": "v03_equivalent_condition_embeddings",
+      "class": "numerically_equivalent_mechanical",
+      "actual_steps": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": true,
+      "cache_reference_latents": true,
+      "quality_claim": "same equations; split GEMM M dimension can cause tiny floating-point drift"
+    },
+    {
+      "version": "v10_forecast_16_4",
+      "class": "approximate_conservative",
+      "actual_steps": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 13, 15, 17, 18, 19],
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": true,
+      "cache_reference_latents": true,
+      "quality_claim": "requires automatic gate and Human review"
+    },
+    {
+      "version": "v11_forecast_14_6",
+      "class": "approximate_balanced",
+      "actual_steps": [0, 1, 2, 3, 4, 5, 6, 7, 9, 11, 13, 15, 17, 19],
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": true,
+      "cache_reference_latents": true,
+      "quality_claim": "requires automatic gate and Human review"
+    },
+    {
+      "version": "v12_forecast_12_8",
+      "class": "approximate_fast",
+      "actual_steps": [0, 1, 2, 3, 4, 5, 7, 9, 11, 13, 16, 19],
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": true,
+      "cache_reference_latents": true,
+      "quality_claim": "exploratory; must not become default without Human review"
+    }
+  ]
+}

@@ -84,7 +84,7 @@ def _load_pinned_comfy_kitchen():
     return module
 
 
-def _smoke_test(kitchen, sage_module) -> None:
+def _smoke_test(kitchen, sage_module, *, require_w4a8: bool) -> None:
     import torch
 
     device = torch.device("cuda:0")
@@ -107,6 +107,38 @@ def _smoke_test(kitchen, sage_module) -> None:
     if projected.shape != (2, 256) or not torch.isfinite(projected).all():
         raise SM89RuntimeError("pinned CUDA INT8/ConvRot smoke test returned invalid data")
 
+    w4_projected = None
+    if require_w4a8:
+        qdata = torch.zeros(
+            (256, 128), device=device, dtype=torch.int8
+        )
+        s_rel = torch.ones(
+            (256, 16), device=device, dtype=torch.float8_e4m3fn
+        )
+        s_channel = torch.full(
+            (256,), 1.0 / 127.0, device=device, dtype=torch.float32
+        )
+        codebook = torch.linspace(
+            -1.0, 1.0, 16, device=device, dtype=torch.float32
+        )
+        with kitchen.use_backend("cuda"):
+            w4_projected = kitchen.w4a8_int8_linear(
+                value,
+                qdata,
+                s_rel,
+                s_channel,
+                codebook=codebook,
+                group_size=16,
+                convrot_groupsize=256,
+                out_dtype=torch.bfloat16,
+            )
+        if w4_projected.shape != (2, 256) or not torch.isfinite(
+            w4_projected
+        ).all():
+            raise SM89RuntimeError(
+                "pinned CUDA W4A8/ConvRot smoke test returned invalid data"
+            )
+
     query = torch.randn((64, 24, 128), device=device, dtype=torch.bfloat16, generator=generator)
     key = torch.randn((64, 24, 128), device=device, dtype=torch.bfloat16, generator=generator)
     val = torch.randn((64, 24, 128), device=device, dtype=torch.bfloat16, generator=generator)
@@ -122,13 +154,14 @@ def _smoke_test(kitchen, sage_module) -> None:
     if attended.shape != (1, 64, 24, 128) or not torch.isfinite(attended).all():
         raise SM89RuntimeError("SageAttention SM89 smoke test returned invalid data")
     torch.cuda.synchronize(device)
-    del value, qweight, scale, projected, query, key, val, attended
+    del value, qweight, scale, projected, w4_projected, query, key, val, attended
 
 
 def configure_sm89_runtime(
     *,
     quant_backend: Literal["cuda", "triton"] = "cuda",
     smoke_test: bool = False,
+    require_w4a8: bool = False,
 ) -> SM89RuntimeReport:
     """Lock native H3 to the release kernel build and fail closed on drift."""
 
@@ -138,7 +171,9 @@ def configure_sm89_runtime(
         raise SM89RuntimeError("CUDA is unavailable")
     capability = tuple(torch.cuda.get_device_capability(0))
     if capability != (8, 9):
-        raise SM89RuntimeError(f"RTX 4090 SM89 is required, found SM{capability[0]}{capability[1]}")
+        raise SM89RuntimeError(
+            f"an NVIDIA SM89 GPU is required, found SM{capability[0]}{capability[1]}"
+        )
 
     kitchen = _load_pinned_comfy_kitchen()
     kitchen_binary = next(
@@ -150,7 +185,7 @@ def configure_sm89_runtime(
     if kitchen_binary is None:
         raise SM89RuntimeError("release-owned Comfy-Kitchen CUDA extension is missing")
     kitchen_sha256 = _sha256(kitchen_binary)
-    if kitchen_sha256 != "aaefcd38ba30379e5707b22bdc7e3209188e75c78ab4dd4a259f9e1d83eafa9b":
+    if kitchen_sha256 != "652b1f1aa339742b39cbecb73c51d942bd675063381eefa59fcede5c4da5f322":
         raise SM89RuntimeError("release-owned Comfy-Kitchen CUDA extension hash changed")
     status = kitchen.list_backends()
     selected = status.get(quant_backend, {})
@@ -159,6 +194,8 @@ def configure_sm89_runtime(
         raise SM89RuntimeError(f"Comfy-Kitchen {quant_backend} backend unavailable: {reason}")
     capabilities = set(selected.get("capabilities", ()))
     required = {"int8_linear"}
+    if require_w4a8:
+        required.add("w4a8_int8_linear")
     missing = sorted(required - capabilities)
     if missing:
         raise SM89RuntimeError(
@@ -182,10 +219,10 @@ def configure_sm89_runtime(
         raise SM89RuntimeError("SageAttention lacks the required SM89 FP8-PV entry point")
     sage_binary = Path(sage_sm89.__file__).resolve()
     sage_sha256 = _sha256(sage_binary)
-    if sage_sha256 != "c44f6878acd51920192d0d9fdbbeebeaade1e4c8eda21ac372f7d0332d99ef5f":
+    if sage_sha256 != "abf2a42461561c4780094825e373342f848afb1e73437cf97b4b9f4ce1eff41b":
         raise SM89RuntimeError("SageAttention SM89 extension hash changed")
     if smoke_test:
-        _smoke_test(kitchen, sage)
+        _smoke_test(kitchen, sage, require_w4a8=require_w4a8)
 
     return SM89RuntimeReport(
         quant_backend=quant_backend,

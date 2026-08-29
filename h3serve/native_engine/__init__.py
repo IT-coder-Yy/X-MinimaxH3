@@ -7,6 +7,7 @@ module import time.  Construct :class:`NativeH3Engine` only in the GPU worker.
 from .engine import NativeGenerationResult, NativeH3Engine, NativeHotH3Engine
 from .hot_session import (
     HotSessionCancelled,
+    HotSessionCheckpointResult,
     HotSessionRequest,
     HotSessionResult,
     NativeT2AVHotSession,
@@ -15,6 +16,7 @@ from .hot_session import (
 __all__ = [
     "HotSessionRequest",
     "HotSessionResult",
+    "HotSessionCheckpointResult",
     "HotSessionCancelled",
     "NativeGenerationResult",
     "NativeH3Engine",

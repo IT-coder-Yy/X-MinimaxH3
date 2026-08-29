@@ -1234,6 +1234,7 @@ extern "C" {
         int input_dtype_code,
         bool stochastic,
         int act_code,
+        int block_threads_override,
         uint64_t seed,
         cudaStream_t stream);
 
@@ -2254,8 +2255,40 @@ void quantize_int8_rowwise_convrot64(
         input_dtype_code,
         stochastic,
         static_cast<int>(act_code),
+        /*block_threads_override=*/0,
         seed,
         stream);
+}
+
+void quantize_int8_rowwise_convrot64_config(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> scales,
+    int64_t group_size,
+    bool stochastic,
+    int64_t act_code,
+    int64_t block_threads,
+    uint64_t seed,
+    uintptr_t stream_ptr) {
+
+    const int64_t M = input.shape(0);
+    const int64_t K = output.shape(1);
+    const int64_t in_width = (act_code == comfy::kActSwiGLU) ? 2 : 1;
+    if (output.shape(0) != M || input.shape(1) != K * in_width) {
+        throw std::runtime_error("INT8 rowwise convrot64 config output shape mismatch");
+    }
+    if (scales.shape(0) != M || scales.shape(1) != 1) {
+        throw std::runtime_error("INT8 rowwise convrot64 config scale shape mismatch");
+    }
+    const int input_dtype_code = map_dtype_to_code(input.dtype());
+    if (input_dtype_code < 0 || input_dtype_code > 2) {
+        throw std::runtime_error("Unsupported input dtype for INT8 rowwise convrot64 config");
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_quantize_int8_rowwise_convrot64_kernel(
+        input.data(), output.data(), scales.data(), M, K,
+        static_cast<int>(group_size), input_dtype_code, stochastic,
+        static_cast<int>(act_code), static_cast<int>(block_threads), seed, stream);
 }
 
 void dequantize_int8_linear(
@@ -2433,6 +2466,7 @@ void int8_linear_m1(
             input_dtype_code,
             false,
             /*act_code=*/0,
+            /*block_threads_override=*/0,
             0,
             stream);
     } else {
@@ -2809,6 +2843,18 @@ NB_MODULE(_C, m) {
           nb::arg("group_size"),
           nb::arg("stochastic"),
           nb::arg("act_code"),
+          nb::arg("seed"),
+          nb::arg("stream_ptr"));
+
+    m.def("quantize_int8_rowwise_convrot64_config", &quantize_int8_rowwise_convrot64_config,
+          "Executor-only ConvRot rowwise INT8 block-size sweep entry point.",
+          nb::arg("input"),
+          nb::arg("output"),
+          nb::arg("scales"),
+          nb::arg("group_size"),
+          nb::arg("stochastic"),
+          nb::arg("act_code"),
+          nb::arg("block_threads"),
           nb::arg("seed"),
           nb::arg("stream_ptr"));
 

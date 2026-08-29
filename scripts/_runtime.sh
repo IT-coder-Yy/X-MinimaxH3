@@ -13,10 +13,8 @@ h3_sparse_importable() {
 h3_configure_sparse_runtime() {
   local python_bin="$1"
   local sparse_commit="ae5b629ebb41e41f86b3ea2ab5a3283f13ac151a"
-  local runtime_root="${H3_SERVE_RUNTIME_DIR:-${release_root}/runtime}"
-  local cache_root="${H3_SPARSE_CACHE_DIR:-${runtime_root}/extensions/sparge-sm89-py310-torch28-cu12}"
-  local packaged_root="${release_root}/prebuilt/sparge-sm89-py310-torch28-cu126"
-  local source_root="${runtime_root}/vendor/SpargeAttn"
+  local cache_root="${H3_SPARSE_CACHE_DIR:-${release_root}/runtime/extensions/sparge-sm89-py310-torch213-cu133}"
+  local source_root="${release_root}/runtime/vendor/SpargeAttn"
   local legacy_root="/tmp/h3_sparge_sm89"
 
   # An explicitly disabled optional backend always wins. This is useful for
@@ -40,24 +38,15 @@ h3_configure_sparse_runtime() {
     return 0
   fi
 
-  # The GitHub release carries the exact extension used by the validated
-  # RTX 4090 runtime.  Prefer it over a machine-local cache or a source build.
-  # Importing is the ABI check: an incompatible Python/Torch/CUDA combination
-  # is rejected instead of being silently selected.
-  if h3_sparse_importable "${python_bin}" "${packaged_root}"; then
-    export H3_NATIVE_ENABLE_SPARSE=1
-    export H3_NATIVE_SPARGE_BUILD_DIR="${packaged_root}"
-    return 0
-  fi
-
   if h3_sparse_importable "${python_bin}" "${cache_root}"; then
     export H3_NATIVE_ENABLE_SPARSE=1
     export H3_NATIVE_SPARGE_BUILD_DIR="${cache_root}"
     return 0
   fi
 
-  # Development-only migration path for checkouts created before the packaged
-  # binary was introduced.
+  # Preserve the already audited development build before /tmp is cleaned or
+  # WSL restarts. The cached directory is release-local and intentionally not
+  # committed because this extension is tied to the locked binary runtime.
   if h3_sparse_importable "${python_bin}" "${legacy_root}"; then
     echo "Caching the validated RTX 4090 sparse-attention extension..." >&2
     mkdir -p "${cache_root}"
@@ -108,8 +97,7 @@ h3_configure_sparse_runtime() {
 }
 
 h3_configure_runtime() {
-  local runtime_root="${H3_SERVE_RUNTIME_DIR:-${release_root}/runtime}"
-  local packaged_python="${runtime_root}/venv/bin/python"
+  local packaged_python="${release_root}/runtime/venv/bin/python"
   local vendor_path="${release_root}/backends/turbo/vendor"
   local python_bin=""
   local candidate
@@ -138,6 +126,11 @@ h3_configure_runtime() {
 
   for candidate in "${candidates[@]}"; do
     [[ -n "${candidate}" && -x "${candidate}" ]] || continue
+    # runtime/venv may itself be reached through a /mnt/c checkout symlink.
+    # Resolve the interpreter before importing Torch so Python discovers the
+    # Linux-native environment prefix instead of walking thousands of DrvFS
+    # paths during import-time source inspection.
+    candidate="$(readlink -f -- "${candidate}")"
     if PYTHONPATH="${vendor_path}${PYTHONPATH:+:${PYTHONPATH}}" \
       "${candidate}" -c '
 import sys
@@ -162,11 +155,6 @@ import PIL, comfy_kitchen, sageattention
   export H3_SERVE_PYTHON="${python_bin}"
   export PYTHONPATH="${vendor_path}${PYTHONPATH:+:${PYTHONPATH}}"
 
-  local packaged_flashvsr_python="${runtime_root}/flashvsr-venv/bin/python"
-  if [[ -z "${H3_SERVE_FLASHVSR_PYTHON:-}" && -x "${packaged_flashvsr_python}" ]]; then
-    export H3_SERVE_FLASHVSR_PYTHON="${packaged_flashvsr_python}"
-  fi
-
   # This is optional: reuse or compile the locked SM89 extension once. A build
   # failure keeps the service available with exact 100% dense attention.
   if ! h3_configure_sparse_runtime "${python_bin}"; then
@@ -175,6 +163,13 @@ import PIL, comfy_kitchen, sageattention
     echo "Continuing with complete dense attention; sparse controls stay locked." >&2
   fi
 
-  export H3_SERVE_MINIMAX_SOURCE="${H3_SERVE_MINIMAX_SOURCE:-${release_root}/runtime_sources/MiniMax-H3}"
-  export H3_SERVE_LIGHTX_SOURCE="${H3_SERVE_LIGHTX_SOURCE:-${release_root}/runtime_sources/LightX2V}"
+  local development_main="${release_root}/../.."
+  local development_minimax="${development_main}/MiniMax-H3"
+  local development_lightx="${release_root}/../../../backend-compare/sources/LightX2V"
+  if [[ ! -d "${release_root}/runtime/vendor/MiniMax-H3" && -d "${development_minimax}" ]]; then
+    export H3_SERVE_MINIMAX_SOURCE="${H3_SERVE_MINIMAX_SOURCE:-${development_minimax}}"
+  fi
+  if [[ ! -d "${release_root}/runtime/vendor/LightX2V" && -d "${development_lightx}" ]]; then
+    export H3_SERVE_LIGHTX_SOURCE="${H3_SERVE_LIGHTX_SOURCE:-${development_lightx}}"
+  fi
 }

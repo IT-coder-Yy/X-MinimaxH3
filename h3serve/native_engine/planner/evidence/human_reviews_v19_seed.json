@@ -20,7 +20,9 @@
         "anomaly": "not_reported"
       },
       "artifact": "runtime/calibration/workload_routing_round24/avguard128_720p15/round24_avguard128_720p15_i004_original911_720p15_seed82303_h3prompt_1280x736_362f_seed82303.mp4",
+      "artifact_sha256": "5c72ca8387153d384e3e5e8fae3ef6223991c635271417bad88ea2e5c6224b7f",
       "comparator_artifact": "runtime/calibration/workload_routing_round23/original128_split050/round23_original128_split050_i004_original911_720p15_seed82303_h3prompt_1280x736_362f_seed82303.mp4",
+      "comparator_artifact_sha256": "2d7df087b9416443ab71d091b528db6c48d2d66e3d0ceedadeb48d26bb103f81",
       "note": "Human reported strange audio, female-to-male timbre drift and blur."
     },
     {
@@ -41,7 +43,9 @@
         "anomaly": "reject"
       },
       "artifact": "runtime/calibration/workload_routing_round26/layergroup30_38_720p15/round26_layergroup30_38_720p15_i004_original911_720p15_seed82303_h3prompt_1280x736_362f_seed82303.mp4",
+      "artifact_sha256": "009316b75de79a45b9007ab076439f463fb352fcce944a522fd2c593ab5fbcb9",
       "comparator_artifact": "runtime/calibration/workload_routing_round23/original128_split050/round23_original128_split050_i004_original911_720p15_seed82303_h3prompt_1280x736_362f_seed82303.mp4",
+      "comparator_artifact_sha256": "2d7df087b9416443ab71d091b528db6c48d2d66e3d0ceedadeb48d26bb103f81",
       "note": "Human continuous playback exposed ghosting missed by static contact sheets."
     },
     {
@@ -62,6 +66,7 @@
         "anomaly": "not_reported"
       },
       "artifact": "runtime/calibration/workload_routing_round63/sol24_phase_720p15/round63_sol24_phase_720p15_i004_original911_720p15_seed82303_h3prompt_1280x736_362f_seed82303.mp4",
+      "artifact_sha256": "9c894a1b7409896a62a7ccee709b1fa79d8299d9e7a4681a767d4d14c44fd5fb",
       "note": "Human rejected blur and abnormal movement despite the lower latency."
     },
     {
@@ -82,6 +87,7 @@
         "anomaly": "accept"
       },
       "artifact": "runtime/calibration/workload_routing_round143/causal_dense_island_720p5/round143_causal_dense_island_720p5_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "artifact_sha256": "db9c00cd7d35fb7d7b104bd0edc351bb8b405b5b97983f9a5d32144651fab116",
       "note": "Human confirmed repaired door/contact motion and improved clarity."
     },
     {
@@ -102,7 +108,9 @@
         "anomaly": "reject"
       },
       "artifact": "runtime/calibration/workload_routing_round149/phase_causal_island_720p5/round149_phase_causal_island_720p5_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "artifact_sha256": "62267dd59388bc45d4b14f0b8caca03b12191479ed335ce94deed56c0c1d6dfd",
       "comparator_artifact": "runtime/calibration/workload_routing_round143/causal_dense_island_720p5/round143_causal_dense_island_720p5_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "comparator_artifact_sha256": "db9c00cd7d35fb7d7b104bd0edc351bb8b405b5b97983f9a5d32144651fab116",
       "note": "Human reported the return of the uncontacted automatic-door motion."
     },
     {
@@ -123,7 +131,9 @@
         "anomaly": "accept"
       },
       "artifact": "runtime/calibration/workload_routing_round216/measured_budget_v1_720p5_retry1/round216_measured_budget_v1_720p5_retry1_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "artifact_sha256": "00245b5fc9b6f5ba1b40f00f0b1161c621a6b483c07a52945a803082471a6f0c",
       "comparator_artifact": "runtime/calibration/workload_routing_round143/causal_dense_island_720p5/round143_causal_dense_island_720p5_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "comparator_artifact_sha256": "db9c00cd7d35fb7d7b104bd0edc351bb8b405b5b97983f9a5d32144651fab116",
       "note": "Human found the logic consistent with the accepted comparator."
     },
     {
@@ -144,7 +154,9 @@
         "anomaly": "reject"
       },
       "artifact": "runtime/calibration/workload_routing_round217/measured_budget_v2_720p5/round217_measured_budget_v2_720p5_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "artifact_sha256": "5fbf92a696e1b21d973d84ef76c428d21fc9109a6d0dee317e0fdc0648ec4a83",
       "comparator_artifact": "runtime/calibration/workload_routing_round216/measured_budget_v1_720p5_retry1/round216_measured_budget_v1_720p5_retry1_round86_mtcr_fused_rms_720p5_1280x736_124f_seed82303.mp4",
+      "comparator_artifact_sha256": "00245b5fc9b6f5ba1b40f00f0b1161c621a6b483c07a52945a803082471a6f0c",
       "note": "Relaxing layers 30-39 and 45 together regressed door causality."
     },
     {
@@ -165,7 +177,9 @@
         "anomaly": "not_reported"
       },
       "artifact": "runtime/calibration/workload_routing_round219/terminal45_budget7800_480p5_four_scene_retry1/round219_terminal45_budget7800_retry1_unlock_latch_then_gate_480p5_864x480_124f_seed82303.mp4",
+      "artifact_sha256": "9fb0f34cea9f6067c0ab9737542eb376105cf1766dca04c0873c4fa768a160cd",
       "comparator_artifact": "runtime/calibration/workload_routing_round220/dense12a8f_unlock_480p5/round220_dense12a8f_unlock_480p5_unlock_latch_then_gate_dense_480p5_864x480_124f_seed82303.mp4",
+      "comparator_artifact_sha256": "6d436fcf6e285fa468e89c24b13efb712836f9f0b9d57ef47beb1175b5aaa568",
       "note": "Both Dense and sparse failed; this must not become a sparse-negative label."
     },
     {
@@ -186,6 +200,7 @@
         "anomaly": "reject"
       },
       "artifact": "runtime/calibration/workload_routing_round224/v13_release_candidate/round224_v13_100_round188_comparator_720p15_1280x736_362f_seed82303.mp4",
+      "artifact_sha256": "570042f25a2547d6a5e980aec8b0cf3af14b445ff6a709e0117e62c9d218f9cb",
       "note": "Human rejected the unformed video and persistent identity/geometry drift."
     }
   ]

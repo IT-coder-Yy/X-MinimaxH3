@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "${root}/scripts/stop.sh" "$@"
+release_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "${release_root}/scripts/stop.sh" "$@"

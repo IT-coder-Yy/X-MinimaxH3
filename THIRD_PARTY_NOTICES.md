@@ -1,32 +1,31 @@
 # Third-party notices
 
-X-MinimaxH3 is original service and acceleration code combined with narrowly
-vendored source subsets, prebuilt extensions, and separately downloaded model
-weights. Component provenance does not change the license of this project's
-original code.
+X-MinimaxH3 combines or interoperates with third-party software and model
+artifacts. This file is a provenance guide, not a substitute for the upstream
+license text. Model weights are downloaded separately and are never relicensed
+by this repository.
 
-| Component | Pinned revision/version | Distribution form | License/provenance |
-|---|---:|---|---|
-| MiniMax H3 | `8d8824efaf94586c0cc9ac7ad8d0723d4d6420ea` | tokenizer and VAE runtime subset; model files downloaded separately | [`third_party_licenses/MiniMax-H3-COMMUNITY-LICENSE`](third_party_licenses/MiniMax-H3-COMMUNITY-LICENSE), root `NOTICE`, and `runtime_sources/PROVENANCE.json` |
-| LightX2V | `205d5c872d01557935dc87d67156f4f94069ea65` | audio-VAE loader runtime subset | `runtime_sources/LightX2V/LICENSE` and `runtime_sources/PROVENANCE.json` |
-| SageAttention | `2.2.0` | CPython 3.10 Linux SM89 wheel | `third_party_licenses/SageAttention-LICENSE` |
-| SpargeAttention | `ae5b629ebb41e41f86b3ea2ab5a3283f13ac151a` | validated CPython 3.10/Torch 2.8/SM89 extension | `prebuilt/sparge-sm89-py310-torch28-cu126/PROVENANCE.json`; Apache-2.0 |
-| Comfy Kitchen | `0.2.26` plus the pinned backend binary | Python package and modified CUDA backend | `third_party_licenses/Comfy-Kitchen-LICENSE`, `third_party_licenses/Comfy-Kitchen-NOTICE` |
-| MiniMax H3 Turbo node | derived from `55fee864dd7b2976b1c4ce3c3d5f7968f181409f` | modified loader/runtime code | `third_party_licenses/Turbo-Node-LICENSE` |
-| Spectrum MiniMax H3 | `dc6291525112cb4246f864738e5bb4e2b85446da` | provenance for forecasting work | `third_party_licenses/Spectrum-LICENSE` |
-| FlashVSR | `b527c6f285fb30df530f5febc8b45764a789c961` | minimal isolated worker source | `third_party/flashvsr/LICENSE`, `third_party/flashvsr/PROVENANCE.md` |
-| Block Sparse Attention | `49d6c39e4dc0303442cda3bb758b3925d4399c49` | CPython 3.11 Linux wheel used by FlashVSR | `third_party/block_sparse_attention/LICENSE`, `third_party/block_sparse_attention/PROVENANCE-H3.md` |
-| FasterVQA | `8db452e2caa5d5d4da507bcf577c19b8114f2ebd` | optional offline evaluation only | `third_party_licenses/FasterVQA-LICENSE` |
+| Component | Purpose | Upstream / license location |
+|---|---|---|
+| MiniMax H3 | Base model architecture and inference source | `MiniMaxAI/MiniMax-H3`, pinned by `scripts/install.sh`; review the upstream model/source terms |
+| LightX2V | H3 runtime integration and LoRA conversion reference | `ModelTC/LightX2V`, Apache-2.0 upstream |
+| MiniMax H3 INT8 weights | FL2VA/Ref2VA diffusion, Qwen encoder and VAEs | `Comfy-Org/MiniMax-H3`; exact revisions and hashes in `models/manifest.json` |
+| MiniMax H3 W4A8 weights | 8GB FL2VA/Ref2VA profiles | `starsfriday/MiniMax-H3-w4a8`; exact revision and hashes in the manifest |
+| Larry Turbo LoRA | Optional accelerated FL2VA profile | `larryvrh/MiniMax-H3-Turbo-Lora`; exact revision and hash in the manifest |
+| LightX2V Turbo LoRAs | Optional FL2VA 4/8-step and Ref2VA 4-step profiles | `lightx2v/Minimax-h3-Turbo`; exact revision and hashes in the manifest |
+| MMH3 UltimateUpscale | Temporal/spatial second-sampling pieces, overlap and stitching design | [`bbaudio-2025/Comfyui-MMH3-UltimateUpscale`](https://github.com/bbaudio-2025/Comfyui-MMH3-UltimateUpscale), MIT; pinned evaluation revision `6db8fa5a4e4ca0718d2ea8d08002ea899fe27721`; license copy in `third_party_licenses/MMH3-UltimateUpscale-LICENSE` |
+| H3 latent upscaler | Learned 3D latent resize used by native second sampling | [`LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler`](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler), Apache-2.0; exact weight revision and hash in the manifest |
+| SageAttention | Quantized dense-attention acceleration and SM89 implementation foundation | [`thu-ml/SageAttention`](https://github.com/thu-ml/SageAttention), Apache-2.0; license copy in `third_party_licenses/SageAttention-LICENSE` |
+| SpargeAttention | Sparse attention integration | Review the pinned upstream source installed by `scripts/install.sh` |
+| Comfy Kitchen 0.2.28 | SM89 INT8/W4A8 kernels; a narrow vendored runtime is included | License and notice in `third_party_licenses/Comfy-Kitchen-*` |
+| H3 SiLU/temb grid | 5.3MB deterministic kernel-calibration lookup asset, not a model checkpoint | `backends/turbo/custom_node/h3_silu_temb_grid.safetensors`, SHA-256 recorded in `RELEASE_MANIFEST.json` |
+| FastVQA | Optional validation tooling | `third_party_licenses/FasterVQA-LICENSE` |
+| ComfyUI connector | Optional HTTP workflow integration | Connector code in `integrations/comfyui`; ComfyUI remains separately licensed upstream |
 
-Model weights are not stored in this source distribution. Their repositories,
-immutable upstream revisions, expected sizes, install paths, and SHA-256
-digests are recorded in `models/manifest.json`. The downloader asks the user to
-accept model licenses before transfer. Users remain responsible for reviewing
-the publishers' licenses and restrictions before use or redistribution.
+Additional Python and system dependencies retain their own licenses. Run
+`pip-licenses` in the configured environment if a deployment needs a complete
+environment-specific software bill of materials.
 
-The MiniMax H3 agreement contains territorial, acceptable-use, downstream-user,
-commercial and attribution requirements. Its complete text is shipped locally;
-the short root `NOTICE` is the redistribution notice required by Section III.4.
-
-X-MinimaxH3's original code is released under the root `LICENSE`. Third-party
-components remain governed by the licenses listed in this document.
+The MiniMax H3 model license and each weight publisher's repository terms may
+restrict commercial use or redistribution. Review them before downloading,
+using or redistributing any weight.

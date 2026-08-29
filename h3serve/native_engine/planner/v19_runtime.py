@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, dataclass
 
 from .v19_candidates import V19CandidateBlueprint
@@ -12,6 +13,49 @@ from .v19_runtime_bridge import runtime_schedule_from_blueprint
 
 
 V19_RUNTIME_SELECTION_SCHEMA = "h3_v19_runtime_selection_v1"
+
+
+def _technique_mix(
+    *,
+    total_steps: int,
+    actual_steps: tuple[int, ...],
+    schedule: tuple[tuple[int, int, str], ...],
+) -> dict[str, object]:
+    """Explain the complete compute mix selected behind the one public dial."""
+
+    actual_set = set(actual_steps)
+    if schedule:
+        actual_actions = Counter(
+            action.rsplit(":", 1)[-1]
+            for step, _layer, action in schedule
+            if step in actual_set
+        )
+        forecast_anchor_actions = Counter(
+            action.rsplit(":", 1)[-1]
+            for step, _layer, action in schedule
+            if step not in actual_set
+        )
+    else:
+        actual_actions = Counter({"dense": len(actual_steps) * 50})
+        forecast_anchor_actions = Counter()
+    forecast_steps = total_steps - len(actual_steps)
+    axes = ["exact_runtime"]
+    if forecast_steps:
+        axes.append("directional_forecast")
+    if any(
+        action.startswith("sparse_topk_")
+        for action in (*actual_actions, *forecast_anchor_actions)
+    ):
+        axes.append("block_sparse_attention")
+    return {
+        "actual_dit_evaluations": len(actual_steps),
+        "forecast_evaluations": forecast_steps,
+        "actual_attention_cells": dict(sorted(actual_actions.items())),
+        "forecast_anchor_attention_cells": dict(
+            sorted(forecast_anchor_actions.items())
+        ),
+        "coupled_techniques": axes,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +175,11 @@ class V19RuntimeSelector:
             "actual_step_indices": list(actual),
             "forecast_steps": int(workload.steps) - len(actual),
             "required_actual_step_indices": list(required_actual_step_indices),
+            "technique_mix": _technique_mix(
+                total_steps=int(workload.steps),
+                actual_steps=actual,
+                schedule=schedule,
+            ),
         }
         if decision.candidate is not None:
             assert decision.certificate is not None
@@ -141,7 +190,10 @@ class V19RuntimeSelector:
                 "envelope_digest": decision.certificate.envelope_digest,
                 "certificate_digest": decision.certificate.certificate_digest,
                 "cost_p90_ms": decision.candidate.predicted_cost_p90_ms,
+                "peak_vram_gib": decision.candidate.predicted_peak_vram_gib,
                 "risk_ucb": asdict(decision.candidate.risk_ucb),
+                "terminal_debt": asdict(decision.candidate.terminal_debt),
+                "maximum_debt": asdict(decision.candidate.maximum_debt),
             })
         return V19RuntimeSelection(
             decision=decision,

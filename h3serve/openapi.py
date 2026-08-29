@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .contract import MAX_NATIVE_PIXEL_FRAMES
+from .contract import MAX_CUSTOM_DIMENSION, MAX_NATIVE_PIXEL_FRAMES
 
 
 def document(version: str) -> dict[str, Any]:
@@ -36,8 +36,8 @@ def document(version: str) -> dict[str, Any]:
             ),
         },
         "seed": {"oneOf": [{"type": "integer", "minimum": 0}, {"type": "string", "enum": ["random"]}]},
-        "width": {"type": "integer", "minimum": 192, "maximum": 1920, "multipleOf": 32},
-        "height": {"type": "integer", "minimum": 192, "maximum": 1920, "multipleOf": 32},
+        "width": {"type": "integer", "minimum": 192, "maximum": MAX_CUSTOM_DIMENSION, "multipleOf": 32},
+        "height": {"type": "integer", "minimum": 192, "maximum": MAX_CUSTOM_DIMENSION, "multipleOf": 32},
         "frames": {"type": "integer", "minimum": 5, "maximum": 362},
         "sampling_steps": {
             "type": "integer",
@@ -51,7 +51,9 @@ def document(version: str) -> dict[str, Any]:
             "maximum": 100,
             "default": 0,
             "description": (
-                "连续加速强度。0为全真实步Dense端点；100为当前内部质量保护边界内的最快调度。"
+                "连续加速强度。0为全真实步Dense端点；"
+                "75为Human审阅的发布质量拐点；"
+                "75到100为明确允许质量风险的激进外推区。"
                 "Base自动联合分配真实/预测步和逐步逐层注意力预算；"
                 "LoRA保留用户指定的全部真实Turbo步，只自适应分配逐步逐层注意力预算。"
             ),
@@ -60,21 +62,9 @@ def document(version: str) -> dict[str, Any]:
         "lora_steps": {"type": "integer", "minimum": 4, "maximum": 8, "deprecated": True},
         "attention_keep_ratio": {"type": "number", "minimum": 0.5, "maximum": 1.0, "deprecated": True},
         "sparse_scope": {"type": "string", "enum": ["middle_only", "guarded", "full"], "deprecated": True},
-        "upscale_enabled": {"type": "boolean"},
-        "upscale_mode": {"type": "string", "enum": ["basic", "advanced"]},
-        "upscale_resolution": {"type": "string", "enum": ["720p", "1080p", "2k"]},
-        "upscale_target_width": {"type": "integer"},
-        "upscale_target_height": {"type": "integer"},
-        "preview_mode": {"type": "string", "enum": ["off", "auto", "pause"], "default": "off"},
-        "preview_step_index": {"oneOf": [{"type": "integer", "minimum": 0}, {"type": "string", "enum": ["auto"]}]},
-        "preview_branch_steps": {"type": "integer", "minimum": 1, "maximum": 3, "default": 2},
-        "preview_fast_finish": {"type": "boolean", "default": False},
         "execution_mode": {"type": "string", "enum": ["complete", "checkpoint"], "default": "complete"},
         "checkpoint_step": {"type": "integer", "minimum": 1},
         "checkpoint_retain": {"type": "boolean", "default": True},
-        "checkpoint_preview": {"type": "boolean", "default": False},
-        "checkpoint_preview_steps": {"type": "integer", "minimum": 1, "maximum": 8, "default": 4},
-        "checkpoint_preview_resolution": {"type": "string", "enum": ["source", "360p", "480p", "720p"], "default": "source"},
         "reference_image_resolution": {
             "type": "string",
             "enum": ["original", "360p", "480p", "720p"],
@@ -114,10 +104,58 @@ def document(version: str) -> dict[str, Any]:
                     "x-h3-native-spatiotemporal-budget": {
                         "inequality": f"width*height*frames <= {MAX_NATIVE_PIXEL_FRAMES}",
                         "reference_envelope": {
-                            "width": 1920, "height": 1088, "frames": 192,
+                            "width": 1920, "height": 1088, "frames": 362,
                         },
                         "frame_grid": "17*n+5",
                         "absolute_max_frames": 362,
+                    },
+                },
+                "SecondSamplingRequest": {
+                    "type": "object",
+                    "properties": {
+                        "resolution": {
+                            "type": "string",
+                            "enum": ["720p", "1080p", "1440p"],
+                            "default": "1080p",
+                            "description": (
+                                "Target short-edge preset; 1440p maps to "
+                                "2560×1440 at 16:9."
+                            ),
+                        },
+                        "steps": {
+                            "type": "integer", "minimum": 1, "maximum": 8,
+                            "default": 1,
+                        },
+                        "strength": {
+                            "type": "string",
+                            "enum": ["preserve", "standard", "enhance", "strong"],
+                            "default": "standard",
+                        },
+                        "acceleration": {
+                            "type": "number", "minimum": 0, "maximum": 100,
+                            "default": 75,
+                            "description": (
+                                "Exact-only low-noise trajectory: acceleration is "
+                                "projected onto the coupled Attention policy; Forecast is disabled."
+                            ),
+                        },
+                        "temporal_window_frames": {
+                            "type": ["integer", "null"],
+                            "minimum": 68,
+                            "maximum": 362,
+                            "default": None,
+                            "description": (
+                                "Optional user temporal-context window. The backend "
+                                "snaps it to H3's phase grid, keeps overlap/crossfade "
+                                "automatic, and shortens it further only when required "
+                                "by the physical VRAM budget."
+                            ),
+                        },
+                        "denoise": {
+                            "type": "number", "minimum": 0.05, "maximum": 0.50,
+                            "default": 0.20,
+                            "deprecated": True,
+                        },
                     },
                 },
                 "Job": {
@@ -129,15 +167,17 @@ def document(version: str) -> dict[str, Any]:
                         "request": {"type": "object"},
                         "progress": {"type": "object"},
                         "video_url": {"type": "string"},
-                        "preview": {"type": "object"},
                         "checkpoint": {"type": "object"},
                         "inference_plan": {
                             "type": "object",
                             "description": (
                                 "只读调度回执：Dense回退原因，或V19候选、"
-                                "execution/envelope/certificate digest与实际/预测步数。"
+                                "execution/envelope/certificate digest与实际/预测步数；"
+                                "memory_execution记录统一显存优化器选择的执行图、预算和块长。"
                             ),
                         },
+                        "second_sampling_available": {"type": "boolean"},
+                        "second_sampling": {"type": "object"},
                         "error": {"type": ["string", "null"]},
                     },
                 },
@@ -166,35 +206,6 @@ def document(version: str) -> dict[str, Any]:
                     "responses": {"200": {"description": "Workspace selected"}, "409": {"description": "Engine or queue is active"}},
                 },
             },
-            "/api/v1/engine": {
-                "put": {
-                    "summary": "Load or switch the active service family",
-                    "description": (
-                        "original/lora select FL2VA; reference/reference_lora select Ref2VA. "
-                        "The suffix only selects the initial task variant; later jobs can hot-switch "
-                        "base and LoRA inside the loaded family. Requires an idle queue when changing family."
-                    ),
-                    "requestBody": {"required": True, "content": {"application/json": {"schema": {
-                        "type": "object", "required": ["engine"],
-                        "properties": {"engine": {
-                            "type": "string",
-                            "enum": ["original", "lora", "reference", "reference_lora"],
-                        }},
-                    }}}},
-                    "responses": {
-                        "200": {"description": "Service family loaded"},
-                        "409": {"description": "Queue is busy or family cannot be switched"},
-                    },
-                },
-                "delete": {
-                    "summary": "Unload the active service family",
-                    "description": "Requires no active or queued jobs.",
-                    "responses": {
-                        "200": {"description": "Service family unloaded"},
-                        "409": {"description": "Queue is busy"},
-                    },
-                },
-            },
             "/api/v1/generations": {
                 "post": {
                     "summary": "Submit a generation job",
@@ -211,8 +222,6 @@ def document(version: str) -> dict[str, Any]:
                         "application/json": {"schema": {"$ref": "#/components/schemas/GenerationRequest"}},
                         "multipart/form-data": {"schema": {"type": "object", "properties": {
                             **request_properties,
-                            "first_frame": {"type": "string", "format": "binary"},
-                            "last_frame": {"type": "string", "format": "binary"},
                             **{f"reference_image_{index}": {"type": "string", "format": "binary"} for index in range(1, 10)},
                             **{f"reference_video_{index}": {"type": "string", "format": "binary"} for index in range(1, 4)},
                             **{f"reference_audio_{index}": {"type": "string", "format": "binary"} for index in range(1, 4)},
@@ -221,29 +230,46 @@ def document(version: str) -> dict[str, Any]:
                     "responses": {"202": {"description": "Accepted", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Job"}}}}, "400": {"description": "Invalid request"}},
                 }
             },
-            "/api/v1/jobs": {
-                "get": {
-                    "summary": "List jobs in the active workspace",
-                    "responses": {"200": {"description": "Ordered job list"}},
-                },
-            },
-            "/api/v1/jobs/{job_id}/preview": {
-                "get": {"summary": "Download a ready fork preview", "responses": {"200": {"description": "Preview MP4"}, "409": {"description": "Not ready"}}},
-            },
-            "/api/v1/jobs/{job_id}/preview/{decision}": {
-                "post": {
-                    "summary": "Continue the exact main trajectory or discard the card",
-                    "parameters": [
-                        {"name": "job_id", "in": "path", "required": True, "schema": {"type": "string"}},
-                        {"name": "decision", "in": "path", "required": True, "schema": {"type": "string", "enum": ["continue", "discard"]}},
-                    ],
-                    "responses": {"200": {"description": "Decision accepted"}, "409": {"description": "Job is not waiting"}},
-                },
-            },
             "/api/v1/jobs/{job_id}/resume": {
                 "post": {
                     "summary": "Queue continuation from a retained formal checkpoint",
                     "responses": {"202": {"description": "Resume queued"}, "409": {"description": "Checkpoint unavailable"}},
+                },
+            },
+            "/api/v1/jobs/{job_id}/second-sampling": {
+                "post": {
+                    "summary": "Queue learned H3 latent second sampling",
+                    "description": (
+                        "Creates a child job from the completed source card's clean AV latent. "
+                        "The source prompt and reference media are reused unchanged; audio is "
+                        "preserved. A learned H3 3D latent upscaler replaces invalid image-style "
+                        "latent interpolation before a Base-weight SA-Solver low-noise "
+                        "refinement pass."
+                    ),
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {
+                            "$ref": "#/components/schemas/SecondSamplingRequest"
+                        }}},
+                    },
+                    "responses": {
+                        "202": {"description": "Second-sampling child queued"},
+                        "400": {"description": "Invalid target or source latent unavailable"},
+                        "409": {"description": "Wrong active service family"},
+                    },
+                },
+            },
+            "/api/v1/cache/latents": {
+                "delete": {
+                    "summary": "Clear reproducible latent and checkpoint caches",
+                    "description": (
+                        "Keeps videos and job history, but removes clean AV latent "
+                        "artifacts used by second sampling and formal checkpoint tensors."
+                    ),
+                    "responses": {
+                        "200": {"description": "Cache cleared"},
+                        "409": {"description": "Jobs are active"},
+                    },
                 },
             },
             "/api/v1/settings/mimo-key": {
@@ -258,6 +284,36 @@ def document(version: str) -> dict[str, Any]:
                         "properties": {"api_key": {"type": "string", "maxLength": 4096}},
                     }}}},
                     "responses": {"200": {"description": "Configuration status only"}},
+                },
+            },
+            "/api/v1/settings/lora": {
+                "get": {
+                    "summary": "List installed H3 LoRA weights and the selected version",
+                    "description": (
+                        "Scans .safetensors below models/loras and reports native-name "
+                        "H3 adapter compatibility without loading tensor payloads."
+                    ),
+                    "responses": {"200": {"description": "LoRA catalog and active selection"}},
+                },
+                "put": {
+                    "summary": "Select and load one installed H3 LoRA version",
+                    "description": (
+                        "Requires an idle job queue. The current hot engine is released and "
+                        "rebuilt; a failed build restores the previous LoRA."
+                    ),
+                    "requestBody": {"required": True, "content": {"application/json": {"schema": {
+                        "type": "object", "required": ["checkpoint"],
+                        "properties": {"checkpoint": {
+                            "type": "string",
+                            "description": "Path relative to models/loras from the GET catalog",
+                        }},
+                    }}}},
+                    "responses": {
+                        "200": {"description": "LoRA selected and hot engine ready"},
+                        "400": {"description": "Missing, unsafe, or incompatible LoRA"},
+                        "409": {"description": "Jobs or another engine transition are active"},
+                        "500": {"description": "Build failed and previous LoRA was restored"},
+                    },
                 },
             },
             "/api/v1/settings/reference-media": {

@@ -25,12 +25,18 @@ from .adapters.sampling_mux import (
     AVPrediction,
     AtomicPyAVMuxer,
     ResMultistepAVSampler,
+    SASolverAVSampler,
     SamplingPlan,
     TurboAVSampler,
     TurboClockMode,
+    refinement_sigma_schedule,
     simple_sigma_schedule,
 )
-from .forecast import DirectionalForecastController
+from .forecast import (
+    DirectionalForecastController,
+    ForecastErrorDebtController,
+    V24_FORECAST_FEEDBACK_POLICY_ID,
+)
 from .model import (
     AttentionOnlineBudget,
     FrameInterleaveConfig,
@@ -41,6 +47,7 @@ from .model import (
     attention_sparsity,
     attention_force_dense,
     attention_step,
+    block_cancellation,
     build_h3_block_executor,
     dense_qk_quantization,
     frame_interleave_config,
@@ -49,11 +56,16 @@ from .model import (
     mlp_spatial_lattice_config,
     rms_adaln_fusion,
     long_video_attention,
+    long_sequence_query_chunking,
 )
 from .planner import (
     ExecutionPlan,
     H3WorkloadAnalyzer,
+    LONG_SEQUENCE_VALIDATED_MAX_PACKED_TOKENS,
+    NoFeasibleProfile,
     RTX4090Planner,
+    select_memory_execution,
+    select_long_sequence_chunks,
     select_stable_dense_qk_quantization,
 )
 from .runtime import ImmutablePinnedModuleResidency, OffloadMode, RuntimeConfig
@@ -66,8 +78,26 @@ from .terminal_latent_guard import stabilize_terminal_video_latent_
 
 VideoDecoder = Callable[[Any, torch.Tensor, int], torch.Tensor]
 AudioDecoder = Callable[[Any, torch.Tensor], torch.Tensor]
+
+
+QWEN_CONDITIONING_CACHE_SCHEMA_VERSION = 1
+QWEN_CONDITIONING_PREPROCESS_VERSION = (
+    "h3_qwen_static_conditioning_v1"
+)
 VideoConditionEncoder = Callable[[Any, Any], Any]
 AudioConditionEncoder = Callable[[Any, Any], Any]
+
+
+# A prepared H3 QKV activation stores one INT8 value per hidden channel and
+# one FP32 row scale.  Keep the admission formula next to the request planner
+# rather than hiding it in a resolution/prompt branch: ``packed_tokens``
+# already includes every FL2VA/Ref2VA condition token.  The extra 512-MiB
+# release reserve covers allocator fragmentation and the calibrated model's
+# residual error; the memory planner independently retains its ordinary
+# 128-MiB guard.
+_H3_SHARED_QKV_BYTES_PER_PACKED_TOKEN = 5_376 + 4
+_H3_SHARED_QKV_RELEASE_RESERVE_BYTES = 512 * 1024**2
+_H3_MEMORY_POLICY_GUARD_BYTES = 128 * 1024**2
 
 
 class HotSessionCancelled(RuntimeError):
@@ -263,6 +293,14 @@ class HotSessionRequest:
     cache_reference_latents: bool = True
     mlp_chunk_tokens: int | None = None
     execution_plan: ExecutionPlan | None = None
+    # Release-only mechanical optimizations that have passed a same-process,
+    # full-DiT byte-equivalence gate.  Benchmarks default this off so their
+    # explicit reference graph remains a real legacy comparator; the service
+    # enables it after constructing the user request.
+    release_byte_exact_optimizations: bool = False
+    # Legacy persisted requests may still carry the historical mode field.
+    # All accepted values feed the same VRAM-budget optimizer.
+    memory_mode: Literal["auto", "performance", "low_vram"] = "auto"
     # Physical decisions emitted by the two-control joint optimizer.  Tuple
     # storage keeps the frozen request auditable and checkpoint-comparable.
     attention_action_schedule: tuple[tuple[int, int, str], ...] = ()
@@ -270,11 +308,20 @@ class HotSessionRequest:
     attention_online_budget_dense_layers: float = 0.0
     attention_online_rebate_schedule: tuple[tuple[int, int], ...] = ()
     acceleration_plan_summary: dict[str, Any] | None = None
+    # In-process request-local controller produced after exact tokenisation.
+    # Its auditable state is exported through the Forecast profile; it is not
+    # part of the public API or prompt-dependent routing surface.
+    mechanistic_runtime_controller: Any | None = None
     # When present, the exact-token V19 selector owns both the actual/forecast
     # trajectory and the per-cell Attention schedule.  Selection happens only
     # after Qwen tokenisation and reference preprocessing, so a creator prompt
     # is never routed using the former character-count approximation.
     v19_acceleration: float | None = None
+    # Actual DiT evaluations required by the surrounding product protocol.
+    # This is deliberately independent from preview rendering: a formal
+    # checkpoint resume must reconstruct the same V19 trajectory even though
+    # it must not render the already-produced checkpoint preview again.
+    scheduler_required_actual_step_indices: tuple[int, ...] = ()
     first_frame: Path | None = None
     last_frame: Path | None = None
     reference_images: tuple[Path, ...] = ()
@@ -298,9 +345,22 @@ class HotSessionRequest:
     # continuation after the first pass has already reached sigma=0.
     refinement_latents_path: Path | None = None
     refinement_denoise: float | None = None
-    refinement_spatial_mode: Literal["strict", "bicubic"] = "strict"
+    refinement_spatial_mode: Literal["strict", "learned_3d"] = "strict"
     preserve_refinement_audio: bool = True
     save_final_latents_path: Path | None = None
+    # A clean source latent may also carry the exact CPU Qwen output produced
+    # by its first pass.  Second sampling reuses that immutable condition
+    # instead of re-running the 32B encoder.  Legacy checkpoints simply miss
+    # the optional entry and fall back to the established encode path.
+    conditioning_cache_source_path: Path | None = None
+    # Internal UltimateUpscale execution contract.  Temporal windows do not
+    # individually satisfy the public 17*n+5 clip rule (for example the
+    # upstream 136-frame window owns exactly 40 H3 video tokens), so the
+    # orchestrator supplies their exact latent clocks.  ``latent_only`` stops
+    # before VAE decode; the stitched full latent is decoded once.
+    internal_video_tokens: int | None = None
+    internal_audio_tokens: int | None = None
+    latent_only: bool = False
     # Resume a formally paused noisy sampler state without replaying its
     # prefix.  The resumed request owns a fresh, explicitly rescheduled sigma
     # tail whose length is ``steps``.  This is intended for disposable preview
@@ -380,15 +440,43 @@ class HotSessionRequest:
             raise ValueError("prompt cannot be empty")
         if self.width % 32 or self.height % 32:
             raise ValueError("width and height must be multiples of 32")
-        if self.frames < 5 or (self.frames - 5) % 17:
+        internal_window = self.internal_video_tokens is not None
+        if internal_window:
+            if self.frames <= 0:
+                raise ValueError("internal temporal window must contain frames")
+            if self.internal_video_tokens <= 0:
+                raise ValueError("internal_video_tokens must be positive")
+            if self.internal_audio_tokens is None or self.internal_audio_tokens <= 0:
+                raise ValueError("internal_audio_tokens must be positive")
+            if not self.latent_only:
+                raise ValueError("internal temporal windows must be latent-only")
+        elif self.internal_audio_tokens is not None:
+            raise ValueError("internal audio clock requires internal video clock")
+        elif self.frames < 5 or (self.frames - 5) % 17:
             raise ValueError("frames must satisfy 17*n+5")
         if self.steps <= 0 or self.fps <= 0:
             raise ValueError("steps and fps must be positive")
+        if self.memory_mode not in ("auto", "performance", "low_vram"):
+            raise ValueError(
+                "memory_mode must be auto, performance or low_vram"
+            )
         if self.v19_acceleration is not None and (
             not math.isfinite(self.v19_acceleration)
             or not 0.0 <= self.v19_acceleration <= 100.0
         ):
             raise ValueError("V19 acceleration must lie in [0, 100]")
+        if (
+            tuple(sorted(set(self.scheduler_required_actual_step_indices)))
+            != self.scheduler_required_actual_step_indices
+            or any(
+                index < 0 or index >= self.steps
+                for index in self.scheduler_required_actual_step_indices
+            )
+        ):
+            raise ValueError(
+                "scheduler-required actual steps must be sorted, unique and "
+                "inside the sigma schedule"
+            )
         if self.preview_step_index is None:
             if self.preview_output_path is not None or self.preview_latents_path is not None:
                 raise ValueError(
@@ -426,9 +514,12 @@ class HotSessionRequest:
                     raise ValueError(
                         "preview branch actual steps must be sorted, unique and inside the branch"
                     )
-            if not 0.4 <= self.preview_branch_spatial_scale <= 1.0:
+            # The public fixed 360p checkpoint preview is about 0.3235 of an
+            # aligned 1080p canvas (352 / 1088).  The old 0.4 floor made the
+            # advertised 24GB 1080p checkpoint path impossible before DiT.
+            if not 0.3 <= self.preview_branch_spatial_scale <= 1.0:
                 raise ValueError(
-                    "preview_branch_spatial_scale must be between 0.4 and 1.0"
+                    "preview_branch_spatial_scale must be between 0.3 and 1.0"
                 )
             if self.preview_audio_branch_use_lora:
                 if not 1 <= self.preview_audio_branch_steps <= 6:
@@ -462,9 +553,9 @@ class HotSessionRequest:
                 )
             if not 0.0 < self.refinement_denoise <= 1.0:
                 raise ValueError("refinement_denoise must be in (0, 1]")
-            if self.refinement_spatial_mode not in ("strict", "bicubic"):
+            if self.refinement_spatial_mode not in ("strict", "learned_3d"):
                 raise ValueError(
-                    "refinement_spatial_mode must be strict or bicubic"
+                    "refinement_spatial_mode must be strict or learned_3d"
                 )
             if self.actual_step_indices is not None and self.actual_step_indices != tuple(
                 range(self.steps)
@@ -472,6 +563,14 @@ class HotSessionRequest:
                 raise ValueError(
                     "second-pass refinement currently requires every step to be actual"
                 )
+        if (
+            self.conditioning_cache_source_path is not None
+            and not Path(self.conditioning_cache_source_path).is_file()
+        ):
+            raise ValueError(
+                "conditioning cache source does not exist: "
+                f"{self.conditioning_cache_source_path}"
+            )
         if self.sampler_state_path is not None:
             if self.refinement_latents_path is not None:
                 raise ValueError(
@@ -732,6 +831,7 @@ class HotSessionResult:
     forecast_profile: dict[str, Any]
     execution_profile: dict[str, Any]
     peak_allocated_gib: float = 0.0
+    peak_reserved_gib: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -745,6 +845,7 @@ class HotSessionCheckpointResult:
     step_seconds: tuple[float, ...]
     execution_profile: dict[str, Any]
     peak_allocated_gib: float = 0.0
+    peak_reserved_gib: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -780,12 +881,19 @@ class NativeT2AVHotSession:
         planner: RTX4090Planner | None = None,
         attention_backend: Any | None = None,
         v19_selector: Any | None = None,
+        latent_upscaler: ImmutablePinnedModuleResidency | None = None,
+        lora_video_shift: float = 12.0,
+        lora_audio_shift: float = 3.0,
+        lora_profile_id: str = "larry_turbo_v4_step600_ema",
+        lora_recommended_steps: tuple[int, ...] = (4, 5, 6, 7, 8),
+        lora_default_steps: int = 6,
     ) -> None:
         self.engine = engine
         self.conditioner = conditioner
         self.transformer = transformer
         self.video_vae = video_vae
         self.audio_vae = audio_vae
+        self.latent_upscaler = latent_upscaler
         self.decode_video = decode_video
         self.decode_audio = decode_audio
         self.encode_video_conditioning = encode_video_conditioning
@@ -793,6 +901,15 @@ class NativeT2AVHotSession:
         self.output_root = output_root.resolve()
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.turbo_clock_mode = turbo_clock_mode
+        self.lora_video_shift = float(lora_video_shift)
+        self.lora_audio_shift = float(lora_audio_shift)
+        self.lora_profile_id = str(lora_profile_id)
+        self.lora_recommended_steps = tuple(int(step) for step in lora_recommended_steps)
+        self.lora_default_steps = int(lora_default_steps)
+        if self.lora_video_shift <= 0.0 or self.lora_audio_shift <= 0.0:
+            raise ValueError("LoRA sigma shifts must be positive")
+        if self.lora_default_steps not in self.lora_recommended_steps:
+            raise ValueError("LoRA default steps must be one of the recommended steps")
         self.debug_step_dir = (
             None if debug_step_dir is None else debug_step_dir.resolve()
         )
@@ -823,8 +940,17 @@ class NativeT2AVHotSession:
         # rather than only the path, participates in the key so replacing an
         # uploaded image can never return stale conditioning.
         self._conditioning_cache: tuple[
-            tuple[Any, ...], torch.Tensor, torch.Tensor
+            str, torch.Tensor, torch.Tensor
         ] | None = None
+        # Disk-backed first-pass conditioning is a one-entry host cache.  It
+        # remains CPU-only so the 8/16-GB backends gain Qwen headroom without
+        # reducing the DiT device budget.
+        self._persisted_conditioning_cache: tuple[
+            str, torch.Tensor, torch.Tensor
+        ] | None = None
+        self._last_conditioning_cache_payload: dict[str, Any] | None = None
+        self._last_conditioning_cache_status = "not_checked"
+        self._last_conditioning_cache_fallback: str | None = None
         # One exact reference-pack cache.  Ref2VA creators commonly keep the
         # same characters/props/voices while changing prompt or seed.  Those
         # VAE latents are deterministic and independent of the denoise state,
@@ -877,6 +1003,53 @@ class NativeT2AVHotSession:
         except (AttributeError, OSError):
             pass
 
+    def _decode_video_for_plan(
+        self,
+        model: Any,
+        latents: torch.Tensor,
+        frame_count: int,
+        execution_plan: ExecutionPlan | None,
+    ) -> torch.Tensor:
+        """Apply one phase-local VAE transport graph without global state."""
+
+        attribute = "_h3_temporal_host_chunk_frames"
+        sentinel = object()
+        previous = getattr(model, attribute, sentinel)
+        host_chunk = (
+            None if execution_plan is None else execution_plan.vae_temporal_tile
+        )
+        if host_chunk is None:
+            try:
+                delattr(model, attribute)
+            except AttributeError:
+                pass
+        else:
+            setattr(model, attribute, int(host_chunk))
+        try:
+            return self.decode_video(model, latents, frame_count)
+        finally:
+            if previous is sentinel:
+                try:
+                    delattr(model, attribute)
+                except AttributeError:
+                    pass
+            else:
+                setattr(model, attribute, previous)
+
+    def _video_vae_block_streaming(
+        self, model: Any, *, width: int, height: int
+    ):
+        """Return the phase-local residency context for this resource tier."""
+
+        from .adapters.vae_block_streaming import stream_video_vae_decoder_tail
+
+        enabled = (
+            getattr(getattr(self, "runtime_config", None), "resource_profile", None)
+            == "w4a8_8gb"
+            and int(width) * int(height) > 1280 * 736
+        )
+        return stream_video_vae_decoder_tail(model, enabled=enabled)
+
     def generate(
         self, request: HotSessionRequest
     ) -> HotSessionResult | HotSessionCheckpointResult:
@@ -895,13 +1068,21 @@ class NativeT2AVHotSession:
                 result,
                 execution_profile=profile,
                 peak_allocated_gib=torch.cuda.max_memory_allocated() / (1024**3),
+                peak_reserved_gib=torch.cuda.max_memory_reserved() / (1024**3),
             )
             self._persist_scheduler_telemetry(result)
             return result
         except BaseException:
             # Do not strand 20+ GiB after a failed kernel/VAE invocation and
             # poison the next queued request.
-            for component in (self.transformer, self.video_vae, self.audio_vae):
+            for component in (
+                self.transformer,
+                self.video_vae,
+                self.audio_vae,
+                self.latent_upscaler,
+            ):
+                if component is None:
+                    continue
                 try:
                     component.move_to("cpu", non_blocking=False)
                 except Exception:
@@ -909,6 +1090,179 @@ class NativeT2AVHotSession:
             self._clear_block_executor()
             self._release_device(collect_cycles=True)
             raise
+
+    def decode_latent_checkpoint(
+        self,
+        request: HotSessionRequest,
+        checkpoint_path: Path,
+    ) -> HotSessionResult:
+        """Decode one already-stitched clean AV latent exactly once.
+
+        UltimateUpscale samples temporal pieces independently.  Decoding every
+        piece would duplicate Video-VAE work and introduce pixel-space seams,
+        so its orchestrator stitches clean latents on CPU and enters here only
+        after the full H3 clock has been reconstructed.
+        """
+
+        request.validate()
+        if request.latent_only or request.internal_video_tokens is not None:
+            raise ValueError("stitched decode requires a normal full-clip request")
+        output = request.output_path.resolve()
+        if not output.is_relative_to(self.output_root):
+            raise ValueError("output_path must stay inside output_root")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        cancel_check = request.cancel_check or (lambda: False)
+
+        def raise_if_cancelled() -> None:
+            if cancel_check():
+                raise HotSessionCancelled("native H3 generation cancelled")
+
+        def progress(percent: float, stage: str, detail: str) -> None:
+            if request.progress_callback is not None:
+                request.progress_callback({
+                    "percent": percent,
+                    "stage": stage,
+                    "detail": detail,
+                })
+
+        started = time.perf_counter()
+        phases: dict[str, float] = {}
+        torch.cuda.reset_peak_memory_stats()
+        checkpoint = torch.load(
+            Path(checkpoint_path), map_location="cpu", weights_only=True
+        )
+        expected = {
+            "frames": request.frames,
+            "fps": request.fps,
+            "width": request.width,
+            "height": request.height,
+        }
+        for key, value in expected.items():
+            if checkpoint.get(key) != value:
+                raise ValueError(
+                    f"stitched latent metadata mismatch for {key}: "
+                    f"expected {value!r}, got {checkpoint.get(key)!r}"
+                )
+        video = checkpoint.get("video")
+        audio = checkpoint.get("audio")
+        if not isinstance(video, torch.Tensor) or video.ndim != 5:
+            raise ValueError("stitched checkpoint has invalid video latent")
+        if not isinstance(audio, torch.Tensor) or audio.ndim != 4:
+            raise ValueError("stitched checkpoint has invalid audio latent")
+        del checkpoint
+        raise_if_cancelled()
+        execution_plan = request.execution_plan
+
+        progress(90, "video_decode", "解码拼接后的高分辨率视频")
+        self._timed(
+            phases,
+            "video_vae_h2d",
+            lambda: self.video_vae.move_to("cuda:0", non_blocking=True),
+        )
+        if execution_plan is not None and execution_plan.vae_spatial_tile is not None:
+            tile_height, tile_width = execution_plan.vae_spatial_tile
+            if tile_height != tile_width:
+                raise ValueError("the current H3 Video-VAE supports square tiles only")
+            model = self.video_vae.value
+            if not hasattr(model, "decoder_tile_size"):
+                raise TypeError("the H3 Video-VAE does not expose decoder_tile_size")
+            model.decoder_tile_size = tile_height
+        from .adapters.vae_tiling import configure_vae_tile_batching
+        from .adapters.vae_compile import (
+            transformer_block_compile,
+            transformer_block_compile_ready,
+        )
+
+        configure_vae_tile_batching(
+            self.video_vae.value,
+            1 if execution_plan is None else execution_plan.vae_tile_batch_size,
+        )
+        compile_vae_block = bool(
+            execution_plan is not None
+            and execution_plan.vae_transformer_block_compile
+        )
+        if compile_vae_block and not transformer_block_compile_ready(
+            self.video_vae.value
+        ):
+            raise RuntimeError(
+                "execution plan requested VAE TransformerBlock compilation, "
+                "but the session did not prebuild the compiled decoder"
+            )
+        with self._video_vae_block_streaming(
+            self.video_vae.value, width=request.width, height=request.height
+        ):
+            with transformer_block_compile(compile_vae_block):
+                decoded_video = self._timed(
+                    phases,
+                    "video_decode",
+                    lambda: self._decode_video_for_plan(
+                        self.video_vae.value,
+                        video.to("cuda:0"),
+                        request.frames,
+                        execution_plan,
+                    ),
+                )
+        del video
+        self._timed(
+            phases,
+            "video_vae_evict",
+            lambda: self.video_vae.move_to("cpu", non_blocking=False),
+        )
+        self._release_device()
+        raise_if_cancelled()
+
+        progress(96, "audio_decode", "解码原始音频")
+        self._timed(
+            phases,
+            "audio_vae_h2d",
+            lambda: self.audio_vae.move_to("cuda:0", non_blocking=True),
+        )
+        decoded_audio = self._timed(
+            phases,
+            "audio_decode",
+            lambda: self.decode_audio(self.audio_vae.value, audio.to("cuda:0")),
+        )
+        del audio
+        self._timed(
+            phases,
+            "audio_vae_evict",
+            lambda: self.audio_vae.move_to("cpu", non_blocking=False),
+        )
+        self._release_device()
+        raise_if_cancelled()
+
+        progress(99, "mux", "封装高分辨率音视频")
+        self._timed(
+            phases,
+            "mux",
+            lambda: AtomicPyAVMuxer(output_root=self.output_root).write(
+                video=decoded_video,
+                audio=decoded_audio,
+                sample_rate=32000,
+                fps=request.fps,
+                output_path=output,
+                cancel_check=raise_if_cancelled,
+            ),
+        )
+        del decoded_video, decoded_audio
+        self._timed(
+            phases, "host_scratch_release", self._release_request_host_scratch
+        )
+        return HotSessionResult(
+            output_path=output,
+            total_seconds=time.perf_counter() - started,
+            phases=phases,
+            step_seconds=(),
+            forecast_profile={"schema_version": 1, "mode": "decode_only"},
+            execution_profile={
+                "ultimate_upscale_decode": {
+                    "latent_stitched": True,
+                    "single_decode": True,
+                }
+            },
+            peak_allocated_gib=torch.cuda.max_memory_allocated() / (1024**3),
+            peak_reserved_gib=torch.cuda.max_memory_reserved() / (1024**3),
+        )
 
     def _attention_telemetry(self) -> dict[str, Any]:
         telemetry = getattr(self.attention_backend, "telemetry", None)
@@ -964,6 +1318,7 @@ class NativeT2AVHotSession:
             "artifact": None if output is None else str(Path(output).resolve()),
             "total_seconds": result.total_seconds,
             "peak_allocated_gib": result.peak_allocated_gib,
+            "peak_reserved_gib": result.peak_reserved_gib,
             "phases": result.phases,
             "step_seconds": list(result.step_seconds),
             "execution_profile": result.execution_profile,
@@ -1029,6 +1384,8 @@ class NativeT2AVHotSession:
             actual_evaluations=len(actual),
             forecast_evaluations=forecast_count,
             condition_tokens_override=condition_token_override,
+            latent_frames_override=request.internal_video_tokens,
+            audio_frames_override=request.internal_audio_tokens,
         )
         return features
 
@@ -1091,14 +1448,21 @@ class NativeT2AVHotSession:
             sampler="turbo" if request.use_lora else "res_multistep",
             scheduler="simple",
         )
+        required_actual_steps = tuple(sorted(set(
+            self_index
+            for self_index in (
+                *request.scheduler_required_actual_step_indices,
+                *(
+                    ()
+                    if request.preview_step_index is None
+                    else (request.preview_step_index,)
+                ),
+            )
+        )))
         selected = self.v19_selector.select(
             workload=workload,
             acceleration=request.v19_acceleration,
-            required_actual_step_indices=(
-                ()
-                if request.preview_step_index is None
-                else (request.preview_step_index,)
-            ),
+            required_actual_step_indices=required_actual_steps,
         )
         selected_request = replace(
             request,
@@ -1108,9 +1472,377 @@ class NativeT2AVHotSession:
             attention_online_budget_dense_layers=0.0,
             attention_online_rebate_schedule=(),
             acceleration_plan_summary=selected.summary,
+            mechanistic_runtime_controller=getattr(
+                selected, "runtime_controller", None
+            ),
         )
         selected_request.validate()
         return selected_request
+
+    def _device_execution_budget_bytes(self) -> int:
+        """Return service-usable capacity, accounting for external GPU users."""
+
+        runtime_config = getattr(self, "runtime_config", None)
+        configured = (
+            23 * 1024**3
+            if runtime_config is None
+            else int(runtime_config.max_device_bytes)
+        )
+        if runtime_config is None or runtime_config.device == "cpu":
+            return configured
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(runtime_config.device)
+            allocated = torch.cuda.memory_allocated(runtime_config.device)
+            reusable_cache = max(
+                0,
+                torch.cuda.memory_reserved(runtime_config.device) - allocated,
+            )
+        except (RuntimeError, AssertionError):
+            return configured
+        # The peak model is a whole-service peak, so add currently allocated
+        # service tensors back. External allocations remain excluded through
+        # cudaMemGetInfo and can therefore trigger the low-VRAM route.
+        # cudaMemGetInfo also excludes this process's CUDA context and library
+        # bookkeeping, while the calibrated peak model is expressed in Torch
+        # allocations.  Add back the measured context envelope before taking
+        # the configured cap; genuinely external allocations larger than that
+        # still reduce the available budget and trigger the low-VRAM route.
+        cuda_context_allowance = 768 * 1024**2
+        return min(
+            configured,
+            int(
+                free_bytes
+                + allocated
+                + reusable_cache
+                + cuda_context_allowance
+            ),
+        )
+
+    def _apply_memory_execution_policy(
+        self,
+        request: HotSessionRequest,
+        features,
+        plan: ExecutionPlan,
+        *,
+        chunk_reason: str | None,
+        qk_override: str | None,
+    ) -> tuple[ExecutionPlan, str | None, str | None, dict[str, object]]:
+        """Project one quality plan onto the fastest budget-feasible graph."""
+
+        decision = select_memory_execution(
+            features,
+            requested_mode=request.memory_mode,
+            device_budget_bytes=self._device_execution_budget_bytes(),
+            weight_tier=getattr(
+                getattr(self, "runtime_config", None),
+                "weight_tier",
+                "int8",
+            ),
+            resource_profile=getattr(
+                getattr(self, "runtime_config", None),
+                "resource_profile",
+                None,
+            ),
+            include_vae=not request.latent_only,
+            existing_query_chunk_tokens=(
+                plan.long_sequence_query_chunk_tokens
+            ),
+        )
+        if not decision.fits_budget:
+            raise RuntimeError(
+                "no full-context H3 execution graph can fit this packed "
+                "workload inside the configured device budget: "
+                f"packed_tokens={features.packed_tokens}, "
+                f"predicted_peak_gib={decision.estimated_selected_peak_bytes / 1024**3:.3f}, "
+                f"budget_gib={decision.device_budget_bytes / 1024**3:.3f}, "
+                f"latent_only={request.latent_only}"
+            )
+        effective_qk, memory_qk_reason = select_stable_dense_qk_quantization(
+            plan.dense_qk_quant_gran,
+            packed_tokens=features.packed_tokens,
+        )
+        forced_qk_upgrade = effective_qk != plan.dense_qk_quant_gran
+        memory_telemetry = decision.telemetry()
+        if forced_qk_upgrade:
+            # Full-context streaming retains every admitted KV block, but the
+            # coarser per-warp INT8 Q/K scale can change sparse scores and LUT
+            # ordering.  Do not advertise byte equality merely because K/V
+            # are non-compact.
+            memory_telemetry.update({
+                "bit_exact": False,
+                "numerical_contract": "full_context_per_warp_qk",
+                "approximation_sources": ["per_warp_int8_qk_granularity"],
+            })
+        release_fused_query_projection = bool(
+            request.release_byte_exact_optimizations
+            and decision.selected_scheme == "exact_streaming"
+        )
+        # The output-layout kernel is byte-exact on both model families, but
+        # its latency win was repeatable only on the FL2VA base graph.  Keep
+        # Ref2VA on the fused-Query-only rail until its heavier reference
+        # schedule clears the same positive-gain release gate.
+        release_direct_nhd_output = bool(
+            release_fused_query_projection and self.engine == "original"
+        )
+        # Q/K normalization and RoPE can write directly into the HND backing
+        # consumed by Attention, removing the two large NHD->HND materializing
+        # copies.  The full physical R-C-R/W-C-R-C gates were byte-exact and
+        # positive on INT8 FL2VA and Ref2VA at both 16GB 720p15 and 24GB
+        # 1080p15.  Compact K/V and direct-NHD-K/V use different storage
+        # contracts and remain deliberately excluded.
+        release_fused_qknorm_hnd_layout = bool(
+            release_fused_query_projection
+            and getattr(
+                getattr(self, "runtime_config", None),
+                "weight_tier",
+                "int8",
+            ) == "int8"
+            and not decision.compact_kv
+            and not plan.long_sequence_direct_nhd_kv
+        )
+        # Value projection already arrives as non-compact HND on this rail.
+        # Quantize it directly into SageAttention's final FP8 backing instead
+        # of materializing an NHD transpose and a second HND staging tensor.
+        # Physical W-C-R-C gates were byte-exact and reduced mean actual-step
+        # latency for INT8 FL2VA and Ref2VA at both 16GB 720p15 and 24GB
+        # 1080p15.  Compact K/V and direct-NHD-K/V retain their own contracts.
+        release_direct_hnd_fp8_value = bool(
+            release_fused_qknorm_hnd_layout
+        )
+        # The protected prefix K path historically materialized a full
+        # ``K - mean`` tensor and then launched SageAttention's key quantizer.
+        # The fused writer performs the same BF16 boundary subtraction and
+        # per-thread INT8 reduction directly into Sage's final HND buffers.  Its
+        # v2 ragged-tail mask is essential: invalid rows must be zero *after*
+        # centering or a non-zero key mean can change the last block scale.
+        # Adversarial ragged tensors plus full-DiT W-C-R-C gates are byte-exact
+        # on INT8 FL2VA/Ref2VA at 16GB 720p15 and 24GB 1080p15.  At 1080p15 it
+        # also removes 1.68--2.24 GiB of peak allocation and materially reduces
+        # latency, so it belongs to the exact streaming release rail.
+        release_fused_prefix_k_quant = bool(
+            release_fused_qknorm_hnd_layout
+        )
+        # At 720p15 the Q and K/V halves of split projection quantize the same
+        # hidden rows twice.  Reusing the exact ConvRot row-INT8 activation was
+        # byte-identical and repeatably positive for both FL2VA and image+audio
+        # Ref2VA under the 16GB gate (about +0.50 GiB peak allocation).  The
+        # 1080p15 cache is about 1.10 GiB and drove NVML to 23.92 GiB, so the
+        # 24GB route deliberately keeps recomputation and its safety margin.
+        shared_qkv_cache_bytes = int(
+            features.packed_tokens * _H3_SHARED_QKV_BYTES_PER_PACKED_TOKEN
+        )
+        shared_qkv_admission_budget_bytes = max(
+            0,
+            int(decision.device_budget_bytes)
+            - _H3_MEMORY_POLICY_GUARD_BYTES,
+        )
+        shared_qkv_required_peak_bytes = int(
+            decision.estimated_selected_peak_bytes
+            + shared_qkv_cache_bytes
+            + _H3_SHARED_QKV_RELEASE_RESERVE_BYTES
+        )
+        shared_qkv_fits_budget = bool(
+            shared_qkv_required_peak_bytes
+            <= shared_qkv_admission_budget_bytes
+        )
+        release_shared_qkv_quantization = bool(
+            release_fused_qknorm_hnd_layout
+            and getattr(
+                getattr(self, "runtime_config", None),
+                "resource_profile",
+                None,
+            ) == "int8_16gb"
+            and shared_qkv_fits_budget
+        )
+        # Partial Top-K avoids sorting the unused KV tail, then feeds the same
+        # selected block set into the unchanged Sparge kernel.  Full-DiT
+        # W-C-R-C gates were byte-identical on FL2VA at 720p15 and 1080p15;
+        # the longer shape saved 0.543 s per actual step.  Ref2VA was also
+        # byte-identical but latency-neutral, so its reference-heavy graph
+        # deliberately keeps the established full-sort path.
+        release_partial_sparse_topk = bool(
+            release_fused_qknorm_hnd_layout
+            and self.engine in ("original", "lora")
+        )
+        memory_telemetry.update({
+            "release_byte_exact_optimizations": bool(
+                request.release_byte_exact_optimizations
+            ),
+            "release_fused_query_projection": release_fused_query_projection,
+            "release_fused_query_evidence": (
+                "h3_fused_query_full_dit_byte_exact_16gb_720p15_"
+                "24gb_1080p15_20260828"
+                if release_fused_query_projection
+                else None
+            ),
+            "release_direct_nhd_output": release_direct_nhd_output,
+            "release_direct_nhd_output_evidence": (
+                "h3_direct_nhd_output_full_dit_byte_exact_fl2va_"
+                "16gb_720p15_24gb_1080p15_20260828"
+                if release_direct_nhd_output
+                else None
+            ),
+            "release_fused_qknorm_hnd_layout": (
+                release_fused_qknorm_hnd_layout
+            ),
+            "release_fused_qknorm_hnd_evidence": (
+                "h3_fused_qknorm_hnd_full_dit_byte_exact_fl2va_ref2va_"
+                "16gb_720p15_24gb_1080p15_20260828"
+                if release_fused_qknorm_hnd_layout
+                else None
+            ),
+            "release_direct_hnd_fp8_value": release_direct_hnd_fp8_value,
+            "release_direct_hnd_fp8_value_evidence": (
+                "h3_direct_hnd_fp8_value_full_dit_byte_exact_fl2va_ref2va_"
+                "16gb_720p15_24gb_1080p15_20260828"
+                if release_direct_hnd_fp8_value
+                else None
+            ),
+            "release_fused_prefix_k_quant": release_fused_prefix_k_quant,
+            "release_fused_prefix_k_quant_evidence": (
+                "h3_fused_prefix_k_quant_v2_ragged_exact_full_dit_"
+                "fl2va_ref2va_16gb_720p15_24gb_1080p15_20260828"
+                if release_fused_prefix_k_quant
+                else None
+            ),
+            "release_shared_qkv_quantization": (
+                release_shared_qkv_quantization
+            ),
+            "shared_qkv_quantization_cache_bytes": shared_qkv_cache_bytes,
+            "shared_qkv_quantization_cache_gib": (
+                shared_qkv_cache_bytes / 1024**3
+            ),
+            "shared_qkv_quantization_required_peak_bytes": (
+                shared_qkv_required_peak_bytes
+            ),
+            "shared_qkv_quantization_required_peak_gib": (
+                shared_qkv_required_peak_bytes / 1024**3
+            ),
+            "shared_qkv_quantization_fits_budget": (
+                shared_qkv_fits_budget
+            ),
+            "release_shared_qkv_quantization_evidence": (
+                "h3_shared_qkv_int8_activation_exact_full_dit_fl2va_ref2va_"
+                "16gb_720p15_20260828"
+                if release_shared_qkv_quantization
+                else None
+            ),
+            "release_partial_sparse_topk": release_partial_sparse_topk,
+            "release_partial_sparse_topk_evidence": (
+                "h3_partial_topk_full_dit_byte_exact_fl2va_"
+                "16gb_720p15_24gb_1080p15_20260828"
+                if release_partial_sparse_topk
+                else None
+            ),
+        })
+        plan = replace(
+            plan,
+            block_buffer_count=decision.block_buffer_count,
+            prefetch_depth=1 if decision.block_buffer_count == 2 else 0,
+            mlp_chunk_tokens=decision.mlp_chunk_tokens,
+            vae_spatial_tile=(
+                decision.vae_spatial_tile,
+                decision.vae_spatial_tile,
+            ),
+            vae_temporal_tile=decision.vae_temporal_tile,
+            dense_qk_quant_gran=effective_qk,
+            long_sequence_query_chunk_tokens=decision.query_chunk_tokens,
+            long_sequence_projection_chunk_tokens=(
+                min(
+                    plan.long_sequence_projection_chunk_tokens,
+                    decision.projection_chunk_tokens,
+                )
+            ),
+            long_sequence_split_qkv_outputs=(
+                decision.query_chunk_tokens is not None
+            ),
+            long_sequence_shared_qkv_quantization=(
+                decision.query_chunk_tokens is not None
+                and not decision.compact_kv
+                and shared_qkv_fits_budget
+                and (
+                    plan.long_sequence_shared_qkv_quantization
+                    or release_shared_qkv_quantization
+                )
+            ),
+            long_sequence_compact_kv=decision.compact_kv,
+            long_sequence_exact_helper_stack=(
+                plan.long_sequence_exact_helper_stack
+                if decision.query_chunk_tokens is not None
+                else False
+            ),
+            long_sequence_single_qknorm_rope=(
+                decision.query_chunk_tokens is not None
+            ),
+            long_sequence_parallel_sparse_lut=(
+                decision.query_chunk_tokens is not None
+            ),
+            long_sequence_partial_sparse_topk=(
+                decision.query_chunk_tokens is not None
+                and (
+                    plan.long_sequence_partial_sparse_topk
+                    or release_partial_sparse_topk
+                )
+            ),
+            long_sequence_fused_prefix_k_quant=(
+                decision.query_chunk_tokens is not None
+                and not decision.compact_kv
+                and not plan.long_sequence_direct_nhd_kv
+                and (
+                    plan.long_sequence_fused_prefix_k_quant
+                    or release_fused_prefix_k_quant
+                )
+            ),
+            long_sequence_fused_query_projection=(
+                decision.query_chunk_tokens is not None
+                and (
+                    plan.long_sequence_fused_query_projection
+                    or release_fused_query_projection
+                )
+            ),
+            long_sequence_fused_qknorm_hnd_layout=(
+                decision.query_chunk_tokens is not None
+                and not decision.compact_kv
+                and (
+                    plan.long_sequence_fused_qknorm_hnd_layout
+                    or release_fused_qknorm_hnd_layout
+                )
+            ),
+            long_sequence_direct_nhd_output=(
+                decision.query_chunk_tokens is not None
+                and (
+                    plan.long_sequence_direct_nhd_output
+                    or release_direct_nhd_output
+                )
+            ),
+            long_sequence_direct_nhd_kv=(
+                plan.long_sequence_direct_nhd_kv
+                if decision.query_chunk_tokens is not None
+                and not decision.compact_kv
+                else False
+            ),
+            long_sequence_direct_hnd_fp8_value=(
+                decision.query_chunk_tokens is not None
+                and not decision.compact_kv
+                and not plan.long_sequence_direct_nhd_kv
+                and (
+                    plan.long_sequence_direct_hnd_fp8_value
+                    or release_direct_hnd_fp8_value
+                )
+            ),
+        )
+        if qk_override is None and forced_qk_upgrade:
+            qk_override = memory_qk_reason or "long_sequence_tail_stability"
+        return (
+            plan,
+            (
+                "isolated_resource_whole_query"
+                if decision.query_chunk_tokens is None
+                else chunk_reason or "isolated_resource_streaming"
+            ),
+            qk_override,
+            memory_telemetry,
+        )
 
     def _resolve_execution_plan(
         self,
@@ -1145,6 +1877,71 @@ class NativeT2AVHotSession:
                     dense_qk_quant_gran=effective_qk,
                 )
             )
+            chunk_reason = "explicit" if (
+                plan.long_sequence_query_chunk_tokens is not None
+            ) else None
+            v24_execution_hint = (
+                None
+                if request.acceleration_plan_summary is None
+                else request.acceleration_plan_summary.get(
+                    "execution_profile_hint"
+                )
+            )
+            if (
+                plan.long_sequence_query_chunk_tokens is None
+                and v24_execution_hint == "v22_medium_byte_exact_helpers"
+            ):
+                # Batch24 reproduced the Human-approved V22 MP4 byte for byte
+                # while saving 9.49 seconds E2E at 67,535 packed tokens.  Keep
+                # this helper stack bound to that exact V24 endpoint; the same
+                # split/single path changed the rejected 720p15 V22 trajectory
+                # and therefore must not be generalized by geometry alone.
+                plan = replace(
+                    plan,
+                    long_sequence_query_chunk_tokens=32_768,
+                    long_sequence_projection_chunk_tokens=8192,
+                    long_sequence_split_qkv_outputs=True,
+                    long_sequence_single_qknorm_rope=True,
+                    long_sequence_parallel_sparse_lut=True,
+                )
+                chunk_reason = "v24_v22_medium_byte_exact_execution"
+            if (
+                plan.long_sequence_query_chunk_tokens is None
+                and features.packed_tokens <= LONG_SEQUENCE_VALIDATED_MAX_PACKED_TOKENS
+            ):
+                chunk_decision = select_long_sequence_chunks(
+                    video_tokens=features.video_tokens,
+                    packed_tokens=features.packed_tokens,
+                )
+                if chunk_decision.query_chunk_tokens is not None:
+                    plan = replace(
+                        plan,
+                        long_sequence_query_chunk_tokens=(
+                            chunk_decision.query_chunk_tokens
+                        ),
+                        long_sequence_projection_chunk_tokens=(
+                            chunk_decision.projection_chunk_tokens
+                        ),
+                        long_sequence_split_qkv_outputs=(
+                            chunk_decision.split_qkv_outputs
+                        ),
+                        long_sequence_single_qknorm_rope=(
+                            chunk_decision.single_qknorm_rope
+                        ),
+                        long_sequence_parallel_sparse_lut=(
+                            chunk_decision.parallel_sparse_lut
+                        ),
+                    )
+                    chunk_reason = chunk_decision.reason
+            plan, chunk_reason, qk_override, memory_execution = (
+                self._apply_memory_execution_policy(
+                    request,
+                    features,
+                    plan,
+                    chunk_reason=chunk_reason,
+                    qk_override=qk_override,
+                )
+            )
             return plan, {
                 "source": "explicit",
                 "profile_id": None,
@@ -1159,9 +1956,52 @@ class NativeT2AVHotSession:
                 "long_video_motion_detail_attention": (
                     plan.long_video_motion_detail_attention
                 ),
+                "long_sequence_query_chunk_tokens": (
+                    plan.long_sequence_query_chunk_tokens
+                ),
+                "long_sequence_projection_chunk_tokens": (
+                    plan.long_sequence_projection_chunk_tokens
+                ),
+                "long_sequence_split_qkv_outputs": (
+                    plan.long_sequence_split_qkv_outputs
+                ),
+                "long_sequence_shared_qkv_quantization": (
+                    plan.long_sequence_shared_qkv_quantization
+                ),
+                "long_sequence_compact_kv": plan.long_sequence_compact_kv,
+                "long_sequence_exact_helper_stack": (
+                    plan.long_sequence_exact_helper_stack
+                ),
+                "long_sequence_single_qknorm_rope": (
+                    plan.long_sequence_single_qknorm_rope
+                ),
+                "long_sequence_parallel_sparse_lut": (
+                    plan.long_sequence_parallel_sparse_lut
+                ),
+                "long_sequence_partial_sparse_topk": (
+                    plan.long_sequence_partial_sparse_topk
+                ),
+                "long_sequence_fused_prefix_k_quant": (
+                    plan.long_sequence_fused_prefix_k_quant
+                ),
+                "long_sequence_fused_query_projection": (
+                    plan.long_sequence_fused_query_projection
+                ),
+                "long_sequence_fused_qknorm_hnd_layout": (
+                    plan.long_sequence_fused_qknorm_hnd_layout
+                ),
+                "long_sequence_direct_nhd_output": (
+                    plan.long_sequence_direct_nhd_output
+                ),
+                "long_sequence_direct_nhd_kv": plan.long_sequence_direct_nhd_kv,
+                "long_sequence_direct_hnd_fp8_value": (
+                    plan.long_sequence_direct_hnd_fp8_value
+                ),
+                "long_sequence_chunk_reason": chunk_reason,
                 "dense_qk_quant_gran": plan.dense_qk_quant_gran,
                 "dense_qk_quant_gran_requested": requested_qk,
                 "dense_qk_stability_override": qk_override,
+                "memory_execution": memory_execution,
                 "frame_interleave_stride": plan.frame_interleave_stride,
                 "frame_interleave_layer_start": plan.frame_interleave_layer_start,
                 "frame_interleave_layer_stop": plan.frame_interleave_layer_stop,
@@ -1256,6 +2096,21 @@ class NativeT2AVHotSession:
                 "vae_transformer_block_compile": False,
                 "fused_rms_adaln": False,
                 "long_video_motion_detail_attention": False,
+                "long_sequence_query_chunk_tokens": None,
+                "long_sequence_projection_chunk_tokens": 8192,
+                "long_sequence_split_qkv_outputs": False,
+                "long_sequence_shared_qkv_quantization": False,
+                "long_sequence_exact_helper_stack": False,
+                "long_sequence_single_qknorm_rope": False,
+                "long_sequence_parallel_sparse_lut": False,
+                "long_sequence_partial_sparse_topk": False,
+                "long_sequence_fused_prefix_k_quant": False,
+                "long_sequence_fused_query_projection": False,
+                "long_sequence_fused_qknorm_hnd_layout": False,
+                "long_sequence_direct_nhd_output": False,
+                "long_sequence_direct_nhd_kv": False,
+                "long_sequence_direct_hnd_fp8_value": False,
+                "long_sequence_chunk_reason": None,
                 "dense_qk_quant_gran": effective_qk,
                 "dense_qk_quant_gran_requested": "per_thread",
                 "dense_qk_stability_override": qk_override,
@@ -1273,38 +2128,145 @@ class NativeT2AVHotSession:
             torch.cuda.memory_reserved(self.runtime_config.device)
             - torch.cuda.memory_allocated(self.runtime_config.device),
         )
-        effective_free = free_bytes + reusable_cache
-        decision = self.planner.select(
-            features,
-            free_device_bytes=effective_free,
-        )
-        requested_qk = decision.plan.dense_qk_quant_gran
+        effective_free = free_bytes + reusable_cache + 768 * 1024**2
+        planner_source = "rtx4090_planner"
+        planner_profile_id = None
+        planner_predicted_seconds = None
+        try:
+            route_decision = self.planner.select(
+                features,
+                free_device_bytes=effective_free,
+            )
+            planner_profile_id = route_decision.profile_id
+            planner_predicted_seconds = route_decision.predicted_seconds
+            base_plan = route_decision.plan
+        except NoFeasibleProfile:
+            # The calibrated table ranks measured high-performance profiles.
+            # A lack of such a profile is not a reason to skip the orthogonal
+            # memory-execution policy. Start from the mature Block base, then
+            # let performance/low_vram admission use the exact packed-token
+            # budget below. Explicit performance still fails closed there if
+            # its physical working set does not fit.
+            planner_source = "memory_execution_fallback"
+            base_plan = ExecutionPlan(
+                offload_mode=OffloadMode.BLOCK,
+                mlp_chunk_tokens=8192,
+                block_buffer_count=2,
+                prefetch_depth=1,
+                vae_spatial_tile=(288, 288),
+            )
+        requested_qk = base_plan.dense_qk_quant_gran
         effective_qk, qk_override = select_stable_dense_qk_quantization(
             requested_qk,
             packed_tokens=features.packed_tokens,
         )
         plan = (
-            decision.plan
+            base_plan
             if effective_qk == requested_qk
-            else replace(decision.plan, dense_qk_quant_gran=effective_qk)
+            else replace(base_plan, dense_qk_quant_gran=effective_qk)
+        )
+        chunk_reason = "profile_explicit" if (
+            plan.long_sequence_query_chunk_tokens is not None
+        ) else None
+        if (
+            plan.long_sequence_query_chunk_tokens is None
+            and features.packed_tokens <= LONG_SEQUENCE_VALIDATED_MAX_PACKED_TOKENS
+        ):
+            chunk_decision = select_long_sequence_chunks(
+                video_tokens=features.video_tokens,
+                packed_tokens=features.packed_tokens,
+            )
+            if chunk_decision.query_chunk_tokens is not None:
+                plan = replace(
+                    plan,
+                    long_sequence_query_chunk_tokens=(
+                        chunk_decision.query_chunk_tokens
+                    ),
+                    long_sequence_projection_chunk_tokens=(
+                        chunk_decision.projection_chunk_tokens
+                    ),
+                    long_sequence_split_qkv_outputs=(
+                        chunk_decision.split_qkv_outputs
+                    ),
+                    long_sequence_single_qknorm_rope=(
+                        chunk_decision.single_qknorm_rope
+                    ),
+                    long_sequence_parallel_sparse_lut=(
+                        chunk_decision.parallel_sparse_lut
+                    ),
+                )
+                chunk_reason = chunk_decision.reason
+        plan, chunk_reason, qk_override, memory_execution = (
+            self._apply_memory_execution_policy(
+                request,
+                features,
+                plan,
+                chunk_reason=chunk_reason,
+                qk_override=qk_override,
+            )
         )
         return plan, {
-            "source": "rtx4090_planner",
-            "profile_id": decision.profile_id,
+            "source": planner_source,
+            "profile_id": planner_profile_id,
             "offload_mode": plan.offload_mode.value,
             "mlp_chunk_tokens": plan.mlp_chunk_tokens,
             "prefetch_depth": plan.prefetch_depth,
+            "block_buffer_count": plan.block_buffer_count,
             "resident_block_count": plan.resident_block_count,
             "vae_spatial_tile": plan.vae_spatial_tile,
+            "vae_temporal_tile": plan.vae_temporal_tile,
             "vae_transformer_block_compile": plan.vae_transformer_block_compile,
             "attention_topk": plan.attention_topk,
             "fused_rms_adaln": plan.fused_rms_adaln,
             "long_video_motion_detail_attention": (
                 plan.long_video_motion_detail_attention
             ),
+            "long_sequence_query_chunk_tokens": (
+                plan.long_sequence_query_chunk_tokens
+            ),
+            "long_sequence_projection_chunk_tokens": (
+                plan.long_sequence_projection_chunk_tokens
+            ),
+            "long_sequence_split_qkv_outputs": (
+                plan.long_sequence_split_qkv_outputs
+            ),
+            "long_sequence_shared_qkv_quantization": (
+                plan.long_sequence_shared_qkv_quantization
+            ),
+            "long_sequence_compact_kv": plan.long_sequence_compact_kv,
+            "long_sequence_exact_helper_stack": (
+                plan.long_sequence_exact_helper_stack
+            ),
+            "long_sequence_single_qknorm_rope": (
+                plan.long_sequence_single_qknorm_rope
+            ),
+            "long_sequence_parallel_sparse_lut": (
+                plan.long_sequence_parallel_sparse_lut
+            ),
+            "long_sequence_partial_sparse_topk": (
+                plan.long_sequence_partial_sparse_topk
+            ),
+            "long_sequence_fused_prefix_k_quant": (
+                plan.long_sequence_fused_prefix_k_quant
+            ),
+            "long_sequence_fused_query_projection": (
+                plan.long_sequence_fused_query_projection
+            ),
+            "long_sequence_fused_qknorm_hnd_layout": (
+                plan.long_sequence_fused_qknorm_hnd_layout
+            ),
+            "long_sequence_direct_nhd_output": (
+                plan.long_sequence_direct_nhd_output
+            ),
+            "long_sequence_direct_nhd_kv": plan.long_sequence_direct_nhd_kv,
+            "long_sequence_direct_hnd_fp8_value": (
+                plan.long_sequence_direct_hnd_fp8_value
+            ),
+            "long_sequence_chunk_reason": chunk_reason,
             "dense_qk_quant_gran": plan.dense_qk_quant_gran,
             "dense_qk_quant_gran_requested": requested_qk,
             "dense_qk_stability_override": qk_override,
+            "memory_execution": memory_execution,
             "frame_interleave_stride": plan.frame_interleave_stride,
             "frame_interleave_layer_start": plan.frame_interleave_layer_start,
             "frame_interleave_layer_stop": plan.frame_interleave_layer_stop,
@@ -1377,8 +2339,10 @@ class NativeT2AVHotSession:
             "segment_cache_sequential_conservative_hold": (
                 plan.segment_cache_sequential_conservative_hold
             ),
-            "predicted_seconds": decision.predicted_seconds,
-            "predicted_peak_gib": decision.predicted_peak_bytes / (1024**3),
+            "predicted_seconds": planner_predicted_seconds,
+            "predicted_peak_gib": memory_execution[
+                "estimated_selected_peak_gib"
+            ],
             **feature_profile,
             "driver_free_gib": free_bytes / (1024**3),
             "reusable_torch_cache_gib": reusable_cache / (1024**3),
@@ -1389,8 +2353,8 @@ class NativeT2AVHotSession:
         mode = OffloadMode.RESIDENT if plan is None else plan.offload_mode
         self._clear_block_executor()
         if mode is OffloadMode.BLOCK:
-            if plan is None or plan.block_buffer_count != 2:
-                raise ValueError("H3 block offload requires a two-buffer execution plan")
+            if plan is None or plan.block_buffer_count not in (1, 2):
+                raise ValueError("H3 block offload requires a one- or two-buffer execution plan")
             block_count = len(self.transformer.value.block_stack.blocks)
             resident_count = plan.resident_block_count
             if resident_count >= block_count:
@@ -1427,68 +2391,286 @@ class NativeT2AVHotSession:
         self.transformer.move_to(self.runtime_config.device, non_blocking=True)
         return self.transformer.value
 
+    @staticmethod
+    def _file_identity(path: Any) -> dict[str, Any] | None:
+        if path is None:
+            return None
+        candidate = Path(path)
+        try:
+            stat = candidate.stat()
+        except OSError:
+            return {"name": candidate.name, "missing": True}
+        return {
+            "name": candidate.name,
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+
+    def _conditioning_encoder_identity(self) -> dict[str, Any]:
+        conditioner = self.conditioner
+        return {
+            "class": (
+                f"{conditioner.__class__.__module__}."
+                f"{conditioner.__class__.__qualname__}"
+            ),
+            "checkpoint": self._file_identity(
+                getattr(conditioner, "checkpoint", None)
+            ),
+            "tokenizer": self._file_identity(
+                Path(getattr(conditioner, "tokenizer_path", ""))
+                / "tokenizer_config.json"
+                if getattr(conditioner, "tokenizer_path", None)
+                else None
+            ),
+            "layers": int(getattr(conditioner, "layers", 0)),
+            "preprocess": QWEN_CONDITIONING_PREPROCESS_VERSION,
+        }
+
+    def _conditioning_fingerprint(self, request: HotSessionRequest) -> str:
+        """Content-address one exact Qwen condition.
+
+        Ref2VA images are proportionally capped independently of the output
+        canvas, while standalone audio contributes stable label tokens only.
+        Those static conditions therefore intentionally omit target geometry,
+        allowing a 480p first pass to feed 1080p/1440p second sampling exactly.
+        FL2VA keyframes and reference videos remain geometry/time addressed.
+        """
+
+        def digest(path: Path | None) -> str | None:
+            return (
+                None
+                if path is None
+                else self._file_content_digest(Path(path)).hex()
+            )
+
+        geometry = None
+        if request.first_frame is not None or request.last_frame is not None:
+            geometry = [int(request.width), int(request.height), int(request.frames)]
+        reference_video_clock = (
+            int(request.frames) if request.reference_videos else None
+        )
+        document = {
+            "schema_version": QWEN_CONDITIONING_CACHE_SCHEMA_VERSION,
+            "service_family": (
+                "reference" if self._uses_reference_layout else "first_last"
+            ),
+            "prompt_sha256": hashlib.sha256(
+                request.prompt.encode("utf-8")
+            ).hexdigest(),
+            "first_frame": digest(request.first_frame),
+            "last_frame": digest(request.last_frame),
+            "reference_images": [
+                digest(path) for path in request.reference_images
+            ],
+            "reference_videos": [
+                digest(path) for path in request.reference_videos
+            ],
+            "reference_audios": [
+                digest(path) for path in request.reference_audios
+            ],
+            "reference_image_resolution": request.reference_image_resolution,
+            "reference_video_resolution": request.reference_video_resolution,
+            "keyframe_geometry": geometry,
+            "reference_video_clock": reference_video_clock,
+            "encoder": self._conditioning_encoder_identity(),
+        }
+        canonical = json.dumps(
+            document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    def _host_conditioning_tensor(self, value: torch.Tensor) -> torch.Tensor:
+        host = value.detach().to("cpu").contiguous()
+        if (
+            str(self.runtime_config.device).startswith("cuda")
+            and torch.cuda.is_available()
+            and not host.is_pinned()
+        ):
+            host = host.pin_memory()
+        return host
+
+    def _conditioning_payload(
+        self,
+        fingerprint: str,
+        embeds: torch.Tensor,
+        tags: torch.Tensor,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": QWEN_CONDITIONING_CACHE_SCHEMA_VERSION,
+            "fingerprint": fingerprint,
+            "encoder": self._conditioning_encoder_identity(),
+            "prompt_embeds": embeds,
+            "text_token_tags": tags,
+        }
+
+    def _validated_conditioning_payload(
+        self,
+        payload: Any,
+        *,
+        fingerprint: str,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("schema_version") != QWEN_CONDITIONING_CACHE_SCHEMA_VERSION:
+            return None
+        if payload.get("fingerprint") != fingerprint:
+            return None
+        embeds = payload.get("prompt_embeds")
+        tags = payload.get("text_token_tags")
+        if not isinstance(embeds, torch.Tensor) or not isinstance(tags, torch.Tensor):
+            return None
+        if embeds.ndim != 3 or embeds.shape[0] != 1 or embeds.shape[-1] != 5120:
+            return None
+        if tags.ndim != 1 or tags.shape[0] != embeds.shape[-2]:
+            return None
+        if not embeds.is_floating_point() or tags.dtype != torch.long:
+            return None
+        return (
+            self._host_conditioning_tensor(embeds),
+            self._host_conditioning_tensor(tags),
+        )
+
+    def _load_persisted_conditioning(
+        self,
+        request: HotSessionRequest,
+        *,
+        fingerprint: str,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        cached = self._persisted_conditioning_cache
+        if cached is not None and cached[0] == fingerprint:
+            self._last_conditioning_cache_status = "checkpoint_memory_hit"
+            return cached[1], cached[2]
+        source = request.conditioning_cache_source_path
+        if source is None:
+            return None
+        try:
+            checkpoint = torch.load(
+                Path(source), map_location="cpu", weights_only=True
+            )
+            payload = (
+                checkpoint.get("qwen_conditioning_cache")
+                if isinstance(checkpoint, dict)
+                else None
+            )
+            validated = self._validated_conditioning_payload(
+                payload, fingerprint=fingerprint
+            )
+            del checkpoint
+        except Exception as error:  # Legacy/corrupt cache must fail open.
+            self._last_conditioning_cache_fallback = (
+                f"checkpoint_read_{type(error).__name__}"
+            )
+            return None
+        if validated is None:
+            self._last_conditioning_cache_fallback = (
+                "checkpoint_missing"
+                if payload is None
+                else "checkpoint_invalid_or_fingerprint_mismatch"
+            )
+            return None
+        embeds, tags = validated
+        self._persisted_conditioning_cache = (fingerprint, embeds, tags)
+        self._last_conditioning_cache_status = "checkpoint_hit"
+        return embeds, tags
+
+    def _backfill_legacy_conditioning_cache(
+        self,
+        request: HotSessionRequest,
+        payload: dict[str, Any],
+    ) -> None:
+        """Atomically upgrade one legacy latent after its one required encode.
+
+        Only a truly missing cache is backfilled.  A present-but-mismatched
+        payload may represent a deliberately different multimodal request and
+        must never be overwritten implicitly.
+        """
+
+        source = request.conditioning_cache_source_path
+        if (
+            source is None
+            or self._last_conditioning_cache_fallback != "checkpoint_missing"
+        ):
+            return
+        source = Path(source).resolve()
+        temporary = source.with_name(
+            f".{source.name}.qwen-cache-{os.getpid()}-{time.time_ns()}.tmp"
+        )
+        try:
+            checkpoint = torch.load(source, map_location="cpu", weights_only=True)
+            if not isinstance(checkpoint, dict):
+                return
+            if checkpoint.get("qwen_conditioning_cache") is not None:
+                return
+            checkpoint["qwen_conditioning_cache"] = payload
+            torch.save(checkpoint, temporary)
+            os.replace(temporary, source)
+        except Exception as error:  # Cache persistence cannot fail generation.
+            self._last_conditioning_cache_fallback = (
+                f"checkpoint_missing_backfill_{type(error).__name__}"
+            )
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def _encode_request(
         self, request: HotSessionRequest
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        has_frames = bool(request.reference_images or request.reference_videos or request.reference_audios) or request.first_frame is not None or request.last_frame is not None
-        conditioning_key = None
-        if has_frames:
-            def image_key(path: Path | None):
-                if path is None:
-                    return None
-                # API uploads are stored below a job-specific directory.  The
-                # same image uploaded for a second seed therefore has a new
-                # pathname even though its conditioning is byte-identical.
-                # Cache by content (plus role/order and geometry below), not
-                # by transient storage location.
-                return self._file_content_digest(Path(path))
-
-            conditioning_key = (
-                request.prompt,
-                image_key(request.first_frame),
-                image_key(request.last_frame),
-                tuple(image_key(path) for path in request.reference_images),
-                tuple(image_key(path) for path in request.reference_videos),
-                tuple(image_key(path) for path in request.reference_audios),
-                request.width,
-                request.height,
-                request.frames,
-            )
-            cached_conditioning = self._conditioning_cache
-            if (
-                cached_conditioning is not None
-                and cached_conditioning[0] == conditioning_key
-            ):
-                return (
-                    cached_conditioning[1].to("cuda:0", non_blocking=True),
-                    cached_conditioning[2].to("cuda:0", non_blocking=True),
-                )
-        cached = self._prompt_cache
-        if not has_frames and cached is not None and cached[0] == request.prompt:
-            return (
-                cached[1].to("cuda:0", non_blocking=True),
-                cached[2].to("cuda:0", non_blocking=True),
-            )
-        encoded = (
-            self.conditioner.encode_request(request)
-            if has_frames
-            else self.conditioner.encode_prompt(request.prompt)
+        has_frames = bool(
+            request.reference_images
+            or request.reference_videos
+            or request.reference_audios
+            or request.first_frame is not None
+            or request.last_frame is not None
         )
-        embeds = encoded.prompt_embeds
-        tags = encoded.text_token_tags
-        if has_frames:
-            self._conditioning_cache = (
-                conditioning_key,
-                embeds.detach().to("cpu").pin_memory(),
-                tags.detach().to("cpu").pin_memory(),
-            )
+        fingerprint = self._conditioning_fingerprint(request)
+        self._last_conditioning_cache_payload = None
+        self._last_conditioning_cache_status = "miss"
+        self._last_conditioning_cache_fallback = None
+        cached = self._conditioning_cache if has_frames else self._prompt_cache
+        if cached is not None and cached[0] == fingerprint:
+            host_embeds, host_tags = cached[1], cached[2]
+            self._last_conditioning_cache_status = "hot_session_hit"
         else:
-            self._prompt_cache = (
-                request.prompt,
-                embeds.detach().to("cpu").pin_memory(),
-                tags.detach().to("cpu").pin_memory(),
+            persisted = self._load_persisted_conditioning(
+                request, fingerprint=fingerprint
             )
-        return embeds, tags
+            if persisted is not None:
+                host_embeds, host_tags = persisted
+            else:
+                encoded = (
+                    self.conditioner.encode_request(request)
+                    if has_frames
+                    else self.conditioner.encode_prompt(request.prompt)
+                )
+                embeds = encoded.prompt_embeds
+                tags = encoded.text_token_tags
+                host_embeds = self._host_conditioning_tensor(embeds)
+                host_tags = self._host_conditioning_tensor(tags)
+                self._last_conditioning_cache_status = "encoded"
+                cached_entry = (fingerprint, host_embeds, host_tags)
+                if has_frames:
+                    self._conditioning_cache = cached_entry
+                else:
+                    self._prompt_cache = cached_entry
+                self._last_conditioning_cache_payload = self._conditioning_payload(
+                    fingerprint, host_embeds, host_tags
+                )
+                self._backfill_legacy_conditioning_cache(
+                    request, self._last_conditioning_cache_payload
+                )
+                return embeds, tags
+            cached_entry = (fingerprint, host_embeds, host_tags)
+            if has_frames:
+                self._conditioning_cache = cached_entry
+            else:
+                self._prompt_cache = cached_entry
+        self._last_conditioning_cache_payload = self._conditioning_payload(
+            fingerprint, host_embeds, host_tags
+        )
+        device = self.runtime_config.device
+        return (
+            host_embeds.to(device, non_blocking=True),
+            host_tags.to(device, non_blocking=True),
+        )
 
     @staticmethod
     def _file_content_digest(path: Path) -> bytes:
@@ -1537,6 +2719,12 @@ class NativeT2AVHotSession:
         if preview_lora_requested and adapter_count == 0:
             raise RuntimeError("LoRA preview requested but the hot family has no adapters")
         active_lora_for_predict = bool(request.use_lora)
+        primary_video_shift = (
+            self.lora_video_shift if request.use_lora else 12.0
+        )
+        primary_audio_shift = (
+            self.lora_audio_shift if request.use_lora else 3.0
+        )
         request_engine = (
             "reference_lora" if self._uses_reference_layout and request.use_lora
             else "reference" if self._uses_reference_layout
@@ -1625,6 +2813,18 @@ class NativeT2AVHotSession:
             text_tokens=int(context_5120.shape[-2]),
         )
         execution_profile.update({
+            "lora_profile": (
+                {
+                    "profile_id": self.lora_profile_id,
+                    "recommended_steps": list(self.lora_recommended_steps),
+                    "default_steps": self.lora_default_steps,
+                    "requested_steps": request.steps,
+                    "video_shift": self.lora_video_shift,
+                    "audio_shift": self.lora_audio_shift,
+                    "clock_mode": self.turbo_clock_mode.value,
+                }
+                if request.use_lora else None
+            ),
             "qwen_pinned_weight_cache": bool(
                 getattr(self.conditioner, "host_cache_ready", False)
             ),
@@ -1639,6 +2839,16 @@ class NativeT2AVHotSession:
                 / (1024**2),
                 3,
             ),
+            "qwen_conditioning_cache": {
+                "schema_version": QWEN_CONDITIONING_CACHE_SCHEMA_VERSION,
+                "status": self._last_conditioning_cache_status,
+                "fallback": self._last_conditioning_cache_fallback,
+                "persisted_with_latent": bool(
+                    self._last_conditioning_cache_payload is not None
+                    and request.save_final_latents_path is not None
+                    and not request.latent_only
+                ),
+            },
         })
         if request.acceleration_plan_summary is not None:
             execution_profile["joint_acceleration"] = dict(
@@ -1805,10 +3015,15 @@ class NativeT2AVHotSession:
         )
 
         duration = request.frames / float(request.fps)
+        latent_video_tokens = (
+            int(request.internal_video_tokens)
+            if request.internal_video_tokens is not None
+            else ((request.frames - 5) // 17) * 5 + 2
+        )
         video_shape = (
             1,
             24,
-            ((request.frames - 5) // 17) * 5 + 2,
+            latent_video_tokens,
             request.height // 16,
             request.width // 16,
         )
@@ -1831,7 +3046,14 @@ class NativeT2AVHotSession:
                 request.terminal_refinement_initial_height // 16,
                 request.terminal_refinement_initial_width // 16,
             )
-        audio_shape = (1, 32, 2, round(duration * 40))
+        audio_shape = (
+            1,
+            32,
+            2,
+            int(request.internal_audio_tokens)
+            if request.internal_audio_tokens is not None
+            else round(duration * 40),
+        )
         generator = torch.Generator("cpu").manual_seed(request.seed)
         video_noise_cpu = torch.randn(
             initial_video_shape, generator=generator, dtype=torch.float32
@@ -1882,6 +3104,8 @@ class NativeT2AVHotSession:
                 "steps": request.steps,
                 "representation": "formal_sampler_checkpoint_v1",
             }
+            if request.use_lora:
+                expected_metadata["lora_profile_id"] = self.lora_profile_id
             for key, expected in expected_metadata.items():
                 if checkpoint.get(key) != expected:
                     raise ValueError(
@@ -1896,7 +3120,9 @@ class NativeT2AVHotSession:
             resume_step_offset = int(checkpoint.get("next_step_index", -1))
             if not 1 <= resume_step_offset < request.steps:
                 raise ValueError("formal checkpoint has an invalid next step")
-            full_sigmas = simple_sigma_schedule(request.steps, 12.0)
+            full_sigmas = simple_sigma_schedule(
+                request.steps, primary_video_shift
+            )
             recorded_sigmas = tuple(float(value) for value in checkpoint.get("sigmas", ()))
             if recorded_sigmas != full_sigmas:
                 raise ValueError("formal checkpoint sigma schedule does not match the request")
@@ -2057,7 +3283,7 @@ class NativeT2AVHotSession:
         elif request.refinement_latents_path is None:
             video = video_noise_cpu.cuda()
             audio = audio_noise_cpu.cuda()
-            sigmas = simple_sigma_schedule(request.steps, 12.0)
+            sigmas = simple_sigma_schedule(request.steps, primary_video_shift)
         else:
             checkpoint = torch.load(
                 Path(request.refinement_latents_path),
@@ -2067,7 +3293,6 @@ class NativeT2AVHotSession:
             expected_metadata = {
                 "frames": request.frames,
                 "fps": request.fps,
-                "engine": request_engine,
             }
             for key, expected in expected_metadata.items():
                 if checkpoint.get(key) != expected:
@@ -2075,6 +3300,16 @@ class NativeT2AVHotSession:
                         "refinement checkpoint metadata mismatch for "
                         f"{key}: expected {expected!r}, got {checkpoint.get(key)!r}"
                     )
+            source_engine = checkpoint.get("engine")
+            compatible_source_engines = (
+                {"reference", "reference_lora"}
+                if self._uses_reference_layout
+                else {"original", "lora"}
+            )
+            if source_engine not in compatible_source_engines:
+                raise ValueError(
+                    "refinement checkpoint service family does not match the request"
+                )
             source_width = checkpoint.get("width")
             source_height = checkpoint.get("height")
             if not isinstance(source_width, int) or not isinstance(
@@ -2110,19 +3345,62 @@ class NativeT2AVHotSession:
                 clean_audio_cpu.shape
             ) != audio_shape:
                 raise ValueError("refinement checkpoint has an invalid audio latent")
-            clean_video_cpu = resize_refinement_video_latent_spatial(
-                clean_video_cpu,
-                target_height=video_shape[-2],
-                target_width=video_shape[-1],
-            )
+            if source_geometry != target_geometry:
+                if request.refinement_spatial_mode != "learned_3d":
+                    raise ValueError(
+                        "cross-resolution H3 refinement requires learned_3d"
+                    )
+                if self.latent_upscaler is None:
+                    raise RuntimeError(
+                        "this launcher does not provide H3 second sampling"
+                    )
+                from .latent_upscaler import upscale_h3_video_latent
+
+                # Prompt projection needs the DiT once before this branch.
+                # Evict it while the 3D upscaler runs, so 16GB and 24GB use
+                # the same bounded-residency phase instead of overlapping two
+                # model slabs and relying on allocator luck.
+                self._timed(
+                    phases,
+                    "second_sampling_dit_evict",
+                    lambda: self.transformer.move_to("cpu", non_blocking=False),
+                )
+                self._release_device()
+                self._timed(
+                    phases,
+                    "latent_upscaler_h2d",
+                    lambda: self.latent_upscaler.move_to(
+                        "cuda:0", non_blocking=True
+                    ),
+                )
+                clean_video_cpu = self._timed(
+                    phases,
+                    "learned_latent_upscale",
+                    lambda: upscale_h3_video_latent(
+                        self.latent_upscaler.value,
+                        clean_video_cpu,
+                        target_height=video_shape[-2],
+                        target_width=video_shape[-1],
+                        temporal_chunk_frames=24,
+                    ),
+                )
+                self._timed(
+                    phases,
+                    "latent_upscaler_evict",
+                    lambda: self.latent_upscaler.move_to(
+                        "cpu", non_blocking=False
+                    ),
+                )
+                self._release_device()
+                dit = self._timed(
+                    phases,
+                    "second_sampling_dit_h2d",
+                    lambda: self._activate_transformer(execution_plan),
+                )
             assert request.refinement_denoise is not None
-            total_refinement_steps = int(request.steps / request.refinement_denoise)
-            if total_refinement_steps < request.steps:
-                total_refinement_steps = request.steps
-            full_refinement_sigmas = simple_sigma_schedule(
-                total_refinement_steps, 12.0
+            sigmas = refinement_sigma_schedule(
+                request.steps, request.refinement_denoise, 6.0
             )
-            sigmas = full_refinement_sigmas[-(request.steps + 1) :]
             sigma_start = float(sigmas[0])
             video = (
                 sigma_start * video_noise_cpu
@@ -2137,8 +3415,11 @@ class NativeT2AVHotSession:
             execution_profile["refinement"] = {
                 "checkpoint": str(Path(request.refinement_latents_path).resolve()),
                 "denoise": request.refinement_denoise,
+                "video_sigma_shift": 6.0,
                 "solver_steps": request.steps,
-                "schedule_total_steps": total_refinement_steps,
+                "sampler": "sa_solver",
+                "schedule_total_steps": request.steps,
+                "schedule_semantics": "fixed_start_sigma_step_resampling_v1",
                 "video_sigmas": list(sigmas),
                 "preserve_first_pass_audio": request.preserve_refinement_audio,
                 "spatial_mode": request.refinement_spatial_mode,
@@ -2222,10 +3503,49 @@ class NativeT2AVHotSession:
                     < request.preview_branch_steps
                 )
             ):
-                forecast = DirectionalForecastController(
-                    actual_steps=actual_steps,
-                    segment_cache=segment_cache,
+                feedback = (
+                    None
+                    if request.acceleration_plan_summary is None
+                    else request.acceleration_plan_summary.get(
+                        "runtime_feedback"
+                    )
                 )
+                if request.mechanistic_runtime_controller is not None:
+                    forecast = ForecastErrorDebtController(
+                        actual_steps=actual_steps,
+                        segment_cache=segment_cache,
+                        risk_reserve_controller=(
+                            request.mechanistic_runtime_controller
+                        ),
+                    )
+                elif (
+                    isinstance(feedback, dict)
+                    and feedback.get("policy_id")
+                    == V24_FORECAST_FEEDBACK_POLICY_ID
+                ):
+                    feedback_mode = str(feedback.get("mode", ""))
+                    if feedback_mode not in (
+                        "observe_only",
+                        "bounded_recovery",
+                    ):
+                        raise ValueError(
+                            "unsupported V24 forecast feedback mode"
+                        )
+                    forecast = ForecastErrorDebtController(
+                        actual_steps=actual_steps,
+                        segment_cache=segment_cache,
+                        recovery_enabled=(
+                            feedback_mode == "bounded_recovery"
+                        ),
+                        max_runtime_promotions=int(
+                            feedback.get("max_runtime_promotions", 0)
+                        ),
+                    )
+                else:
+                    forecast = DirectionalForecastController(
+                        actual_steps=actual_steps,
+                        segment_cache=segment_cache,
+                    )
         if segment_cache is not None and forecast is None:
             raise ValueError(
                 "the first segment-cache prototype requires the original forecast route"
@@ -2239,17 +3559,35 @@ class NativeT2AVHotSession:
         remaining_actual_steps = tuple(
             index for index in actual_steps if index >= resume_step_offset
         )
+        video_sigma_shift = (
+            6.0
+            if request.refinement_latents_path is not None
+            else primary_video_shift
+        )
+        audio_sigma_shift = (
+            3.0
+            if request.refinement_latents_path is not None
+            else primary_audio_shift
+        )
         plan = SamplingPlan(
-            sampler="turbo" if self._uses_turbo_sampler(request) else "res_multistep",
+            sampler=(
+                "sa_solver"
+                if request.refinement_latents_path is not None
+                else "turbo"
+                if self._uses_turbo_sampler(request)
+                else "res_multistep"
+            ),
             video_sigmas=sigmas,
             audio_sigmas=sigmas,
             actual_step_indices=remaining_actual_steps,
-            video_shift=12.0,
-            audio_shift=3.0,
+            video_shift=video_sigma_shift,
+            audio_shift=audio_sigma_shift,
             step_index_offset=resume_step_offset,
+            seed=request.seed,
         )
         layout = None
         step_seconds: list[float] = []
+        long_sequence_step_memory: list[dict[str, float | int | bool]] = []
         self_speculative_records: list[dict[str, Any]] = []
         last_denoised: tuple[torch.Tensor, torch.Tensor] | None = None
         preview_latents: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -2374,37 +3712,57 @@ class NativeT2AVHotSession:
                         execution_plan.mlp_spatial_lattice_detail_fraction
                     ),
                 )
+
             def run_dit_once():
-                return dit(
-                    video_value,
-                    audio_value,
-                    context,
-                    torch.tensor([clock.video_sigma], device="cuda"),
-                    output_frame_count=request.frames,
-                    text_token_tags=text_tags,
-                    condition_video_latents=condition_video_latents,
-                    condition_audio_latents=condition_audio_latents,
-                    keyframe_indices=keyframe_indices,
-                    reference_shapes=reference_shapes,
-                    reference_kinds=reference_kinds,
-                    reference_audio_frames=reference_audio_frames,
-                    condition_seed=(request.seed if self._uses_reference_layout else 42),
-                    cache_condition_rows=request.cache_condition_rows,
-                    cache_condition_embeddings=request.cache_condition_embeddings,
-                    layout=layout,
-                    audio_transport_scale=(
-                        4.0
-                        if active_lora_for_predict
-                        and self.turbo_clock_mode is TurboClockMode.SHARED_VIDEO
-                        else None
-                    ),
-                    block_stack_runner=block_stack_runner,
-                    mlp_chunk_tokens=(
-                        execution_plan.mlp_chunk_tokens
-                        if execution_plan is not None
-                        else request.mlp_chunk_tokens
-                    ),
-                )
+                with block_cancellation(raise_if_cancelled):
+                    return dit(
+                        video_value,
+                        audio_value,
+                        context,
+                        torch.tensor([clock.video_sigma], device="cuda"),
+                        output_frame_count=request.frames,
+                        text_token_tags=text_tags,
+                        condition_video_latents=condition_video_latents,
+                        condition_audio_latents=condition_audio_latents,
+                        keyframe_indices=keyframe_indices,
+                        reference_shapes=reference_shapes,
+                        reference_kinds=reference_kinds,
+                        reference_audio_frames=reference_audio_frames,
+                        condition_seed=(
+                            request.seed if self._uses_reference_layout else 42
+                        ),
+                        cache_condition_rows=request.cache_condition_rows,
+                        cache_condition_embeddings=(
+                            request.cache_condition_embeddings
+                        ),
+                        layout=layout,
+                        audio_transport_scale=(
+                            4.0
+                            if active_lora_for_predict
+                            and self.turbo_clock_mode
+                            is TurboClockMode.SHARED_VIDEO
+                            else None
+                        ),
+                        sigma_shift_video=(
+                            self.lora_video_shift
+                            if active_lora_for_predict else 12.0
+                        ),
+                        sigma_shift_audio=(
+                            self.lora_audio_shift
+                            if active_lora_for_predict else 3.0
+                        ),
+                        block_stack_runner=block_stack_runner,
+                        mlp_chunk_tokens=(
+                            execution_plan.mlp_chunk_tokens
+                            if execution_plan is not None
+                            else request.mlp_chunk_tokens
+                        ),
+                        final_projection_chunk_tokens=(
+                            2048
+                            if self.runtime_config.weight_tier == "w4a8"
+                            else None
+                        ),
+                    )
 
             with (
                 torch.inference_mode(),
@@ -2428,6 +3786,81 @@ class NativeT2AVHotSession:
                     False
                     if execution_plan is None
                     else execution_plan.long_video_motion_detail_attention
+                ),
+                long_sequence_query_chunking(
+                    None
+                    if execution_plan is None
+                    else execution_plan.long_sequence_query_chunk_tokens,
+                    projection_chunk_tokens=(
+                        8192
+                        if execution_plan is None
+                        else execution_plan.long_sequence_projection_chunk_tokens
+                    ),
+                    split_qkv_outputs=(
+                        False
+                        if execution_plan is None
+                        else execution_plan.long_sequence_split_qkv_outputs
+                    ),
+                    shared_qkv_quantization=(
+                        False
+                        if execution_plan is None
+                        else execution_plan.long_sequence_shared_qkv_quantization
+                    ),
+                    compact_kv=(
+                        False
+                        if execution_plan is None
+                        else execution_plan.long_sequence_compact_kv
+                    ),
+                    exact_helper_stack=(
+                        False
+                        if execution_plan is None
+                        else execution_plan.long_sequence_exact_helper_stack
+                    ),
+                    single_qknorm_rope=(
+                        False
+                        if execution_plan is None
+                        else execution_plan.long_sequence_single_qknorm_rope
+                    ),
+                    parallel_sparse_lut=(
+                        False
+                        if execution_plan is None
+                        else execution_plan.long_sequence_parallel_sparse_lut
+                    ),
+                    partial_sparse_topk=(
+                        False
+                        if execution_plan is None
+                        else execution_plan.long_sequence_partial_sparse_topk
+                    ),
+                    fused_prefix_k_quant=(
+                        False
+                        if execution_plan is None
+                        else execution_plan.long_sequence_fused_prefix_k_quant
+                    ),
+                    fused_query_projection=(
+                        False
+                        if execution_plan is None
+                        else execution_plan.long_sequence_fused_query_projection
+                    ),
+                    fused_qknorm_hnd_layout=(
+                        False
+                        if execution_plan is None
+                        else execution_plan.long_sequence_fused_qknorm_hnd_layout
+                    ),
+                    direct_nhd_output=(
+                        False
+                        if execution_plan is None
+                        else execution_plan.long_sequence_direct_nhd_output
+                    ),
+                    direct_nhd_kv=(
+                        False
+                        if execution_plan is None
+                        else execution_plan.long_sequence_direct_nhd_kv
+                    ),
+                    direct_hnd_fp8_value=(
+                        False
+                        if execution_plan is None
+                        else execution_plan.long_sequence_direct_hnd_fp8_value
+                    ),
                 ),
             ):
                 verify_whole_dit = (
@@ -2564,8 +3997,12 @@ class NativeT2AVHotSession:
                 video_sigmas=branch_sigmas,
                 audio_sigmas=branch_sigmas,
                 actual_step_indices=branch_actual,
-                video_shift=12.0,
-                audio_shift=3.0,
+                video_shift=(
+                    self.lora_video_shift if branch_uses_lora else 12.0
+                ),
+                audio_shift=(
+                    self.lora_audio_shift if branch_uses_lora else 3.0
+                ),
             )
             saved_forecast = forecast
             saved_layout = layout
@@ -2774,7 +4211,9 @@ class NativeT2AVHotSession:
                 "next_step_index": index + 1,
                 "sigma": float(clock.video_sigma),
                 "sigma_next": float(clock.video_sigma_next),
-                "sigmas": list(simple_sigma_schedule(request.steps, 12.0)),
+                "sigmas": list(simple_sigma_schedule(
+                    request.steps, primary_video_shift
+                )),
                 "actual_step_indices": list(actual_steps),
                 "attention_action_schedule": list(
                     request.attention_action_schedule
@@ -2791,6 +4230,9 @@ class NativeT2AVHotSession:
                     request.prompt.encode("utf-8")
                 ).hexdigest(),
                 "use_lora": request.use_lora,
+                "lora_profile_id": (
+                    self.lora_profile_id if request.use_lora else None
+                ),
                 "forecast_state": (
                     None if forecast is None else forecast.checkpoint_state()
                 ),
@@ -2957,16 +4399,20 @@ class NativeT2AVHotSession:
             self._clear_block_executor()
             self._release_device()
             self.video_vae.move_to("cuda:0", non_blocking=True)
-            decoded_video = self.decode_video(
-                self.video_vae.value, preview_latents[0].to("cuda:0"), request.frames
+            decoded_video = self._decode_video_for_plan(
+                self.video_vae.value,
+                preview_latents[0].to("cuda:0"),
+                request.frames,
+                execution_plan,
             )
             decoded_forecast_video = (
                 None
                 if forecast_preview_latents is None
-                else self.decode_video(
+                else self._decode_video_for_plan(
                     self.video_vae.value,
                     forecast_preview_latents[0].to("cuda:0"),
                     request.frames,
+                    execution_plan,
                 )
             )
             self.video_vae.move_to("cpu", non_blocking=False)
@@ -3048,6 +4494,56 @@ class NativeT2AVHotSession:
                 "denoise",
                 f"DiT 去噪 {index + 1}/{request.steps}",
             )
+            # Query streaming keeps an individual H3 block inside VRAM, but
+            # long requests repeatedly allocate several differently shaped
+            # Dense/Sparge workspaces.  CUDA's cache can otherwise retain
+            # those slabs across solver steps until HMM silently spills well
+            # beyond physical VRAM.  Reclaim only at the natural step
+            # boundary and only for the opt-in long-sequence path.  This
+            # policy depends on actual execution geometry, never prompt or
+            # conditioning semantics.
+            long_sequence_active = bool(
+                execution_plan is not None
+                and execution_plan.long_sequence_query_chunk_tokens is not None
+            )
+            if execution_plan is not None and (
+                execution_plan.long_sequence_query_chunk_tokens is not None
+            ):
+                torch.cuda.synchronize()
+                gib = float(1024**3)
+                allocated_before = torch.cuda.memory_allocated()
+                reserved_before = torch.cuda.memory_reserved()
+                memory_budget = self._device_execution_budget_bytes()
+                # Cache compaction is a pressure valve, not a mandatory tax.
+                # Keep reusable slabs for 480p/720p throughput and compact only
+                # when the retained allocator footprint approaches the current
+                # service budget. This is request geometry agnostic.
+                compact_long_sequence = bool(
+                    long_sequence_active
+                    and index + 1 < request.steps
+                    and reserved_before >= int(memory_budget * 0.82)
+                )
+                if compact_long_sequence:
+                    torch.cuda.empty_cache()
+                long_sequence_step_memory.append(
+                    {
+                        "step_index": int(index),
+                        "allocated_before_gib": allocated_before / gib,
+                        "reserved_before_gib": reserved_before / gib,
+                        "reserved_after_gib": torch.cuda.memory_reserved() / gib,
+                        "cumulative_peak_allocated_gib": (
+                            torch.cuda.max_memory_allocated() / gib
+                        ),
+                        "cumulative_peak_reserved_gib": (
+                            torch.cuda.max_memory_reserved() / gib
+                        ),
+                        "interstep_cache_compacted": compact_long_sequence,
+                        "device_budget_gib": memory_budget / gib,
+                    }
+                )
+                execution_profile["long_sequence_step_memory"] = list(
+                    long_sequence_step_memory
+                )
             checkpoint_now = request.checkpoint_after_step == index + 1
             if checkpoint_now:
                 save_formal_checkpoint(index, clock, step_video, step_audio)
@@ -3080,11 +4576,12 @@ class NativeT2AVHotSession:
             )
 
         def sample():
-            sampler = (
-                TurboAVSampler(self.turbo_clock_mode)
-                if self._uses_turbo_sampler(request)
-                else ResMultistepAVSampler()
-            )
+            if request.refinement_latents_path is not None:
+                sampler = SASolverAVSampler()
+            elif self._uses_turbo_sampler(request):
+                sampler = TurboAVSampler(self.turbo_clock_mode)
+            else:
+                sampler = ResMultistepAVSampler()
             result_video, result_audio = sampler.sample(
                 video,
                 audio,
@@ -3115,6 +4612,8 @@ class NativeT2AVHotSession:
         except _HotSessionCheckpointReached:
             torch.cuda.synchronize()
             phases["denoise"] = time.perf_counter() - denoise_started
+            peak_allocated_gib = torch.cuda.max_memory_allocated() / (1024**3)
+            peak_reserved_gib = torch.cuda.max_memory_reserved() / (1024**3)
             if request_online_budget is not None:
                 execution_profile["attention_online_guard"] = (
                     request_online_budget.telemetry()
@@ -3140,6 +4639,8 @@ class NativeT2AVHotSession:
                 phases=phases,
                 step_seconds=tuple(step_seconds),
                 execution_profile=execution_profile,
+                peak_allocated_gib=peak_allocated_gib,
+                peak_reserved_gib=peak_reserved_gib,
             )
         torch.cuda.synchronize()
         phases["denoise"] = time.perf_counter() - denoise_started
@@ -3306,19 +4807,24 @@ class NativeT2AVHotSession:
         if final_latents_path is not None:
             final_latents_path = Path(final_latents_path).resolve()
             final_latents_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "video": video.detach().cpu(),
-                    "audio": audio.detach().cpu(),
-                    "frames": request.frames,
-                    "fps": request.fps,
-                    "width": request.width,
-                    "height": request.height,
-                    "engine": request_engine,
-                    "seed": request.seed,
-                },
-                final_latents_path,
-            )
+            latent_document = {
+                "video": video.detach().cpu(),
+                "audio": audio.detach().cpu(),
+                "frames": request.frames,
+                "fps": request.fps,
+                "width": request.width,
+                "height": request.height,
+                "engine": request_engine,
+                "seed": request.seed,
+            }
+            if (
+                not request.latent_only
+                and self._last_conditioning_cache_payload is not None
+            ):
+                latent_document["qwen_conditioning_cache"] = (
+                    self._last_conditioning_cache_payload
+                )
+            torch.save(latent_document, final_latents_path)
         del (
             context,
             text_tags,
@@ -3336,6 +4842,44 @@ class NativeT2AVHotSession:
         self._release_device()
         raise_if_cancelled()
 
+        if request.latent_only:
+            if final_latents_path is None:
+                raise ValueError("latent-only execution requires save_final_latents_path")
+            self._timed(
+                phases,
+                "host_scratch_release",
+                self._release_request_host_scratch,
+            )
+            return HotSessionResult(
+                output_path=output,
+                total_seconds=time.perf_counter() - started_total,
+                phases=phases,
+                step_seconds=tuple(step_seconds),
+                forecast_profile=(
+                    forecast_profile_override
+                    if forecast_profile_override is not None
+                    else forecast.export()
+                    if forecast is not None
+                    else {
+                        "schema_version": 1,
+                        "mode": "disabled",
+                        "planned_actual_steps": list(actual_steps),
+                        "actual_steps": request.steps,
+                        "forecast_steps": 0,
+                        "records": [],
+                    }
+                ),
+                execution_profile={
+                    **execution_profile,
+                    "ultimate_upscale_window": {
+                        "frames": request.frames,
+                        "video_tokens": request.internal_video_tokens,
+                        "audio_tokens": request.internal_audio_tokens,
+                        "decoded": False,
+                    },
+                },
+            )
+
         progress(80, "video_decode", "视频解码")
         self._timed(
             phases,
@@ -3351,6 +4895,7 @@ class NativeT2AVHotSession:
                 raise TypeError("the H3 Video-VAE does not expose decoder_tile_size")
             video_vae_model.decoder_tile_size = tile_height
         from .adapters.vae_tiling import configure_vae_tile_batching
+        from .adapters.real_vae import select_uint8_postprocess_frame_chunk
         from .adapters.vae_compile import (
             transformer_block_compile,
             transformer_block_compile_ready,
@@ -3360,6 +4905,22 @@ class NativeT2AVHotSession:
             self.video_vae.value,
             1 if execution_plan is None else execution_plan.vae_tile_batch_size,
         )
+        uint8_frame_chunk = select_uint8_postprocess_frame_chunk((
+            1,
+            3,
+            request.frames,
+            request.height,
+            request.width,
+        ))
+        execution_profile["video_uint8_postprocess"] = {
+            "mode": (
+                "temporal_streaming_exact"
+                if uint8_frame_chunk is not None
+                else "single_tensor_exact"
+            ),
+            "frame_chunk": uint8_frame_chunk,
+            "routing_inputs": "output_geometry_only",
+        }
         compile_vae_block = bool(
             execution_plan is not None
             and execution_plan.vae_transformer_block_compile
@@ -3371,27 +4932,35 @@ class NativeT2AVHotSession:
                 "execution plan requested VAE TransformerBlock compilation, "
                 "but the session did not prebuild the compiled decoder"
             )
-        with transformer_block_compile(compile_vae_block):
-            decoded_video = self._timed(
-                phases,
-                "video_decode",
-                lambda: self.decode_video(
-                    self.video_vae.value, video, request.frames
-                ),
-            )
-            decoded_preview_video = (
-                None
-                if preview_latents is None or preview_published
-                else self._timed(
+        with self._video_vae_block_streaming(
+            self.video_vae.value, width=request.width, height=request.height
+        ) as block_policy:
+            with transformer_block_compile(compile_vae_block):
+                decoded_video = self._timed(
                     phases,
-                    "preview_video_decode",
-                    lambda: self.decode_video(
+                    "video_decode",
+                    lambda: self._decode_video_for_plan(
                         self.video_vae.value,
-                        preview_latents[0].to("cuda:0"),
+                        video,
                         request.frames,
+                        execution_plan,
                     ),
                 )
-            )
+                decoded_preview_video = (
+                    None
+                    if preview_latents is None or preview_published
+                    else self._timed(
+                        phases,
+                        "preview_video_decode",
+                        lambda: self._decode_video_for_plan(
+                            self.video_vae.value,
+                            preview_latents[0].to("cuda:0"),
+                            request.frames,
+                            execution_plan,
+                        ),
+                    )
+                )
+        execution_profile["video_vae_block_streaming"] = block_policy
         del video
         self._timed(
             phases,
@@ -3498,8 +5067,19 @@ class NativeT2AVHotSession:
 
     def close(self) -> None:
         self._clear_block_executor()
-        for component in (self.transformer, self.video_vae, self.audio_vae):
+        for component in (
+            self.transformer,
+            self.video_vae,
+            self.audio_vae,
+            self.latent_upscaler,
+        ):
+            if component is None:
+                continue
             component.move_to("cpu", non_blocking=False)
+        self._prompt_cache = None
+        self._conditioning_cache = None
+        self._persisted_conditioning_cache = None
+        self._last_conditioning_cache_payload = None
         self._reference_latent_cache = None
         self._release_device(collect_cycles=True)
 

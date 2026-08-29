@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "anchor": "ref2va_multiref_8s_enhanced_v1.json",
+  "purpose": "Human-review-only Ref2VA candidates; all use the same enhanced prompt, references, seed and 8/12 schedule.",
+  "candidates": [
+    {
+      "version": "a00_exactkernels_8_12",
+      "actual_steps": [0, 1, 2, 3, 5, 8, 13, 19],
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": true
+    },
+    {
+      "version": "a10_fusedrms_8_12_review",
+      "actual_steps": [0, 1, 2, 3, 5, 8, 13, 19],
+      "fused_rms_adaln": true,
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": true
+    },
+    {
+      "version": "a20_sparse075_8_12_review",
+      "actual_steps": [0, 1, 2, 3, 5, 8, 13, 19],
+      "attention_topk": 0.75,
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": true
+    },
+    {
+      "version": "a30_sparse075_fusedrms_8_12_review",
+      "actual_steps": [0, 1, 2, 3, 5, 8, 13, 19],
+      "attention_topk": 0.75,
+      "fused_rms_adaln": true,
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": true
+    }
+  ]
+}

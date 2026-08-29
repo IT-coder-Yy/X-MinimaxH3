@@ -2,14 +2,16 @@
 set -euo pipefail
 
 release_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-runtime_root="${H3_SERVE_RUNTIME_DIR:-${release_root}/runtime}"
-mkdir -p "${runtime_root}/tmp"
-export TMPDIR="${TMPDIR:-${runtime_root}/tmp}"
+if [[ -f "${release_root}/.env.local" ]]; then
+  source "${release_root}/.env.local"
+fi
+mkdir -p "${release_root}/runtime/tmp"
+export TMPDIR="${TMPDIR:-${release_root}/runtime/tmp}"
 source "${release_root}/scripts/_process.sh"
 source "${release_root}/scripts/_runtime.sh"
 
 serve_port="${H3_SERVE_PORT:-8090}"
-pid_file="${H3_SERVE_PID_FILE:-${runtime_root}/h3serve-${serve_port}.pid}"
+pid_file="${H3_SERVE_PID_FILE:-${release_root}/runtime/h3serve-${serve_port}.pid}"
 if [[ -s "${pid_file}" ]]; then
   existing_pid="$(<"${pid_file}")"
   if h3_is_release_server_pid "${existing_pid}"; then

@@ -75,6 +75,22 @@ class GenerationLimitPolicyTest(unittest.TestCase):
             migrated = load_generation_limit_policy(data_dir)
             self.assertEqual(migrated, GenerationLimitPolicy())
 
+    def test_pre_2k_matrix_preserves_operator_values_and_seeds_only_2k(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary)
+            limits = default_preset_limits()
+            del limits["2k"]
+            limits["1080p"]["16:9"] = 10
+            path = data_dir / "settings/generation_limits.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                json.dumps({"preset_limits": limits}), encoding="utf-8"
+            )
+
+            migrated = load_generation_limit_policy(data_dir)
+            self.assertEqual(migrated.preset_limits["1080p"]["16:9"], 10)
+            self.assertEqual(migrated.preset_limits["2k"]["16:9"], 15)
+
 
 if __name__ == "__main__":
     unittest.main()

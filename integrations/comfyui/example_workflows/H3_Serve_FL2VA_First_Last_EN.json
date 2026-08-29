@@ -1,0 +1,118 @@
+{
+  "id": "55db31f7-2441-4eed-bddc-2b334aa8814a",
+  "revision": 0,
+  "last_node_id": 6,
+  "last_link_id": 6,
+  "nodes": [
+    {
+      "id": 1, "type": "H3ServeConnectionEnglish", "pos": [40, 60], "size": [380, 150],
+      "flags": {}, "order": 0, "mode": 0,
+      "inputs": [
+        {"name": "server_url", "type": "STRING", "link": null, "widget": {"name": "server_url"}},
+        {"name": "api_key", "type": "STRING", "link": null, "widget": {"name": "api_key"}},
+        {"name": "poll_seconds", "type": "FLOAT", "link": null, "widget": {"name": "poll_seconds"}}
+      ],
+      "outputs": [
+        {"name": "connection", "type": "H3_SERVE_CONNECTION", "links": [1, 5]}
+      ],
+      "properties": {"Node name for S&R": "H3ServeConnectionEnglish"},
+      "widgets_values": ["http://127.0.0.1:8090", "", 1.0],
+      "title": "① Connect to the ready FL2VA service"
+    },
+    {
+      "id": 2, "type": "LoadImage", "pos": [40, 280], "size": [320, 310],
+      "flags": {}, "order": 1, "mode": 0,
+      "inputs": [{"name": "image", "type": "COMBO", "link": null, "widget": {"name": "image"}}],
+      "outputs": [
+        {"name": "IMAGE", "type": "IMAGE", "links": [2]},
+        {"name": "MASK", "type": "MASK", "links": null}
+      ],
+      "properties": {"Node name for S&R": "LoadImage"},
+      "widgets_values": [""], "title": "② Select first frame"
+    },
+    {
+      "id": 3, "type": "LoadImage", "pos": [40, 640], "size": [320, 310],
+      "flags": {}, "order": 2, "mode": 0,
+      "inputs": [{"name": "image", "type": "COMBO", "link": null, "widget": {"name": "image"}}],
+      "outputs": [
+        {"name": "IMAGE", "type": "IMAGE", "links": [3]},
+        {"name": "MASK", "type": "MASK", "links": null}
+      ],
+      "properties": {"Node name for S&R": "LoadImage"},
+      "widgets_values": [""], "title": "③ Select last frame"
+    },
+    {
+      "id": 5, "type": "PrimitiveStringMultiline", "pos": [500, 900], "size": [640, 320],
+      "flags": {}, "order": 3, "mode": 0,
+      "inputs": [
+        {"name": "value", "type": "STRING", "link": null, "widget": {"name": "value"}}
+      ],
+      "outputs": [
+        {"name": "STRING", "type": "STRING", "links": [4]}
+      ],
+      "properties": {"Node name for S&R": "PrimitiveStringMultiline"},
+      "widgets_values": [
+        "integrated_multimodal_description: A continuous cinematic shot moves naturally from the supplied first frame to the supplied last frame. Preserve character identity, clothing, composition and spatial continuity; keep actions and camera motion smooth.\n\noverall_soundscape: Natural synchronized ambience and action sounds from the depicted scene.\n\nnon_diegetic_music: N/A"
+      ],
+      "title": "FL2VA prompt"
+    },
+    {
+      "id": 4, "type": "H3ServeFL2VAPresetGenerateEnglish", "pos": [500, 130], "size": [640, 720],
+      "flags": {}, "order": 4, "mode": 0,
+      "inputs": [
+        {"name": "connection", "type": "H3_SERVE_CONNECTION", "link": 1},
+        {"name": "prompt", "type": "STRING", "link": 4},
+        {"name": "resolution", "type": "COMBO", "link": null, "widget": {"name": "resolution"}},
+        {"name": "aspect_ratio", "type": "COMBO", "link": null, "widget": {"name": "aspect_ratio"}},
+        {"name": "duration_seconds", "type": "FLOAT", "link": null, "widget": {"name": "duration_seconds"}},
+        {"name": "sampling_steps", "type": "INT", "link": null, "widget": {"name": "sampling_steps"}},
+        {"name": "acceleration", "type": "FLOAT", "link": null, "widget": {"name": "acceleration"}},
+        {"name": "model_variant", "type": "COMBO", "link": null, "widget": {"name": "model_variant"}},
+        {"name": "preview_mode", "type": "COMBO", "link": null, "widget": {"name": "preview_mode"}},
+        {"name": "preview_step", "type": "INT", "link": null, "widget": {"name": "preview_step"}},
+        {"name": "seed", "type": "INT", "link": null, "widget": {"name": "seed"}},
+        {"name": "checkpoint_job_id", "type": "STRING", "link": null, "widget": {"name": "checkpoint_job_id"}},
+        {"name": "checkpoint_action", "type": "COMBO", "link": null, "widget": {"name": "checkpoint_action"}},
+        {"name": "first_frame", "type": "IMAGE", "link": 2},
+        {"name": "last_frame", "type": "IMAGE", "link": 3}
+      ],
+      "outputs": [
+        {"name": "final_video", "type": "VIDEO", "links": [6]},
+        {"name": "preview_video", "type": "VIDEO", "links": null}
+      ],
+      "properties": {"Node name for S&R": "H3ServeFL2VAPresetGenerateEnglish"},
+      "widgets_values": [
+        "480p", "16:9", 5.0, 20, 0.0, "Base weights", "Off", 6, 4404, "", "", "New task"
+      ],
+      "title": "④ Generate FL2VA with optional first/last frames"
+    },
+    {
+      "id": 6, "type": "H3ServeSecondSamplingEnglish", "pos": [1220, 180], "size": [430, 340],
+      "flags": {}, "order": 5, "mode": 0,
+      "inputs": [
+        {"name": "connection", "type": "H3_SERVE_CONNECTION", "link": 5},
+        {"name": "source_video", "type": "VIDEO", "link": 6},
+        {"name": "target_resolution", "type": "COMBO", "link": null, "widget": {"name": "target_resolution"}},
+        {"name": "sampling_steps", "type": "INT", "link": null, "widget": {"name": "sampling_steps"}},
+        {"name": "redraw_strength", "type": "COMBO", "link": null, "widget": {"name": "redraw_strength"}},
+        {"name": "acceleration", "type": "FLOAT", "link": null, "widget": {"name": "acceleration"}}
+      ],
+      "outputs": [
+        {"name": "second_sampled_video", "type": "VIDEO", "links": null}
+      ],
+      "properties": {"Node name for S&R": "H3ServeSecondSamplingEnglish"},
+      "widgets_values": ["1080p", 2, "Standard · Denoise 0.20", 75.0],
+      "title": "⑤ Base + SA Solver second sampling"
+    }
+  ],
+  "links": [
+    [1, 1, 0, 4, 0, "H3_SERVE_CONNECTION"],
+    [2, 2, 0, 4, 13, "IMAGE"],
+    [3, 3, 0, 4, 14, "IMAGE"],
+    [4, 5, 0, 4, 1, "STRING"],
+    [5, 1, 0, 6, 0, "H3_SERVE_CONNECTION"],
+    [6, 4, 0, 6, 1, "VIDEO"]
+  ],
+  "groups": [], "config": {},
+  "extra": {"ds": {"scale": 0.8, "offset": [30, 20]}}, "version": 0.4
+}

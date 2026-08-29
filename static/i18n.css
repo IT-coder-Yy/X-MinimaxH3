@@ -1,0 +1,50 @@
+.language-switch {
+  display: flex;
+  align-items: center;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(5, 7, 11, .42);
+}
+
+.language-switch button {
+  min-width: 38px;
+  height: 28px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .03em;
+  cursor: pointer;
+  transition: background .16s ease, color .16s ease, box-shadow .16s ease;
+}
+
+.language-switch button:hover { color: var(--text); }
+
+.language-switch button.active,
+.language-switch button[aria-pressed="true"] {
+  background: linear-gradient(135deg, rgba(255, 126, 80, .2), rgba(138, 120, 255, .18));
+  color: #fff;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .2);
+}
+
+.latent-cache-button {
+  border-color: rgba(255, 105, 120, .25);
+  background: rgba(255, 105, 120, .07);
+  color: #ffb1ba;
+}
+
+.latent-cache-button:disabled { cursor: wait; opacity: .5; }
+
+@media (max-width: 760px) {
+  .topbar-actions { gap: 7px; }
+  .language-switch button { min-width: 34px; padding: 0 7px; }
+}
+
+@media (max-width: 520px) {
+  .language-switch button { min-width: 31px; padding: 0 5px; }
+  .server-state { display: none; }
+}

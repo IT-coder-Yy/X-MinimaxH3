@@ -5,6 +5,8 @@ import unittest
 from h3serve.contract import (
     ContractError,
     GenerationSpec,
+    MODEL_LAUNCHERS,
+    SecondSamplingSpec,
     default_quality,
     public_options,
     resolve_frames,
@@ -14,6 +16,162 @@ from h3serve.contract import (
 
 
 class ContractTest(unittest.TestCase):
+    def test_six_resource_launchers_are_orthogonal_to_base_lora_variant(self) -> None:
+        options = public_options()
+        self.assertEqual(set(options["model_launchers"]), set(MODEL_LAUNCHERS))
+        self.assertEqual(len(MODEL_LAUNCHERS), 6)
+        self.assertEqual(
+            options["model_launchers"]["fl2va_w4a8_8gb"]["variants"],
+            ["base", "lora"],
+        )
+        self.assertTrue(
+            options["model_launchers"]["ref2va_w4a8_8gb"]["second_sampling"]
+        )
+
+        base = GenerationSpec.from_mapping({
+            "prompt": "8GB base",
+            "runtime_launcher": "fl2va_w4a8_8gb",
+            "model_variant": "base",
+            "resolution": "720p",
+            "duration_seconds": 15,
+        })
+        lora = GenerationSpec.from_mapping({
+            "prompt": "8GB LoRA",
+            "runtime_launcher": "fl2va_w4a8_8gb",
+            "model_variant": "lora",
+            "resolution": "720p",
+            "duration_seconds": 15,
+        })
+        self.assertEqual(base.runtime_launcher, "fl2va_w4a8_8gb")
+        self.assertEqual(lora.runtime_launcher, "fl2va_w4a8_8gb")
+        self.assertEqual((base.vram_profile, lora.vram_profile), ("8gb", "8gb"))
+        self.assertEqual((base.weight_tier, lora.weight_tier), ("w4a8", "w4a8"))
+        self.assertEqual((base.engine, lora.engine), ("original", "lora"))
+        self.assertEqual(GenerationSpec.from_mapping(lora.to_dict()), lora)
+
+        with self.assertRaisesRegex(ContractError, "up to 720p"):
+            GenerationSpec.from_mapping({
+                "prompt": "unsupported 8GB geometry",
+                "runtime_launcher": "fl2va_w4a8_8gb",
+                "resolution": "1080p",
+                "duration_seconds": 5,
+            })
+        with self.assertRaisesRegex(ContractError, "disagrees"):
+            GenerationSpec.from_mapping({
+                "prompt": "mismatched family",
+                "runtime_launcher": "ref2va_w4a8_8gb",
+                "service_family": "first_last",
+            })
+
+    def test_resource_backend_identity_round_trips_and_caps_geometry(self) -> None:
+        sixteen = GenerationSpec.from_mapping({
+            "prompt": "16GB 720p",
+            "runtime_launcher": "fl2va_int8_16gb",
+            "resolution": "720p",
+            "duration_seconds": 15,
+        })
+        self.assertEqual(sixteen.vram_profile, "16gb")
+        self.assertEqual(sixteen.runtime_launcher, "fl2va_int8_16gb")
+        self.assertEqual(GenerationSpec.from_mapping(sixteen.to_dict()), sixteen)
+        sixteen_1080p = GenerationSpec.from_mapping({
+            "prompt": "16GB experimental native 1080p",
+            "runtime_launcher": "fl2va_int8_16gb",
+            "resolution": "1080p",
+            "duration_seconds": 15,
+        })
+        self.assertEqual((sixteen_1080p.width, sixteen_1080p.height), (1920, 1088))
+        self.assertEqual(sixteen_1080p.frames, 362)
+
+        with self.assertRaisesRegex(ContractError, "24gb.*1080p"):
+            GenerationSpec.from_mapping({
+                "prompt": "24GB first-pass 2K is not released",
+                "runtime_launcher": "fl2va_int8_24gb",
+                "resolution": "2k",
+                "duration_seconds": 5,
+            })
+        # Legacy identifiers remain readable but canonicalize immediately.
+        legacy = GenerationSpec.from_mapping({
+            "prompt": "persisted launcher", "runtime_launcher": "fl2va_int8"
+        })
+        self.assertEqual(legacy.runtime_launcher, "fl2va_int8_24gb")
+
+    def test_second_sampling_contract_uses_h3_geometry_and_own_solver_range(self) -> None:
+        source = GenerationSpec.from_mapping({
+            "prompt": "source card", "resolution": "480p",
+            "aspect_ratio": "16:9", "duration_seconds": 15,
+        })
+        second = SecondSamplingSpec.from_mapping({
+            "resolution": "1080p", "steps": 1, "acceleration": 80,
+            "denoise": 0.2, "memory_mode": "low_vram",
+            "temporal_window_frames": 119,
+        }, source=source)
+        self.assertEqual((second.width, second.height), (1920, 1088))
+        self.assertEqual(second.steps, 1)
+        self.assertEqual(second.strength, "standard")
+        self.assertEqual(second.model_variant, "base")
+        self.assertEqual(second.denoise, 0.2)
+        self.assertEqual(second.memory_mode, "auto")
+        self.assertEqual(second.temporal_window_frames, 119)
+        self.assertEqual(SecondSamplingSpec(**second.to_dict()), second)
+        second_2k = SecondSamplingSpec.from_mapping({
+            "resolution": "2k", "steps": 1, "acceleration": 75,
+            "denoise": 0.2,
+        }, source=source)
+        self.assertEqual((second_2k.width, second_2k.height), (2560, 1440))
+        second_1440p = SecondSamplingSpec.from_mapping({
+            "resolution": "1440p", "steps": 1, "acceleration": 75,
+            "denoise": 0.2,
+        }, source=source)
+        self.assertEqual(second_1440p.resolution, "2k")
+        self.assertEqual((second_1440p.width, second_1440p.height), (2560, 1440))
+
+        strong = SecondSamplingSpec.from_mapping({
+            "resolution": "1080p", "steps": 8,
+            "strength": "strong",
+        }, source=source)
+        self.assertEqual(strong.model_variant, "base")
+        self.assertEqual(strong.strength, "strong")
+        self.assertEqual(strong.denoise, 0.30)
+        with self.assertRaisesRegex(ContractError, "Base weights only"):
+            SecondSamplingSpec.from_mapping({
+                "resolution": "1080p", "model_variant": "lora",
+            }, source=source)
+        with self.assertRaisesRegex(ContractError, "between 68 and 362"):
+            SecondSamplingSpec.from_mapping({
+                "resolution": "1080p", "temporal_window_frames": 51,
+            }, source=source)
+
+        same_size = GenerationSpec.from_mapping({
+            "prompt": "already 720p", "resolution": "720p",
+        })
+        with self.assertRaisesRegex(ContractError, "larger"):
+            SecondSamplingSpec.from_mapping(
+                {"resolution": "720p"}, source=same_size
+            )
+
+    def test_legacy_memory_modes_normalize_and_are_not_public(self) -> None:
+        for mode in ("auto", "performance", "low_vram"):
+            spec = GenerationSpec.from_mapping({
+                "prompt": "memory route",
+                "memory_mode": mode,
+            })
+            self.assertEqual(spec.memory_mode, "auto")
+            self.assertEqual(GenerationSpec.from_mapping(spec.to_dict()), spec)
+        options = public_options()
+        self.assertNotIn("memory_modes", options)
+        self.assertFalse(options["device_memory_backend"]["user_execution_modes"])
+        self.assertEqual(
+            options["device_memory_backend"]["policy"],
+            "startup_fixed_profile_then_minimum_latency_graph",
+        )
+        self.assertFalse(
+            options["device_memory_backend"]["cross_profile_routing"]
+        )
+        with self.assertRaisesRegex(ContractError, "memory_mode"):
+            GenerationSpec.from_mapping({
+                "prompt": "bad memory route", "memory_mode": "magic"
+            })
+
     def test_prompt_is_validated_but_not_rewritten(self) -> None:
         prompt = "  subject_definitions:\n<Subject 1> from <Picture 1>.\n  "
         self.assertEqual(GenerationSpec.from_mapping({"prompt": prompt}).prompt, prompt)
@@ -77,6 +235,8 @@ class ContractTest(unittest.TestCase):
         limits = public_options()["advanced_limits"]
         self.assertIn("sampling_steps", limits)
         self.assertIn("acceleration", limits)
+        self.assertIn("75=Human审阅质量拐点", limits["acceleration"]["meaning"])
+        self.assertIn("75–100", limits["acceleration"]["meaning"])
         self.assertEqual(limits["quality_protection"], "internal_non_disableable")
 
         with self.assertRaisesRegex(ContractError, "cannot be mixed"):
@@ -122,6 +282,19 @@ class ContractTest(unittest.TestCase):
                 "execution_mode": "checkpoint",
                 "checkpoint_step": 20,
             })
+        aligned_360 = GenerationSpec.from_mapping({
+            "prompt": "360p fixed checkpoint preview",
+            "resolution": "360p",
+            "sampling_steps": 8,
+            "acceleration": 0,
+            "execution_mode": "checkpoint",
+            "checkpoint_step": 4,
+            "checkpoint_retain": True,
+            "checkpoint_preview": True,
+            "checkpoint_preview_steps": 4,
+            "checkpoint_preview_resolution": "360p",
+        })
+        self.assertEqual((aligned_360.width, aligned_360.height), (640, 352))
 
     def test_lora_joint_checkpoint_keeps_user_trajectory_and_dial(self) -> None:
         spec = GenerationSpec.from_mapping({
@@ -177,8 +350,9 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(resolve_geometry("480p", "16:9"), (864, 480))
         self.assertEqual(resolve_geometry("720p", "16:9"), (1280, 736))
         self.assertEqual(resolve_geometry("1080p", "16:9"), (1920, 1088))
+        self.assertEqual(resolve_geometry("2k", "16:9"), (2560, 1440))
         self.assertEqual(resolve_geometry("360p", "9:16"), (352, 640))
-        for resolution in ("360p", "480p", "720p", "1080p"):
+        for resolution in ("360p", "480p", "720p", "1080p", "2k"):
             for ratio in ("1:1", "4:3", "3:4", "16:9", "9:16"):
                 width, height = resolve_geometry(resolution, ratio)
                 self.assertEqual(width % 32, 0)
@@ -194,14 +368,9 @@ class ContractTest(unittest.TestCase):
     def test_native_pixel_frame_budget_is_enforced_for_presets_and_custom(self) -> None:
         preset = GenerationSpec.from_mapping({
             "prompt": "validated 1080p", "resolution": "1080p",
-            "aspect_ratio": "16:9", "duration_seconds": 8,
+            "aspect_ratio": "16:9", "duration_seconds": 15,
         })
-        self.assertEqual((preset.width, preset.height, preset.frames), (1920, 1088, 192))
-        with self.assertRaisesRegex(ContractError, "at most 8.000 seconds"):
-            GenerationSpec.from_mapping({
-                "prompt": "too long", "resolution": "1080p",
-                "aspect_ratio": "16:9", "duration_seconds": 8.5,
-            })
+        self.assertEqual((preset.width, preset.height, preset.frames), (1920, 1088, 362))
 
         four_three = GenerationSpec.from_mapping({
             "prompt": "longer four by three", "resolution": "1080p",
@@ -215,32 +384,38 @@ class ContractTest(unittest.TestCase):
         })
         self.assertEqual((square.width, square.height, square.frames),
                          (1088, 1088, 328))
-        with self.assertRaisesRegex(ContractError, "at most 10.125 seconds"):
-            GenerationSpec.from_mapping({
-                "prompt": "four by three too long", "resolution": "1080p",
-                "aspect_ratio": "4:3", "duration_seconds": 10.5,
-            })
+        GenerationSpec.from_mapping({
+            "prompt": "full-length four by three", "resolution": "1080p",
+            "aspect_ratio": "4:3", "duration_seconds": 15,
+        })
 
         custom = GenerationSpec.from_mapping({
             "prompt": "custom 1080p", "mode": "advanced",
-            "width": 1920, "height": 1088, "frames": 192,
+            "width": 1920, "height": 1088, "frames": 362,
             "actual_steps": 9,
         })
-        self.assertEqual(custom.frames, 192)
-        with self.assertRaisesRegex(ContractError, r"width\*height\*frames"):
+        self.assertEqual(custom.frames, 362)
+        with self.assertRaisesRegex(ContractError, "24gb.*1080p"):
+            GenerationSpec.from_mapping({
+                "prompt": "2k is reserved for second sampling",
+                "resolution": "2k", "aspect_ratio": "16:9",
+                "duration_seconds": 15, "memory_mode": "auto",
+            })
+        with self.assertRaisesRegex(ContractError, r"frames must be 5\.\.362"):
             GenerationSpec.from_mapping({
                 "prompt": "custom too long", "mode": "advanced",
-                "width": 1920, "height": 1088, "frames": 209,
+                "width": 1920, "height": 1088, "frames": 379,
                 "actual_steps": 9,
             })
 
         options = public_options()
-        self.assertEqual(options["duration"]["max_by_resolution"]["1080p"], 8)
-        self.assertEqual(options["duration"]["max_by_preset"]["1080p"]["16:9"], 8)
-        self.assertEqual(options["duration"]["max_by_preset"]["1080p"]["4:3"], 243 / 24)
-        self.assertEqual(options["duration"]["max_by_preset"]["1080p"]["1:1"], 328 / 24)
-        self.assertEqual(options["duration"]["max_native_pixel_frames"], 1920 * 1088 * 192)
-        self.assertEqual(options["advanced_limits"]["dimension_max"], 1920)
+        self.assertEqual(options["duration"]["max_by_resolution"]["1080p"], 15)
+        self.assertEqual(options["duration"]["max_by_preset"]["1080p"]["16:9"], 15)
+        self.assertEqual(options["duration"]["max_by_preset"]["1080p"]["4:3"], 15)
+        self.assertEqual(options["duration"]["max_by_preset"]["1080p"]["1:1"], 15)
+        self.assertEqual(options["duration"]["max_by_preset"]["2k"]["16:9"], 15)
+        self.assertEqual(options["duration"]["max_native_pixel_frames"], 2560 * 1440 * 362)
+        self.assertEqual(options["advanced_limits"]["dimension_max"], 2560)
 
     def test_default_is_balanced_9_actual_11_forecast(self) -> None:
         spec = GenerationSpec.from_mapping({"prompt": "test", "seed": 1})
@@ -328,6 +503,7 @@ class ContractTest(unittest.TestCase):
     def test_upscale_contract_preserves_ratio_and_round_trips(self) -> None:
         self.assertEqual(resolve_upscale_geometry(864, 480, "1080p"), (1944, 1080))
         self.assertEqual(resolve_upscale_geometry(1280, 720, "2k"), (2560, 1440))
+        self.assertEqual(resolve_upscale_geometry(1280, 720, "1440p"), (2560, 1440))
         spec = GenerationSpec.from_mapping({
             "prompt": "upscale", "seed": 1, "upscale_enabled": True,
             "upscale_mode": "basic", "upscale_resolution": "1080p",
@@ -379,7 +555,7 @@ class ContractTest(unittest.TestCase):
         restored = GenerationSpec.from_mapping(spec.to_dict(include_execution=True))
         self.assertEqual(restored, spec)
 
-    def test_advanced_lora_and_4090_safety_bounds(self) -> None:
+    def test_advanced_lora_and_native_2k_safety_bounds(self) -> None:
         spec = GenerationSpec.from_mapping({
             "prompt": "advanced turbo", "engine": "lora", "advanced": "true",
             "width": 864, "height": 480, "frames": 124, "lora_steps": 7,
@@ -392,10 +568,30 @@ class ContractTest(unittest.TestCase):
                 "prompt": "bad grid", "advanced": True, "width": 850,
                 "height": 480, "frames": 124, "actual_steps": 9,
             })
+
+    def test_2k_is_internal_second_sampling_geometry_not_public_first_pass(self) -> None:
+        payload = {
+            "prompt": "persisted H3 second sampling target",
+            "engine": "original",
+            "mode": "advanced",
+            "width": 2560,
+            "height": 1440,
+            "frames": 362,
+            "duration_seconds": 362 / 24,
+            "actual_steps": 20,
+            "weight_tier": "int8",
+            "vram_profile": "24gb",
+        }
+        with self.assertRaises(ContractError):
+            GenerationSpec.from_mapping(payload)
+        restored = GenerationSpec.from_mapping(
+            payload, allow_second_sampling_target=True
+        )
+        self.assertEqual((restored.width, restored.height), (2560, 1440))
         with self.assertRaises(ContractError):
             GenerationSpec.from_mapping({
-                "prompt": "too many pixels", "advanced": True, "width": 1280,
-                "height": 1280, "frames": 124, "actual_steps": 9,
+                "prompt": "too many pixels", "advanced": True, "width": 2560,
+                "height": 1472, "frames": 124, "actual_steps": 9,
             })
         with self.assertRaises(ContractError):
             GenerationSpec.from_mapping({

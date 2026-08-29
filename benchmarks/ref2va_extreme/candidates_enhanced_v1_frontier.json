@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "anchor": "ref2va_multiref_8s_enhanced_v1.json",
+  "purpose": "Dense-kernel Ref2VA forecast frontier; retain every output for Human review.",
+  "candidates": [
+    {
+      "version": "f00_warmup_2_18_not_for_review",
+      "actual_steps": [0, 1],
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": true
+    },
+    {
+      "version": "f07_dense_forecast7_13_review",
+      "actual_steps": [0, 1, 2, 3, 6, 11, 19],
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": true
+    },
+    {
+      "version": "f06_dense_forecast6_14_review",
+      "actual_steps": [0, 1, 2, 4, 9, 19],
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": true
+    }
+  ]
+}

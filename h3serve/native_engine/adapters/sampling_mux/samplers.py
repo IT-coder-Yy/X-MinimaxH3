@@ -171,6 +171,298 @@ class ResMultistepAVSampler:
         return video, audio
 
 
+def _flow_half_log_snr(sigma: float) -> float:
+    """Return ComfyUI's half-logSNR for ``ModelSamplingDiscreteFlow``.
+
+    Unlike the ``CONST`` flow parameterization, H3's discrete-flow sampler
+    treats the solver state as unit-alpha data prediction.  SA-Solver therefore
+    uses ``-log(sigma)`` here; using ``log((1-sigma)/sigma)`` silently changes
+    every Adams coefficient.
+    """
+
+    if sigma <= 0.0:
+        return math.inf
+    return -math.log(sigma)
+
+
+def _flow_percent_to_sigma(percent: float, shift: float) -> float:
+    if percent <= 0.0:
+        return 1.0
+    if percent >= 1.0:
+        return 0.0
+    timestep = 1.0 - percent
+    return shift * timestep / (1.0 + (shift - 1.0) * timestep)
+
+
+def _sa_coefficients(
+    *,
+    sigma_next: float,
+    lambdas: tuple[float, ...],
+    lambda_start: float,
+    lambda_stop: float,
+    tau: float,
+) -> tuple[float, ...]:
+    """Compute SA-Solver's exponential Adams coefficients.
+
+    This is an independent AV adaptation of the Stochastic Adams equations
+    used by ComfyUI's standard ``sa_solver``.  The coefficient solve is tiny
+    (at most 4x4) and remains on CPU; only the resulting scalars touch the H3
+    video/audio tensors.
+    """
+
+    import torch
+
+    order = len(lambdas)
+    if order <= 0:
+        raise ValueError("SA-Solver requires at least one prediction")
+    dtype = torch.float64
+    device = "cpu"
+    start = torch.tensor(lambda_start, dtype=dtype, device=device)
+    stop = torch.tensor(lambda_stop, dtype=dtype, device=device)
+    tau_multiplier = 1.0 + tau * tau
+    depth = torch.arange(order, dtype=dtype, device=device)
+    product = stop.pow(depth) - start.pow(depth) * torch.exp(
+        -tau_multiplier * (stop - start)
+    )
+    recursive_depth = depth.unsqueeze(1) - depth.unsqueeze(0)
+    log_factorial = torch.lgamma(depth + 1.0)
+    recursive = log_factorial.unsqueeze(1) - log_factorial.unsqueeze(0)
+    if tau > 0.0:
+        recursive = recursive - recursive_depth * math.log(tau_multiplier)
+    signs = torch.where(
+        torch.remainder(recursive_depth, 2.0) == 0.0,
+        torch.ones_like(recursive_depth),
+        -torch.ones_like(recursive_depth),
+    )
+    exponential_integrals = (recursive.exp() * signs).tril() @ product
+    lambda_tensor = torch.tensor(lambdas, dtype=dtype, device=device)
+    vandermonde_t = torch.vander(
+        lambda_tensor, N=order, increasing=True
+    ).transpose(0, 1)
+    lagrange_integrals = torch.linalg.solve(
+        vandermonde_t, exponential_integrals
+    )
+    alpha_next = sigma_next * math.exp(lambda_stop)
+    return tuple(float(value) for value in alpha_next * lagrange_integrals)
+
+
+def _linear_combination(values: list[Any], coefficients: tuple[float, ...]) -> Any:
+    if not values or len(values) != len(coefficients):
+        raise ValueError("SA-Solver history and coefficients disagree")
+    result = values[0] * coefficients[0]
+    for value, coefficient in zip(values[1:], coefficients[1:]):
+        result = result + value * coefficient
+    return result
+
+
+class SASolverAVSampler:
+    """Stochastic Adams predictor-corrector for synchronized H3 AV latents.
+
+    The implementation follows the standard ``sa_solver`` operating point:
+    predictor order 3, corrector order 4, PECE disabled, and stochasticity in
+    the 20%-80% flow-time interval.  H3 second sampling normally starts near
+    the low-noise boundary, so the common denoise=0.20 path is deterministic.
+    """
+
+    name = "sa_solver"
+
+    def __init__(self, *, predictor_order: int = 3, corrector_order: int = 4) -> None:
+        if predictor_order <= 0 or corrector_order <= 0:
+            raise ValueError("SA-Solver orders must be positive")
+        self.predictor_order = int(predictor_order)
+        self.corrector_order = int(corrector_order)
+
+    def sample(
+        self,
+        video: Any,
+        audio: Any,
+        plan: SamplingPlan,
+        predict: AVPredictor,
+        *,
+        cancel_check: CancelCheck = lambda: None,
+        callback: StepCallback | None = None,
+        transition: StepTransition | None = None,
+        initial_previous_video: Any | None = None,
+        initial_previous_audio: Any | None = None,
+        initial_previous_video_sigma: float | None = None,
+        initial_previous_audio_sigma: float | None = None,
+    ) -> tuple[Any, Any]:
+        if transition is not None or any(
+            value is not None
+            for value in (
+                initial_previous_video,
+                initial_previous_audio,
+                initial_previous_video_sigma,
+                initial_previous_audio_sigma,
+            )
+        ):
+            raise ValueError(
+                "SA-Solver second sampling does not support RES history or transitions"
+            )
+        if tuple(plan.actual_step_indices) != tuple(
+            range(plan.step_index_offset, plan.step_index_offset + plan.step_count)
+        ):
+            raise ValueError("SA-Solver requires every refinement step to run the DiT")
+
+        import torch
+
+        sigmas = tuple(float(value) for value in plan.video_sigmas)
+        if plan.audio_sigmas != plan.video_sigmas:
+            raise ValueError("SA-Solver requires the synchronized H3 AV clock")
+        lambdas = tuple(_flow_half_log_snr(value) for value in sigmas)
+        maximum_order = max(self.predictor_order, self.corrector_order)
+        predicted_video = video
+        predicted_audio = audio
+        video_predictions: list[Any] = []
+        audio_predictions: list[Any] = []
+        previous_h = 0.0
+        previous_tau = 0.0
+        previous_video_noise: Any | None = None
+        previous_audio_noise: Any | None = None
+        generator = torch.Generator(device=video.device)
+        # Match ComfyUI's default_noise_sampler exactly.  It offsets CPU seeds
+        # by one while CUDA generators use the request seed directly.
+        generator_seed = int(plan.seed)
+        if video.device.type == "cpu":
+            generator_seed += 1
+        generator.manual_seed(generator_seed & ((1 << 63) - 1))
+        stochastic_start = _flow_percent_to_sigma(0.20, plan.video_shift)
+        stochastic_stop = _flow_percent_to_sigma(0.80, plan.video_shift)
+
+        for index in range(plan.step_count):
+            cancel_check()
+            clock = plan.clock(index)
+            prediction = predict(
+                predicted_video,
+                predicted_audio,
+                clock,
+                step_index=clock.index,
+                is_actual_step=True,
+            )
+            video_predictions.append(prediction.video_denoised)
+            audio_predictions.append(prediction.audio_denoised)
+            video_predictions = video_predictions[-maximum_order:]
+            audio_predictions = audio_predictions[-maximum_order:]
+
+            next_sigma = sigmas[index + 1]
+            predictor_order = min(self.predictor_order, len(video_predictions))
+            corrector_order = (
+                0
+                if index == 0 or next_sigma == 0.0
+                else min(self.corrector_order, len(video_predictions))
+            )
+            # The zero endpoint lowers the method order near completion, as in
+            # the upstream implementation, to avoid an unstable terminal fit.
+            predictor_order = min(
+                predictor_order, max(1, len(sigmas) - 2 - index)
+            )
+            corrector_order = min(
+                corrector_order, max(0, len(sigmas) - 1 - index)
+            )
+
+            if corrector_order == 0:
+                video = predicted_video
+                audio = predicted_audio
+            else:
+                history_lambdas = lambdas[
+                    index - corrector_order + 1 : index + 1
+                ]
+                coefficients = _sa_coefficients(
+                    sigma_next=sigmas[index],
+                    lambdas=history_lambdas,
+                    lambda_start=lambdas[index - 1],
+                    lambda_stop=lambdas[index],
+                    tau=previous_tau,
+                )
+                scale = (
+                    sigmas[index]
+                    / sigmas[index - 1]
+                    * math.exp(-(previous_tau * previous_tau) * previous_h)
+                )
+                video = scale * video + _linear_combination(
+                    video_predictions[-corrector_order:], coefficients
+                )
+                audio = scale * audio + _linear_combination(
+                    audio_predictions[-corrector_order:], coefficients
+                )
+                if previous_tau > 0.0:
+                    assert previous_video_noise is not None
+                    assert previous_audio_noise is not None
+                    video = video + previous_video_noise
+                    audio = audio + previous_audio_noise
+
+            if next_sigma == 0.0:
+                predicted_video = prediction.video_denoised
+                predicted_audio = prediction.audio_denoised
+                previous_video_noise = None
+                previous_audio_noise = None
+            else:
+                tau = (
+                    1.0
+                    if stochastic_stop <= next_sigma <= stochastic_start
+                    else 0.0
+                )
+                history_lambdas = lambdas[
+                    index - predictor_order + 1 : index + 1
+                ]
+                coefficients = _sa_coefficients(
+                    sigma_next=next_sigma,
+                    lambdas=history_lambdas,
+                    lambda_start=lambdas[index],
+                    lambda_stop=lambdas[index + 1],
+                    tau=tau,
+                )
+                previous_h = lambdas[index + 1] - lambdas[index]
+                scale = (
+                    next_sigma
+                    / sigmas[index]
+                    * math.exp(-(tau * tau) * previous_h)
+                )
+                predicted_video = scale * video + _linear_combination(
+                    video_predictions[-predictor_order:], coefficients
+                )
+                predicted_audio = scale * audio + _linear_combination(
+                    audio_predictions[-predictor_order:], coefficients
+                )
+                if tau > 0.0:
+                    noise_scale = next_sigma * math.sqrt(
+                        -math.expm1(-2.0 * tau * tau * previous_h)
+                    )
+                    if video.shape[0] != audio.shape[0]:
+                        raise ValueError("SA-Solver requires equal AV batch sizes")
+                    batch = int(video.shape[0])
+                    video_width = video.numel() // batch
+                    audio_width = audio.numel() // batch
+                    # The reference sampler draws one packed AV noise tensor.
+                    # Drawing video and audio separately is not numerically
+                    # equivalent (even with the same generator), because the
+                    # random kernel may consume a shape-dependent sequence.
+                    packed_noise = torch.randn(
+                        (batch, video_width + audio_width),
+                        dtype=video.dtype,
+                        layout=video.layout,
+                        device=video.device,
+                        generator=generator,
+                    )
+                    previous_video_noise = packed_noise[
+                        :, :video_width
+                    ].reshape_as(video) * noise_scale
+                    previous_audio_noise = packed_noise[
+                        :, video_width:
+                    ].reshape_as(audio).to(dtype=audio.dtype) * noise_scale
+                    predicted_video = predicted_video + previous_video_noise
+                    predicted_audio = predicted_audio + previous_audio_noise
+                else:
+                    previous_video_noise = None
+                    previous_audio_noise = None
+                previous_tau = tau
+
+            if callback is not None:
+                callback(clock.index, clock, predicted_video, predicted_audio)
+
+        return predicted_video, predicted_audio
+
+
 class TurboClockMode(str, Enum):
     """How the Turbo predictor represents its audio denoised estimate."""
 
@@ -274,9 +566,11 @@ def create_sampler(
     name: str,
     *,
     turbo_clock_mode: TurboClockMode = TurboClockMode.DUAL_SHIFT,
-) -> ResMultistepAVSampler | TurboAVSampler:
+) -> ResMultistepAVSampler | SASolverAVSampler | TurboAVSampler:
     if name == ResMultistepAVSampler.name:
         return ResMultistepAVSampler()
     if name == TurboAVSampler.name:
         return TurboAVSampler(turbo_clock_mode)
+    if name == SASolverAVSampler.name:
+        return SASolverAVSampler()
     raise ValueError(f"unsupported native H3 sampler: {name!r}")

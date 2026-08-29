@@ -11,6 +11,7 @@ from .mux import (
 from .samplers import (
     AVPrediction,
     ResMultistepAVSampler,
+    SASolverAVSampler,
     TurboAVSampler,
     TurboClockMode,
     create_sampler,
@@ -20,6 +21,7 @@ from .scheduler import (
     H3SimpleScheduler,
     SamplingPlan,
     StepClock,
+    refinement_sigma_schedule,
     simple_sigma_schedule,
 )
 
@@ -31,6 +33,7 @@ __all__ = [
     "MediaProbe",
     "MuxConfig",
     "ResMultistepAVSampler",
+    "SASolverAVSampler",
     "SamplingPlan",
     "StepClock",
     "TurboAVSampler",
@@ -39,5 +42,6 @@ __all__ = [
     "normalize_h3_audio_loudness",
     "probe_media",
     "probe_media_metadata",
+    "refinement_sigma_schedule",
     "simple_sigma_schedule",
 ]

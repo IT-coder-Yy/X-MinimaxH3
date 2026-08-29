@@ -39,13 +39,18 @@ class H3WorkloadAnalyzer:
         actual_evaluations: int,
         forecast_evaluations: int = 0,
         condition_tokens_override: int | None = None,
+        latent_frames_override: int | None = None,
+        audio_frames_override: int | None = None,
     ) -> WorkloadFeatures:
         if width <= 0 or height <= 0 or width % 32 or height % 32:
             raise ValueError("H3 width and height must be positive multiples of 32")
         if text_tokens <= 0:
             raise ValueError("text_tokens must be positive")
-        if not 0 <= condition_count <= 9:
-            raise ValueError("condition_count must be between 0 and 9")
+        # Ref2VA publicly accepts 9 images + 3 videos + 3 audios.  Condition
+        # token accounting uses their real encoded sizes through the override;
+        # the count itself must therefore cover the complete 15-item contract.
+        if not 0 <= condition_count <= 15:
+            raise ValueError("condition_count must be between 0 and 15")
         if engine not in ("original", "lora", "reference"):
             raise ValueError(f"unsupported H3 engine: {engine}")
         if actual_evaluations <= 0 or forecast_evaluations < 0:
@@ -53,7 +58,13 @@ class H3WorkloadAnalyzer:
         if engine == "lora" and forecast_evaluations:
             raise ValueError("the distilled LoRA route cannot use forecast evaluations")
 
-        latent_frames = self.video_latent_frames(frames)
+        latent_frames = (
+            self.video_latent_frames(frames)
+            if latent_frames_override is None
+            else int(latent_frames_override)
+        )
+        if latent_frames <= 0:
+            raise ValueError("latent_frames_override must be positive")
         spatial_tokens = (height // 32) * (width // 32)
         video_tokens = latent_frames * spatial_tokens
         condition_tokens = (
@@ -63,7 +74,13 @@ class H3WorkloadAnalyzer:
         )
         if condition_tokens < 0:
             raise ValueError("condition_tokens_override cannot be negative")
-        audio_frames = round((frames / self.fps) * self.audio_latent_hz)
+        audio_frames = (
+            round((frames / self.fps) * self.audio_latent_hz)
+            if audio_frames_override is None
+            else int(audio_frames_override)
+        )
+        if audio_frames <= 0:
+            raise ValueError("audio_frames_override must be positive")
         audio_tokens = 2 * audio_frames
         packed_tokens = text_tokens + video_tokens + condition_tokens + audio_tokens
         return WorkloadFeatures(

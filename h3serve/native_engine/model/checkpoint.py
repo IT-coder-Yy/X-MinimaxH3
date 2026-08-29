@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
 from .config import H3CoreConfig
-from .quantization import ComfyQuantSpec
+from .quantization import ComfyQuantSpec, W4A8QuantSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +42,18 @@ def audit_pruned_convrot_checkpoint(
     quantized = 0
     with _safe_open(path) as checkpoint:
         keys = set(checkpoint.keys())
+        metadata = checkpoint.metadata() or {}
+        raw_quantization = metadata.get("_quantization_metadata")
+        quantization_layers: dict[str, object] = {}
+        if raw_quantization:
+            try:
+                decoded_quantization = json.loads(raw_quantization)
+                layers = decoded_quantization.get("layers", {})
+                if not isinstance(layers, dict):
+                    raise TypeError("layers must be an object")
+                quantization_layers = layers
+            except (json.JSONDecodeError, TypeError, ValueError) as error:
+                issues.append(f"invalid _quantization_metadata: {error}")
 
         def expect(
             key: str, shape: tuple[int, ...], dtypes: tuple[str, ...] | None = None
@@ -116,23 +129,68 @@ def audit_pruned_convrot_checkpoint(
             }
             for name, shape in matrices.items():
                 layer = f"{prefix}.{name}"
-                expect(f"{layer}.weight", shape, ("I8",))
-                expect(f"{layer}.weight_scale", (shape[0], 1), ("F32",))
-                quant_key = f"{layer}.comfy_quant"
-                if quant_key not in keys:
-                    issues.append(f"missing {quant_key}")
+                if f"{layer}.weight_scale" in keys:
+                    expect(f"{layer}.weight", shape, ("I8",))
+                    expect(
+                        f"{layer}.weight_scale", (shape[0], 1), ("F32",)
+                    )
+                    quant_key = f"{layer}.comfy_quant"
+                    if quant_key not in keys:
+                        issues.append(f"missing {quant_key}")
+                        continue
+                    try:
+                        spec = ComfyQuantSpec.decode(
+                            checkpoint.get_tensor(quant_key)
+                        )
+                        spec.validate_supported()
+                        if not spec.convrot:
+                            issues.append(f"{layer}: ConvRot flag is false")
+                        elif shape[1] % spec.convrot_groupsize:
+                            issues.append(
+                                f"{layer}: input width not divisible by ConvRot group"
+                            )
+                        else:
+                            quantized += 1
+                    except Exception as error:
+                        issues.append(f"{quant_key}: {error}")
+                    continue
+
+                raw_spec = quantization_layers.get(layer)
+                if not isinstance(raw_spec, dict):
+                    issues.append(
+                        f"{layer}: missing INT8 tensors and W4A8 metadata"
+                    )
                     continue
                 try:
-                    spec = ComfyQuantSpec.decode(checkpoint.get_tensor(quant_key))
-                    spec.validate_supported()
-                    if not spec.convrot:
-                        issues.append(f"{layer}: ConvRot flag is false")
-                    elif shape[1] % spec.convrot_groupsize:
-                        issues.append(f"{layer}: input width not divisible by ConvRot group")
-                    else:
-                        quantized += 1
+                    w4_spec = W4A8QuantSpec.from_mapping(raw_spec)
+                    w4_spec.validate_supported()
+                    expect(
+                        f"{layer}.weight",
+                        (shape[0], shape[1] // 2),
+                        ("I8",),
+                    )
+                    expect(
+                        f"{layer}.weight_s_rel",
+                        (shape[0], shape[1] // w4_spec.group_size),
+                        ("F8_E4M3", "F32"),
+                    )
+                    expect(
+                        f"{layer}.weight_s_channel",
+                        (shape[0],),
+                        ("F32",),
+                    )
+                    if f"{layer}.weight_codebook" in keys:
+                        expect(
+                            f"{layer}.weight_codebook", (16,), ("F32",)
+                        )
+                    if f"{layer}.weight_correction" in keys:
+                        expect(
+                            f"{layer}.weight_correction",
+                            (shape[1] // w4_spec.group_size, shape[0]),
+                        )
+                    quantized += 1
                 except Exception as error:
-                    issues.append(f"{quant_key}: {error}")
+                    issues.append(f"{layer}: {error}")
         tensor_count = len(keys)
     return CheckpointAudit(
         path=path,

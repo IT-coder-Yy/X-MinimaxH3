@@ -75,6 +75,19 @@ class H3ServeClient:
             content_type=f"multipart/form-data; boundary={boundary}",
         )
 
+    def submit_second_sampling(
+        self, source_job_id: str, fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Queue the same native H3 second-sampling pass as the Web console."""
+
+        body = json.dumps(fields, ensure_ascii=False).encode("utf-8")
+        return self._request(
+            "POST",
+            f"/api/v1/jobs/{source_job_id}/second-sampling",
+            body=body,
+            content_type="application/json",
+        )
+
     def cancel(self, job_id: str) -> None:
         try:
             self._request("DELETE", f"/api/v1/jobs/{job_id}")

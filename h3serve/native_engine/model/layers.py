@@ -9,6 +9,8 @@ batch-one, no-TP, no-distributed serving target.
 from __future__ import annotations
 
 import math
+import os
+from contextlib import nullcontext
 from typing import Callable, TypeAlias
 
 import torch
@@ -17,6 +19,15 @@ import torch.nn.functional as F
 
 AttentionBackend = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 ModulationSegment: TypeAlias = tuple[int, int, int]
+_PROFILE_REGIONS_ENABLED = os.environ.get("H3_NATIVE_PROFILE_REGIONS", "0") == "1"
+
+
+def _profile_region(name: str):
+    """Expose opt-in Kineto regions without taxing production requests."""
+
+    if _PROFILE_REGIONS_ENABLED:
+        return torch.profiler.record_function(name)
+    return nullcontext()
 
 
 class RMSNorm(nn.Module):
@@ -138,6 +149,99 @@ def apply_qknorm_rope(
     return rotate(query), rotate(key)
 
 
+def _apply_single_qknorm_rope(
+    value: torch.Tensor,
+    *,
+    weight: torch.Tensor,
+    frequencies: torch.Tensor,
+    eps: float,
+    query_slot: bool,
+) -> torch.Tensor:
+    """Apply one side of QK-Norm/RoPE with the established kernel order."""
+
+    if frequencies.ndim == 6:
+        rotate_width = int(frequencies.shape[-3]) * 2
+        if value.is_cuda and value.dtype in (torch.float16, torch.bfloat16):
+            from .kernels import current_long_sequence_single_qknorm_rope
+
+            if current_long_sequence_single_qknorm_rope():
+                from .single_qknorm_rope import try_apply_single_qknorm_rope_
+
+                if try_apply_single_qknorm_rope_(
+                    value,
+                    weight=weight.to(device=value.device, dtype=value.dtype),
+                    frequencies=frequencies,
+                    eps=eps,
+                ):
+                    return value
+            from comfy_kitchen import rms_rope_split_half_
+
+            value_4d = value.unsqueeze(0)
+            scratch = torch.empty_like(value_4d)
+            normalized_weight = weight.to(device=value.device, dtype=value.dtype)
+            if query_slot:
+                rms_rope_split_half_(
+                    value_4d,
+                    scratch,
+                    frequencies,
+                    normalized_weight,
+                    normalized_weight,
+                    epsilon=eps,
+                    rot_dim=rotate_width,
+                )
+            else:
+                rms_rope_split_half_(
+                    scratch,
+                    value_4d,
+                    frequencies,
+                    normalized_weight,
+                    normalized_weight,
+                    epsilon=eps,
+                    rot_dim=rotate_width,
+                )
+            return value_4d[0]
+
+        value = F.rms_norm(
+            value,
+            (value.shape[-1],),
+            weight=weight.to(value.dtype),
+            eps=eps,
+        )
+        half_width = rotate_width // 2
+        first = value[..., :half_width]
+        second = value[..., half_width:rotate_width]
+        table = frequencies[0, :, 0].to(value.dtype)
+        out_first = (
+            first * table[:, None, :, 0, 0]
+            + second * table[:, None, :, 0, 1]
+        )
+        out_second = (
+            first * table[:, None, :, 1, 0]
+            + second * table[:, None, :, 1, 1]
+        )
+        return torch.cat(
+            (out_first, out_second, value[..., rotate_width:]), dim=-1
+        )
+
+    value = F.rms_norm(
+        value,
+        (value.shape[-1],),
+        weight=weight.to(dtype=value.dtype),
+        eps=eps,
+    )
+    rotate_width = int(frequencies.shape[-1])
+    half = rotate_width // 2
+    cosine = torch.cos(frequencies[:, :half]).to(value.dtype)
+    sine = torch.sin(frequencies[:, :half]).to(value.dtype)
+    cosine = torch.cat((cosine, cosine), dim=-1).unsqueeze(1)
+    sine = torch.cat((sine, sine), dim=-1).unsqueeze(1)
+    active, passthrough = value[..., :rotate_width], value[..., rotate_width:]
+    first, second = active.chunk(2, dim=-1)
+    perpendicular = torch.cat((-second, first), dim=-1)
+    active = active * cosine + perpendicular * sine
+    return torch.cat((active, passthrough), dim=-1)
+
+
 def torch_sdpa(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
     q = query.transpose(0, 1).unsqueeze(0)
     k = key.transpose(0, 1).unsqueeze(0)
@@ -194,6 +298,596 @@ class FusedQKVAttention(nn.Module):
             key = self.k_norm(key)
         attended = self.backend(query, key, val).reshape(value.shape[0], self.inner_width)
         return self.out_proj(attended)
+
+    def stream_gated_residual_(
+        self,
+        residual: torch.Tensor,
+        hidden: torch.Tensor,
+        frequencies: torch.Tensor | None,
+        gate: torch.Tensor,
+        modulation_segments: tuple[ModulationSegment, ...],
+        *,
+        query_chunk_tokens: int,
+        projection_chunk_tokens: int = 8192,
+    ) -> bool:
+        """Run one memory-bounded fixed-TopK layer and update ``residual``.
+
+        The normal fused projection deliberately materializes one
+        ``[L, 3*attention_width]`` allocation.  At the 220k-token 1080p/15s
+        shape that tensor alone is 8.8 GiB and overlaps Sparge's selector.
+        This route projects modest row chunks into separately owned K/V
+        tensors, drops unquantized V before K pooling, then recomputes Query in
+        bounded chunks and immediately applies each output chunk's gated
+        residual.  Avoiding a sequence-long Query costs one extra row-local
+        QKV pass but leaves headroom for request-dependent reference prefixes.
+        No sampler or model-weight math is changed; unsupported physical
+        backends fail closed to the old path.
+        """
+
+        if query_chunk_tokens < 128 or query_chunk_tokens % 128:
+            raise ValueError("streamed Attention chunks must be multiples of 128")
+        if projection_chunk_tokens <= 0:
+            raise ValueError("streamed projection chunks must be positive")
+        projection_chunk_tokens = min(
+            int(projection_chunk_tokens), query_chunk_tokens
+        )
+        from .kernels import _resolve_long_sequence_physical_backend
+
+        physical = _resolve_long_sequence_physical_backend(
+            self.backend, int(hidden.shape[0])
+        )
+        if physical is None:
+            return False
+        prepare_values = getattr(physical, "prepare_long_sequence_values", None)
+        prepare_keys = getattr(physical, "prepare_long_sequence_keys", None)
+        prefix_attention = getattr(
+            physical, "long_sequence_prefix_queries", None
+        )
+        video_attention = getattr(physical, "long_sequence_video_queries", None)
+        if any(
+            method is None
+            for method in (
+                prepare_values,
+                prepare_keys,
+                prefix_attention,
+                video_attention,
+            )
+        ):
+            return False
+        if residual.shape != hidden.shape or hidden.ndim != 2:
+            raise ValueError("streamed Attention requires aligned rank-two hidden state")
+        sequence = int(hidden.shape[0])
+        from .kernels import (
+            current_attention_protected_prefix,
+            current_attention_video_layout,
+        )
+
+        segment_prefix = int(modulation_segments[-1][0])
+        layout_prefix = current_attention_protected_prefix()
+        protected_tokens = layout_prefix if layout_prefix > 0 else segment_prefix
+        if layout_prefix > 0 and layout_prefix != segment_prefix:
+            raise ValueError(
+                "packed layout prefix does not match the generated-video "
+                "modulation segment"
+            )
+        if not 0 < protected_tokens < sequence:
+            return False
+        video_layout = current_attention_video_layout()
+        if video_layout is not None:
+            latent_frames, frame_tokens = video_layout
+            if protected_tokens + latent_frames * frame_tokens != sequence:
+                raise ValueError(
+                    "request-local video geometry does not cover the packed "
+                    "sequence"
+                )
+
+        from .kernels import (
+            current_long_sequence_compact_kv,
+            current_long_sequence_direct_hnd_fp8_value,
+            current_long_sequence_direct_nhd_kv,
+            current_long_sequence_fused_qknorm_hnd_layout,
+        )
+
+        from .long_sequence_contract import (
+            resolve_physical_long_sequence_contract,
+        )
+
+        physical_contract = resolve_physical_long_sequence_contract(
+            physical,
+            compact_kv=current_long_sequence_compact_kv(),
+            direct_nhd_kv_requested=current_long_sequence_direct_nhd_kv(),
+            fused_qknorm_hnd_requested=(
+                current_long_sequence_fused_qknorm_hnd_layout()
+            ),
+            direct_hnd_fp8_value_requested=(
+                current_long_sequence_direct_hnd_fp8_value()
+            ),
+        )
+        kv_layout = physical_contract.kv_layout
+        if kv_layout == "HND":
+            kv_shape = (1, self.num_heads, sequence, self.head_dim)
+        elif kv_layout == "NHD":
+            kv_shape = (1, sequence, self.num_heads, self.head_dim)
+        fused_qknorm_hnd_layout = (
+            physical_contract.fused_qknorm_hnd_layout
+        )
+        expected = 3 * self.inner_width
+        from .kernels import (
+            current_long_sequence_shared_qkv_quantization,
+            current_long_sequence_split_qkv_outputs,
+        )
+
+        output_slice = getattr(self.qkv_proj, "forward_output_slice", None)
+        split_qkv = (
+            current_long_sequence_split_qkv_outputs()
+            and callable(output_slice)
+        )
+        compact_kv = current_long_sequence_compact_kv()
+        if compact_kv and not split_qkv:
+            raise RuntimeError(
+                "compact K/V requires output-sliced Q/K/V projection"
+            )
+        prepare_output_slices = getattr(
+            self.qkv_proj, "prepare_output_slices", None
+        )
+        prepared_output_slice = getattr(
+            self.qkv_proj, "forward_prepared_output_slice", None
+        )
+        shared_qkv_quantization = bool(
+            split_qkv
+            and current_long_sequence_shared_qkv_quantization()
+            and callable(prepare_output_slices)
+            and callable(prepared_output_slice)
+        )
+        prepared_qkv_input = None
+        if shared_qkv_quantization:
+            with _profile_region("h3_long_shared_qkv_quantize"):
+                prepared_qkv_input = prepare_output_slices(hidden)
+
+        def project_kv_chunk(start: int, stop: int):
+            """Project and normalize one row slab for either K/V build."""
+
+            with _profile_region("h3_long_kv_qkv_projection"):
+                if prepared_qkv_input is None:
+                    kv_chunk = output_slice(
+                        hidden[start:stop], self.inner_width, expected
+                    )
+                else:
+                    kv_chunk = prepared_output_slice(
+                        hidden,
+                        prepared_qkv_input,
+                        start,
+                        stop,
+                        self.inner_width,
+                        expected,
+                    )
+            if kv_chunk.shape[-1] != 2 * self.inner_width:
+                raise ValueError("split K/V projection has invalid width")
+            k_chunk, v_chunk = kv_chunk.split(self.inner_width, dim=-1)
+            chunk_shape = (stop - start, self.num_heads, self.head_dim)
+            k_chunk = k_chunk.view(chunk_shape)
+            v_chunk = v_chunk.view(chunk_shape).to(
+                getattr(physical, "long_sequence_value_dtype", hidden.dtype)
+            )
+            if frequencies is None or not frequencies.shape[-1]:
+                k_chunk = self.k_norm(k_chunk)
+            else:
+                chunk_frequencies = (
+                    frequencies[:, start:stop]
+                    if frequencies.ndim == 6
+                    else frequencies[start:stop]
+                )
+                k_chunk = _apply_single_qknorm_rope(
+                    k_chunk,
+                    weight=self.k_norm.weight,
+                    frequencies=chunk_frequencies,
+                    eps=self.k_norm.eps,
+                    query_slot=False,
+                )
+            return kv_chunk, k_chunk, v_chunk
+
+        if compact_kv:
+            begin_compact = getattr(
+                physical, "begin_compact_long_sequence_kv", None
+            )
+            if not callable(begin_compact):
+                return False
+            key_sum = torch.zeros(
+                (self.num_heads, self.head_dim),
+                device=hidden.device,
+                dtype=torch.float32,
+            )
+            value_absmax = torch.zeros(
+                (self.num_heads, self.head_dim),
+                device=hidden.device,
+                dtype=torch.float32,
+            )
+            for start in range(0, sequence, projection_chunk_tokens):
+                stop = min(sequence, start + projection_chunk_tokens)
+                kv_chunk, k_chunk, v_chunk = project_kv_chunk(start, stop)
+                with _profile_region("h3_long_compact_kv_statistics"):
+                    key_sum.add_(k_chunk.detach().float().sum(dim=0))
+                    torch.maximum(
+                        value_absmax,
+                        v_chunk.detach().float().abs().amax(dim=0),
+                        out=value_absmax,
+                    )
+                del kv_chunk, k_chunk, v_chunk
+            key_mean = key_sum.div_(sequence)
+            builder = begin_compact(
+                key_tokens=sequence,
+                heads=self.num_heads,
+                head_dim=self.head_dim,
+                key_mean=key_mean,
+                value_absmax=value_absmax,
+                device=hidden.device,
+            )
+            del key_sum, key_mean, value_absmax
+            for start in range(0, sequence, projection_chunk_tokens):
+                stop = min(sequence, start + projection_chunk_tokens)
+                kv_chunk, k_chunk, v_chunk = project_kv_chunk(start, stop)
+                with _profile_region("h3_long_compact_kv_quantize"):
+                    builder.add(start, k_chunk, v_chunk)
+                del kv_chunk, k_chunk, v_chunk
+            prepared = builder.finish()
+            del builder
+        else:
+            key_hnd = torch.empty(
+                kv_shape, device=hidden.device, dtype=torch.bfloat16
+            )
+            value_hnd = torch.empty(
+                kv_shape,
+                device=hidden.device,
+                dtype=getattr(physical, "long_sequence_value_dtype", hidden.dtype),
+            )
+        projection_starts = (
+            ()
+            if compact_kv
+            else range(0, sequence, projection_chunk_tokens)
+        )
+        for start in projection_starts:
+            stop = min(sequence, start + projection_chunk_tokens)
+            with _profile_region("h3_long_kv_qkv_projection"):
+                if split_qkv:
+                    if prepared_qkv_input is None:
+                        kv_chunk = output_slice(
+                            hidden[start:stop], self.inner_width, expected
+                        )
+                    else:
+                        kv_chunk = prepared_output_slice(
+                            hidden,
+                            prepared_qkv_input,
+                            start,
+                            stop,
+                            self.inner_width,
+                            expected,
+                        )
+                else:
+                    qkv = self.qkv_proj(hidden[start:stop])
+            if split_qkv:
+                if kv_chunk.shape[-1] != 2 * self.inner_width:
+                    raise ValueError("split K/V projection has invalid width")
+                k_chunk, v_chunk = kv_chunk.split(self.inner_width, dim=-1)
+            else:
+                if qkv.shape[-1] != expected:
+                    raise ValueError(
+                        f"fused QKV output width {qkv.shape[-1]} != {expected}"
+                    )
+                q_chunk, k_chunk, v_chunk = qkv.split(self.inner_width, dim=-1)
+            chunk_shape = (stop - start, self.num_heads, self.head_dim)
+            k_chunk = k_chunk.view(chunk_shape)
+            v_chunk = v_chunk.view(chunk_shape)
+            key_laid_out = False
+            if split_qkv:
+                if frequencies is None or not frequencies.shape[-1]:
+                    k_chunk = self.k_norm(k_chunk)
+                else:
+                    chunk_frequencies = (
+                        frequencies[:, start:stop]
+                        if frequencies.ndim == 6
+                        else frequencies[start:stop]
+                    )
+                    if fused_qknorm_hnd_layout:
+                        from .single_qknorm_rope import (
+                            try_apply_single_qknorm_rope_to_hnd,
+                        )
+
+                        key_destination = key_hnd[
+                            0, :, start:stop
+                        ].permute(1, 0, 2)
+                        key_laid_out = try_apply_single_qknorm_rope_to_hnd(
+                            k_chunk,
+                            key_destination,
+                            weight=self.k_norm.weight.to(
+                                device=k_chunk.device,
+                                dtype=k_chunk.dtype,
+                            ),
+                            frequencies=chunk_frequencies,
+                            eps=self.k_norm.eps,
+                        )
+                        del key_destination
+                    if not key_laid_out:
+                        k_chunk = _apply_single_qknorm_rope(
+                            k_chunk,
+                            weight=self.k_norm.weight,
+                            frequencies=chunk_frequencies,
+                            eps=self.k_norm.eps,
+                            query_slot=False,
+                        )
+            else:
+                q_chunk = q_chunk.view(chunk_shape)
+                if frequencies is None or not frequencies.shape[-1]:
+                    q_chunk = self.q_norm(q_chunk)
+                    k_chunk = self.k_norm(k_chunk)
+                else:
+                    chunk_frequencies = (
+                        frequencies[:, start:stop]
+                        if frequencies.ndim == 6
+                        else frequencies[start:stop]
+                    )
+                    q_chunk, k_chunk = apply_qknorm_rope(
+                        q_chunk,
+                        k_chunk,
+                        q_weight=self.q_norm.weight,
+                        k_weight=self.k_norm.weight,
+                        frequencies=chunk_frequencies,
+                        eps=self.q_norm.eps,
+                    )
+            if kv_layout == "HND":
+                if not key_laid_out:
+                    key_hnd[0, :, start:stop].copy_(
+                        k_chunk.permute(1, 0, 2)
+                    )
+                value_hnd[0, :, start:stop].copy_(v_chunk.permute(1, 0, 2))
+            else:
+                key_hnd[0, start:stop].copy_(k_chunk)
+                value_hnd[0, start:stop].copy_(v_chunk)
+            if split_qkv:
+                del kv_chunk, k_chunk, v_chunk
+            else:
+                del qkv, q_chunk, k_chunk, v_chunk
+
+        if not compact_kv:
+            with _profile_region("h3_long_prepare_value"):
+                if physical_contract.direct_hnd_fp8_value:
+                    from .compact_fp8 import prepare_sage_fp8_hnd_direct
+
+                    heads = int(value_hnd.shape[1])
+                    key_tokens = int(value_hnd.shape[2])
+                    head_dim = int(value_hnd.shape[3])
+                    value_fp8, value_scale = prepare_sage_fp8_hnd_direct(
+                        value_hnd
+                    )
+                else:
+                    value_fp8, value_scale, heads, key_tokens, head_dim = (
+                        prepare_values(value_hnd)
+                    )
+            del value_hnd
+            if (
+                heads != self.num_heads
+                or key_tokens != sequence
+                or head_dim != self.head_dim
+            ):
+                raise ValueError(
+                    "prepared long-sequence V metadata is inconsistent"
+                )
+            with _profile_region("h3_long_prepare_key"):
+                prepared = prepare_keys(key_hnd, value_fp8, value_scale)
+            del key_hnd
+
+        def project_queries(start: int, stop: int) -> torch.Tensor:
+            """Recompute only one live Query range with exact row-local math."""
+
+            from .kernels import current_long_sequence_fused_query_projection
+
+            if split_qkv and current_long_sequence_fused_query_projection():
+                with _profile_region("h3_long_query_qkv_projection"):
+                    if prepared_qkv_input is None:
+                        q_chunk = output_slice(
+                            hidden[start:stop], 0, self.inner_width
+                        )
+                    else:
+                        q_chunk = prepared_output_slice(
+                            hidden,
+                            prepared_qkv_input,
+                            start,
+                            stop,
+                            0,
+                            self.inner_width,
+                        )
+                chunk_shape = (
+                    stop - start,
+                    self.num_heads,
+                    self.head_dim,
+                )
+                q_chunk = q_chunk.view(chunk_shape)
+                if frequencies is None or not frequencies.shape[-1]:
+                    q_chunk = self.q_norm(q_chunk)
+                else:
+                    chunk_frequencies = (
+                        frequencies[:, start:stop]
+                        if frequencies.ndim == 6
+                        else frequencies[start:stop]
+                    )
+                    if fused_qknorm_hnd_layout:
+                        from .single_qknorm_rope import (
+                            try_apply_single_qknorm_rope_to_hnd,
+                        )
+
+                        query_hnd = torch.empty(
+                            (
+                                self.num_heads,
+                                stop - start,
+                                self.head_dim,
+                            ),
+                            device=q_chunk.device,
+                            dtype=q_chunk.dtype,
+                        )
+                        query_nhd_view = query_hnd.permute(1, 0, 2)
+                        if try_apply_single_qknorm_rope_to_hnd(
+                            q_chunk,
+                            query_nhd_view,
+                            weight=self.q_norm.weight.to(
+                                device=q_chunk.device,
+                                dtype=q_chunk.dtype,
+                            ),
+                            frequencies=chunk_frequencies,
+                            eps=self.q_norm.eps,
+                        ):
+                            del q_chunk, query_hnd
+                            return query_nhd_view
+                        del query_nhd_view, query_hnd
+                    q_chunk = _apply_single_qknorm_rope(
+                        q_chunk,
+                        weight=self.q_norm.weight,
+                        frequencies=chunk_frequencies,
+                        eps=self.q_norm.eps,
+                        query_slot=True,
+                    )
+                return q_chunk
+
+            query = torch.empty(
+                (stop - start, self.num_heads, self.head_dim),
+                device=hidden.device,
+                dtype=hidden.dtype,
+            )
+            for chunk_start in range(start, stop, projection_chunk_tokens):
+                chunk_stop = min(stop, chunk_start + projection_chunk_tokens)
+                with _profile_region("h3_long_query_qkv_projection"):
+                    if split_qkv:
+                        if prepared_qkv_input is None:
+                            q_chunk = output_slice(
+                                hidden[chunk_start:chunk_stop],
+                                0,
+                                self.inner_width,
+                            )
+                        else:
+                            q_chunk = prepared_output_slice(
+                                hidden,
+                                prepared_qkv_input,
+                                chunk_start,
+                                chunk_stop,
+                                0,
+                                self.inner_width,
+                            )
+                    else:
+                        qkv = self.qkv_proj(hidden[chunk_start:chunk_stop])
+                if not split_qkv:
+                    q_chunk, k_chunk, v_chunk = qkv.split(
+                        self.inner_width, dim=-1
+                    )
+                chunk_shape = (
+                    chunk_stop - chunk_start,
+                    self.num_heads,
+                    self.head_dim,
+                )
+                q_chunk = q_chunk.view(chunk_shape)
+                if split_qkv:
+                    if frequencies is None or not frequencies.shape[-1]:
+                        q_chunk = self.q_norm(q_chunk)
+                    else:
+                        chunk_frequencies = (
+                            frequencies[:, chunk_start:chunk_stop]
+                            if frequencies.ndim == 6
+                            else frequencies[chunk_start:chunk_stop]
+                        )
+                        q_chunk = _apply_single_qknorm_rope(
+                            q_chunk,
+                            weight=self.q_norm.weight,
+                            frequencies=chunk_frequencies,
+                            eps=self.q_norm.eps,
+                            query_slot=True,
+                        )
+                else:
+                    k_chunk = k_chunk.view(chunk_shape)
+                    if frequencies is None or not frequencies.shape[-1]:
+                        q_chunk = self.q_norm(q_chunk)
+                        k_chunk = self.k_norm(k_chunk)
+                    else:
+                        chunk_frequencies = (
+                            frequencies[:, chunk_start:chunk_stop]
+                            if frequencies.ndim == 6
+                            else frequencies[chunk_start:chunk_stop]
+                        )
+                        q_chunk, k_chunk = apply_qknorm_rope(
+                            q_chunk,
+                            k_chunk,
+                            q_weight=self.q_norm.weight,
+                            k_weight=self.k_norm.weight,
+                            frequencies=chunk_frequencies,
+                            eps=self.q_norm.eps,
+                        )
+                local_start = chunk_start - start
+                local_stop = chunk_stop - start
+                query[local_start:local_stop].copy_(q_chunk)
+                if split_qkv:
+                    del q_chunk
+                else:
+                    del qkv, q_chunk, k_chunk, v_chunk
+            return query
+
+        def commit(start: int, stop: int, attended: torch.Tensor) -> None:
+            flattened = attended.reshape(stop - start, self.inner_width)
+            with _profile_region("h3_long_out_projection"):
+                projected = self.out_proj(flattened)
+            with _profile_region("h3_long_attention_residual"):
+                _gated_residual_slice_(
+                    residual,
+                    projected,
+                    gate,
+                    modulation_segments,
+                    start=start,
+                    stop=stop,
+                )
+            del flattened, projected
+
+        all_queries = getattr(physical, "long_sequence_all_queries", None)
+        if all_queries is not None:
+            for start in range(0, sequence, query_chunk_tokens):
+                stop = min(sequence, start + query_chunk_tokens)
+                query = project_queries(start, stop)
+                attended = all_queries(query, prepared)
+                commit(start, stop, attended)
+                del query, attended
+            return True
+
+        # Text length and the number/shape of reference image/audio items are
+        # request dependent.  Stream prefix Queries as well, while retaining
+        # every packed token as K/V, so no particular T2VA prompt shape is
+        # baked into this path.
+        for prefix_start in range(0, protected_tokens, query_chunk_tokens):
+            prefix_stop = min(
+                protected_tokens, prefix_start + query_chunk_tokens
+            )
+            query = project_queries(prefix_start, prefix_stop)
+            with _profile_region("h3_long_prefix_attention"):
+                prefix_output = prefix_attention(
+                    query, prepared
+                )
+            commit(prefix_start, prefix_stop, prefix_output)
+            del query, prefix_output
+        video_tokens = sequence - protected_tokens
+        for local_start in range(0, video_tokens, query_chunk_tokens):
+            local_stop = min(video_tokens, local_start + query_chunk_tokens)
+            global_start = protected_tokens + local_start
+            global_stop = protected_tokens + local_stop
+            indices = torch.arange(
+                local_start,
+                local_stop,
+                device=hidden.device,
+                dtype=torch.int64,
+            )
+            query = project_queries(global_start, global_stop)
+            with _profile_region("h3_long_video_attention"):
+                attended = video_attention(
+                    query,
+                    prepared,
+                    protected_tokens=protected_tokens,
+                    query_token_indices=indices,
+                )
+            commit(global_start, global_stop, attended)
+            del query, indices, attended
+        return True
 
 
 class SwiGLUMLP(nn.Module):
@@ -257,6 +951,39 @@ def _gated_residual(
     if previous != residual.shape[0]:
         raise ValueError("modulation segments do not cover the packed sequence")
     return residual
+
+
+def _gated_residual_slice_(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+    segments: tuple[ModulationSegment, ...],
+    *,
+    start: int,
+    stop: int,
+) -> None:
+    """Apply one contiguous update slice without expanding AdaLN rows."""
+
+    if not 0 <= start < stop <= residual.shape[0]:
+        raise ValueError("gated residual slice falls outside the packed sequence")
+    if update.shape != residual[start:stop].shape:
+        raise ValueError("gated residual slice shape does not match its destination")
+    covered = start
+    for segment_start, segment_stop, row in segments:
+        overlap_start = max(start, segment_start)
+        overlap_stop = min(stop, segment_stop)
+        if overlap_start >= overlap_stop:
+            continue
+        if overlap_start != covered:
+            raise ValueError("modulation segments do not cover the update slice")
+        update_start = overlap_start - start
+        update_stop = overlap_stop - start
+        residual[overlap_start:overlap_stop].addcmul_(
+            update[update_start:update_stop], gate[row].to(update.dtype)
+        )
+        covered = overlap_stop
+    if covered != stop:
+        raise ValueError("modulation segments do not cover the update slice")
 
 
 class H3TransformerBlock(nn.Module):
@@ -350,17 +1077,50 @@ class H3TransformerBlock(nn.Module):
             self.adaln_projector(timestep_rows), hidden_size=self.hidden_size
         )
         shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = params
-        from .kernels import current_attention_layer, rms_adaln
+        from .kernels import (
+            current_attention_layer,
+            current_long_sequence_projection_chunk_tokens,
+            current_long_sequence_query_chunk_tokens,
+            rms_adaln,
+        )
 
         hidden = rms_adaln(
             value, self.norm1, shift_a, scale_a, modulation_segments
         )
-        value = _gated_residual(
+        query_chunk_tokens = current_long_sequence_query_chunk_tokens()
+        if query_chunk_tokens is None:
+            value = _gated_residual(
+                value,
+                self.attention(hidden, frequencies),
+                gate_a,
+                modulation_segments,
+            )
+        elif not self.attention.stream_gated_residual_(
             value,
-            self.attention(hidden, frequencies),
+            hidden,
+            frequencies,
             gate_a,
             modulation_segments,
-        )
+            query_chunk_tokens=query_chunk_tokens,
+            projection_chunk_tokens=(
+                current_long_sequence_projection_chunk_tokens()
+            ),
+        ):
+            from .kernels import _can_fallback_to_unstreamed_exact_attention
+
+            if not _can_fallback_to_unstreamed_exact_attention(
+                self.attention.backend, int(hidden.shape[0])
+            ):
+                raise RuntimeError(
+                    "the selected Attention action has no validated long-sequence "
+                    "streaming implementation"
+                )
+            value = _gated_residual(
+                value,
+                self.attention(hidden, frequencies),
+                gate_a,
+                modulation_segments,
+            )
         hidden = rms_adaln(
             value, self.norm2, shift_m, scale_m, modulation_segments
         )
@@ -485,14 +1245,16 @@ class H3TransformerBlock(nn.Module):
             )
             return value
 
-        if try_fused_gated_mlp(
-            value,
-            hidden,
-            self.mlp,
-            gate_m,
-            modulation_segments,
-            chunk_tokens=mlp_chunk_tokens,
-        ):
+        with _profile_region("h3_long_mlp"):
+            fused_mlp = try_fused_gated_mlp(
+                value,
+                hidden,
+                self.mlp,
+                gate_m,
+                modulation_segments,
+                chunk_tokens=mlp_chunk_tokens,
+            )
+        if fused_mlp:
             if capture is not None:
                 persist_mlp_capture(
                     capture,

@@ -7,13 +7,24 @@ import ctypes
 import gc
 import math
 import os
+import tempfile
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from ..contract import GenerationSpec, actual_step_schedule, engine_family, engine_variant
+from ..contract import (
+    GenerationSpec,
+    SecondSamplingSpec,
+    actual_step_schedule,
+    engine_variant,
+    launcher_family,
+    launcher_vram_profile,
+    launcher_weight_tier,
+    normalize_launcher,
+)
 from .pipeline import GenerationInput, NativeH3Pipeline, PipelineCancelled, SamplingConfig
+from .adapters.sampling_mux import refinement_sigma_schedule
 
 
 class NativeGenerationCancelled(RuntimeError):
@@ -27,6 +38,7 @@ class NativeGenerationResult:
     output_path: Path
     stage_seconds: dict[str, float]
     inference_plan: dict[str, Any] | None = None
+    final_latents_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +51,32 @@ class NativeCheckpointResult:
     total_steps: int
     stage_seconds: dict[str, float]
     inference_plan: dict[str, Any] | None = None
+
+
+def _public_inference_plan(execution_profile: object) -> dict[str, Any] | None:
+    """Keep quality scheduling and physical memory routing auditable.
+
+    Historically the service returned only ``joint_acceleration`` from the
+    much larger native execution profile.  That made an ``auto`` memory-mode
+    request impossible to inspect after completion.  Preserve the existing
+    flat scheduler fields for client compatibility and attach only the small,
+    stable physical-route receipt needed by the public product contract.
+    """
+
+    if not isinstance(execution_profile, dict):
+        return None
+    joint = execution_profile.get("joint_acceleration")
+    result = dict(joint) if isinstance(joint, dict) else {}
+    memory_execution = execution_profile.get("memory_execution")
+    if isinstance(memory_execution, dict):
+        result["memory_execution"] = dict(memory_execution)
+    conditioning_cache = execution_profile.get("qwen_conditioning_cache")
+    if isinstance(conditioning_cache, dict):
+        # This is a small receipt only; the cached tensors remain private to
+        # the latent checkpoint.  Exposing the receipt makes it possible to
+        # verify that second sampling did not silently run Qwen again.
+        result["qwen_conditioning_cache"] = dict(conditioning_cache)
+    return result or None
 
 
 _ORIGINAL_ACTUAL_INDICES = {
@@ -103,12 +141,17 @@ class NativeH3Engine:
         preview_decision_wait: Any | None = None,
         checkpoint_path: Path | None = None,
         resume_checkpoint_path: Path | None = None,
+        final_latents_path: Path | None = None,
+        second_sampling: SecondSamplingSpec | None = None,
+        refinement_latents_path: Path | None = None,
     ) -> NativeGenerationResult:
         output_path = output_path.resolve()
         if not output_path.is_relative_to(self._output_root):
             raise ValueError("output_path must stay inside the configured output root")
         if reference_images or reference_videos or reference_audios:
             raise RuntimeError("the compatibility pipeline does not implement Ref2VA")
+        if second_sampling is not None or refinement_latents_path is not None:
+            raise RuntimeError("the compatibility pipeline does not implement H3 second sampling")
         request = GenerationInput(
             prompt=spec.prompt,
             width=spec.width,
@@ -139,6 +182,7 @@ class NativeH3Engine:
             elapsed_seconds=round(time.monotonic() - started, 3),
             output_path=result_path,
             stage_seconds=dict(state.metrics.elapsed_seconds),
+            final_latents_path=None,
         )
 
     def _result_path(self, result: Any, expected: Path) -> Path:
@@ -173,25 +217,49 @@ class NativeHotH3Engine:
         self._engine_name: str | None = None
         self._warm_state: dict[str, Any] = {
             "status": "cold", "engine": None, "startup_seconds": None, "error": None,
+            "progress_percent": 0.0,
+            "progress_stage": "cold",
+            "progress_detail": "尚未加载模型",
         }
+
+    def _loading_progress(self, percent: float, stage: str, detail: str) -> None:
+        if self._warm_state.get("status") != "loading":
+            return
+        self._warm_state.update({
+            "progress_percent": round(max(0.0, min(100.0, percent)), 1),
+            "progress_stage": stage,
+            "progress_detail": detail,
+        })
 
     def preflight(self, engine: str) -> dict[str, Any]:
         return self._factory.preflight(engine)
 
     def _ensure_session(self, engine: str):
-        family = engine if engine in ("first_last", "reference") else engine_family(engine)
-        if self._built is not None and self._engine_name == family:
+        launcher = normalize_launcher(engine)
+        family = launcher_family(launcher)
+        weight_tier = launcher_weight_tier(launcher)
+        vram_profile = launcher_vram_profile(launcher)
+        if self._built is not None and self._engine_name == launcher:
             return self._built
         if self._built is not None:
             self._built.session.close()
             self._built = None
             self._engine_name = None
         try:
-            self._built = self._factory.build(family)
-            self._engine_name = family
+            configure_progress = getattr(self._factory, "set_progress_callback", None)
+            if callable(configure_progress):
+                configure_progress(self._loading_progress)
+            self._built = self._factory.build(launcher)
+            self._engine_name = launcher
             self._warm_state = {
                 "status": "ready",
                 "engine": family,
+                "launcher": launcher,
+                "weight_tier": weight_tier,
+                "vram_profile": vram_profile,
+                "allocator_ceiling_gib": round(
+                    float(getattr(self._built, "allocator_ceiling_gib", 0.0)), 3
+                ),
                 "startup_seconds": round(self._built.startup_seconds, 3),
                 "qwen_storage": getattr(self._built, "qwen_storage", "source"),
                 "qwen_layer_cache": bool(
@@ -203,24 +271,65 @@ class NativeHotH3Engine:
                 "v19_release_digest": getattr(
                     self._built, "v19_release_digest", None
                 ),
+                "pareto_policy_id": getattr(
+                    self._built, "pareto_policy_id", None
+                ),
+                "pareto_candidate_id": getattr(
+                    self._built, "pareto_candidate_id", None
+                ),
+                "lora_checkpoint": Path(
+                    getattr(self._built, "lora_checkpoint", "")
+                ).name,
+                "lora_profile_id": getattr(
+                    self._built, "lora_profile_id", None
+                ),
+                "lora_display_name": getattr(
+                    self._built, "lora_display_name", None
+                ),
+                "lora_recommended_steps": list(getattr(
+                    self._built, "lora_recommended_steps", ()
+                )),
+                "lora_default_steps": getattr(
+                    self._built, "lora_default_steps", None
+                ),
                 "error": None,
+                "progress_percent": 100.0,
+                "progress_stage": "ready",
+                "progress_detail": "模型引擎已就绪",
             }
         except Exception as error:
             self._warm_state = {
                 "status": "failed", "engine": family,
+                "launcher": launcher, "weight_tier": weight_tier,
+                "vram_profile": vram_profile,
                 "startup_seconds": None, "error": str(error),
+                "progress_percent": 100.0,
+                "progress_stage": "failed",
+                "progress_detail": "模型引擎加载失败",
             }
             raise
+        finally:
+            configure_progress = getattr(self._factory, "set_progress_callback", None)
+            if callable(configure_progress):
+                configure_progress(None)
         return self._built
 
     async def preload(self, engine: str) -> None:
-        engine = engine if engine in ("first_last", "reference") else engine_family(engine)
+        engine = normalize_launcher(engine)
+        family = launcher_family(engine)
+        weight_tier = launcher_weight_tier(engine)
+        vram_profile = launcher_vram_profile(engine)
         async with self._lock:
             if self._built is not None and self._engine_name == engine:
                 return
             self._warm_state = {
-                "status": "loading", "engine": engine,
+                "status": "loading", "engine": family,
+                "launcher": engine, "weight_tier": weight_tier,
+                "vram_profile": vram_profile,
                 "startup_seconds": None, "error": None,
+                "progress_percent": 1.0,
+                "progress_stage": "starting",
+                "progress_detail": "开始加载模型引擎",
             }
             try:
                 await asyncio.to_thread(self._ensure_session, engine)
@@ -237,7 +346,13 @@ class NativeHotH3Engine:
             key: self._warm_state.get(key)
             for key in (
                 "status", "engine", "startup_seconds", "qwen_storage",
-                "qwen_layer_cache",
+                "qwen_layer_cache", "pareto_policy_id", "pareto_candidate_id",
+                "launcher", "weight_tier", "vram_profile",
+                "allocator_ceiling_gib",
+                "lora_checkpoint",
+                "lora_profile_id", "lora_display_name",
+                "lora_recommended_steps", "lora_default_steps",
+                "progress_percent", "progress_stage", "progress_detail",
             )
         }
 
@@ -291,6 +406,9 @@ class NativeHotH3Engine:
         preview_decision_wait: Any | None = None,
         checkpoint_path: Path | None = None,
         resume_checkpoint_path: Path | None = None,
+        final_latents_path: Path | None = None,
+        second_sampling: SecondSamplingSpec | None = None,
+        refinement_latents_path: Path | None = None,
     ) -> NativeGenerationResult | NativeCheckpointResult:
         from .hot_session import (
             HotSessionCancelled,
@@ -299,18 +417,34 @@ class NativeHotH3Engine:
         )
         from .long_video_motion_detail import select_candidate
 
+        is_second_sampling = second_sampling is not None
+        if is_second_sampling != (refinement_latents_path is not None):
+            raise ValueError(
+                "second_sampling and refinement_latents_path must be supplied together"
+            )
+        if second_sampling is not None and second_sampling.model_variant != "base":
+            raise ValueError("H3 second sampling is fixed to the Base weights")
         joint_plan = None
+        second_attention_schedule: tuple[tuple[int, int, str], ...] = ()
+        second_plan_summary: dict[str, Any] | None = None
         # INT8 V19 and distilled LoRA deliberately have separate scheduling
-        # domains.  A Base release bundle must never make LoRA borrow a
-        # forecast trajectory that was calibrated for the 20-step model.
+        # domains.  A Base release bundle (or isolated Base research overlay)
+        # must never make LoRA borrow a forecast trajectory calibrated for the
+        # 20-step model.
         use_v19 = bool(
+            not is_second_sampling
+            and
             spec.model_variant == "base"
             and
             spec.joint_acceleration_enabled
-            and getattr(self._factory, "v19_release_enabled", False)
+            and getattr(
+                self._factory,
+                "v19_scheduler_enabled",
+                getattr(self._factory, "v19_release_enabled", False),
+            )
         )
         joint_scheduler_id = None
-        if spec.joint_acceleration_enabled and not use_v19:
+        if (spec.joint_acceleration_enabled or is_second_sampling) and not use_v19:
             from .planner import (
                 FROZEN_INT8_JOINT_POLICY,
                 H3JointAccelerationScheduler,
@@ -351,6 +485,23 @@ class NativeHotH3Engine:
             # Research runs can pin a version without changing the two-field
             # public request contract or silently moving the release default.
             # The selected id remains serialized in request telemetry.
+            requested_steps = (
+                int(second_sampling.steps)
+                if second_sampling is not None
+                else int(
+                    spec.sampling_steps
+                    or (
+                        self._built.lora_default_steps
+                        if spec.model_variant == "lora"
+                        else 20
+                    )
+                )
+            )
+            requested_acceleration = (
+                float(second_sampling.acceleration)
+                if second_sampling is not None
+                else float(spec.acceleration or 0.0)
+            )
             if spec.model_variant == "lora":
                 policy_id = (
                     os.environ.get(
@@ -360,8 +511,8 @@ class NativeHotH3Engine:
                 )
                 scheduler = H3LoraAccelerationScheduler(policy_id=policy_id)
                 joint_plan = scheduler.plan(
-                    int(spec.sampling_steps or 8),
-                    float(spec.acceleration or 0.0),
+                    max(4, requested_steps) if is_second_sampling else requested_steps,
+                    requested_acceleration,
                     workload=workload,
                 )
                 joint_scheduler_id = LORA_NO_FORECAST_SCHEDULER_ID
@@ -375,16 +526,59 @@ class NativeHotH3Engine:
                 joint_plan = H3JointAccelerationScheduler(
                     policy_id=policy_id
                 ).plan(
-                    int(spec.sampling_steps or 20),
-                    float(spec.acceleration or 0.0),
-                    allow_forecast=True,
+                    max(4, requested_steps) if is_second_sampling else requested_steps,
+                    requested_acceleration,
+                    # UltimateUpscale is a short, low-noise trajectory.  All
+                    # solver positions remain real DiT evaluations; the same
+                    # acceleration control is projected only onto Attention.
+                    allow_forecast=not is_second_sampling,
                     workload=workload,
                 )
-                joint_scheduler_id = "h3_int8_frozen_round229"
+                joint_scheduler_id = (
+                    "h3_second_sampling_exact_attention_v1"
+                    if is_second_sampling
+                    else "h3_int8_frozen_round229"
+                )
+            if is_second_sampling and requested_steps < 4:
+                # The first-pass optimizer's certified domain starts at four
+                # trajectory points.  UltimateUpscale commonly uses one real
+                # low-noise evaluation, so project the terminal N rows of the
+                # four-step exact-only Attention policy onto N refinement
+                # rows.  This never invents Forecast steps and preserves the
+                # terminal layer protection learned by the optimizer.
+                provisional = joint_plan
+                terminal_start = provisional.total_steps - requested_steps
+                remapped = []
+                for (step, layer), action in sorted(
+                    provisional.runtime_action_schedule().items()
+                ):
+                    if step >= terminal_start:
+                        remapped.append((step - terminal_start, layer, action))
+                second_attention_schedule = tuple(remapped)
+                second_plan_summary = {
+                    **{
+                        key: value
+                        for key, value in provisional.to_dict().items()
+                        if key != "attention_decisions"
+                    },
+                    "schema_version": "h3_second_sampling_attention_projection_v1",
+                    "total_steps": requested_steps,
+                    "actual_step_indices": list(range(requested_steps)),
+                    "forecast_step_indices": [],
+                    "actual_evaluations": requested_steps,
+                    "forecast_evaluations": 0,
+                    "projection_source_steps": provisional.total_steps,
+                    "projection_source_terminal_start": terminal_start,
+                    "scheduler_family": joint_scheduler_id,
+                    "model_variant": spec.model_variant,
+                }
+                joint_plan = None
         sparse_requested = (
             use_v19 and float(spec.acceleration or 0.0) > 0.0
         ) or (
             joint_plan is not None and joint_plan.uses_sparse_attention
+        ) or (
+            any(action != "dense" for _step, _layer, action in second_attention_schedule)
         ) or (
             spec.advanced
             and not spec.joint_acceleration_enabled
@@ -402,8 +596,22 @@ class NativeHotH3Engine:
         async with self._lock:
             if cancel_event.is_set():
                 raise NativeGenerationCancelled("native H3 generation cancelled")
-            built = await asyncio.to_thread(self._ensure_session, spec.service_family)
-            if use_v19:
+            built = await asyncio.to_thread(
+                self._ensure_session, spec.runtime_launcher
+            )
+            runtime_config = getattr(built.session, "runtime_config", None)
+            allocator_ceiling_gib = (
+                float(runtime_config.max_device_bytes) / 1024**3
+                if runtime_config is not None
+                else {"24gb": 23.25, "16gb": 15.25, "8gb": 7.25}[
+                    spec.vram_profile
+                ]
+            )
+            if is_second_sampling:
+                assert second_sampling is not None
+                total_steps = second_sampling.steps
+                actual_steps = tuple(range(total_steps))
+            elif use_v19:
                 total_steps = int(spec.sampling_steps or 20)
                 actual_steps = tuple(range(total_steps))
             elif joint_plan is not None:
@@ -422,7 +630,7 @@ class NativeHotH3Engine:
                 )
             candidate = (
                 None
-                if joint_plan is not None or use_v19
+                if joint_plan is not None or use_v19 or is_second_sampling
                 else select_candidate(
                     spec,
                     first_frame=first_frame,
@@ -433,7 +641,18 @@ class NativeHotH3Engine:
                 )
             )
             execution_plan = self._request_plan(spec)
-            if joint_plan is not None or use_v19:
+            if is_second_sampling and execution_plan is None:
+                from .planner import ExecutionPlan
+                from .runtime import OffloadMode
+
+                execution_plan = ExecutionPlan(
+                    offload_mode=OffloadMode.BLOCK,
+                    mlp_chunk_tokens=8192,
+                    block_buffer_count=2,
+                    prefetch_depth=1,
+                    vae_spatial_tile=(288, 288),
+                )
+            if joint_plan is not None or use_v19 or is_second_sampling:
                 if execution_plan is None:
                     raise RuntimeError(
                         "joint acceleration requires an explicit RTX 4090 execution plan"
@@ -513,6 +732,42 @@ class NativeHotH3Engine:
                     int(spec.checkpoint_preview_resolution[:-1])
                     / float(min(spec.width, spec.height)),
                 )
+            ultimate_plan = None
+            if second_sampling is not None:
+                from .ultimate_upscale import plan_ultimate_upscale
+
+                ultimate_plan = plan_ultimate_upscale(
+                    target_width=second_sampling.width,
+                    target_height=second_sampling.height,
+                    frames=spec.frames,
+                    device_budget_bytes=built.session._device_execution_budget_bytes(),
+                    text_tokens=max(
+                        128, min(1024, int(math.ceil(len(spec.prompt) * 0.55)))
+                    ),
+                    condition_count=(
+                        int(first_frame is not None)
+                        + int(last_frame is not None)
+                        + len(reference_images)
+                        + len(reference_videos)
+                        + len(reference_audios)
+                    ),
+                    engine=spec.engine,
+                    actual_evaluations=second_sampling.steps,
+                    requested_mode=second_sampling.memory_mode,
+                    weight_tier=built.weight_tier,
+                    resource_profile=built.session.runtime_config.resource_profile,
+                    allow_spatial_tiles=False,
+                    temporal_window_frames=(
+                        second_sampling.temporal_window_frames
+                    ),
+                )
+                if not ultimate_plan.full_canvas and len(ultimate_plan.spatial) != 1:
+                    raise RuntimeError(
+                        "this second-sampling target requires spatial tiles; "
+                        "the release executor currently enables the faster full-spatial "
+                        "temporal-window executor only"
+                    )
+
             request = HotSessionRequest(
                 prompt=spec.prompt,
                 seed=spec.seed,
@@ -524,8 +779,12 @@ class NativeHotH3Engine:
                 output_path=output_path,
                 actual_step_indices=actual_steps,
                 execution_plan=execution_plan,
+                release_byte_exact_optimizations=True,
+                memory_mode=spec.memory_mode,
                 attention_action_schedule=(
-                    ()
+                    second_attention_schedule
+                    if second_attention_schedule
+                    else ()
                     if joint_plan is None
                     else tuple(
                         (step, layer, action)
@@ -546,7 +805,9 @@ class NativeHotH3Engine:
                     () if joint_plan is None else joint_plan.online_rebate_schedule
                 ),
                 acceleration_plan_summary=(
-                    None
+                    second_plan_summary
+                    if second_plan_summary is not None
+                    else None
                     if joint_plan is None
                     else {
                         **{
@@ -561,6 +822,11 @@ class NativeHotH3Engine:
                 v19_acceleration=(
                     float(spec.acceleration or 0.0) if use_v19 else None
                 ),
+                scheduler_required_actual_step_indices=(
+                    (int(spec.checkpoint_step or 1) - 1,)
+                    if use_v19 and spec.execution_mode == "checkpoint"
+                    else ()
+                ),
                 first_frame=first_frame,
                 last_frame=last_frame,
                 reference_images=reference_images,
@@ -571,6 +837,23 @@ class NativeHotH3Engine:
                 cancel_check=cancel_event.is_set,
                 progress_callback=progress_callback,
                 use_lora=engine_variant(spec.engine) == "lora",
+                refinement_latents_path=refinement_latents_path,
+                refinement_denoise=(
+                    None if second_sampling is None else second_sampling.denoise
+                ),
+                refinement_spatial_mode=(
+                    "strict" if second_sampling is None else second_sampling.spatial_mode
+                ),
+                preserve_refinement_audio=(
+                    True if second_sampling is None else second_sampling.preserve_audio
+                ),
+                save_final_latents_path=final_latents_path,
+                conditioning_cache_source_path=(
+                    Path(refinement_latents_path).resolve()
+                    if second_sampling is not None
+                    and refinement_latents_path is not None
+                    else None
+                ),
                 formal_resume_state_path=resume_checkpoint_path,
                 checkpoint_after_step=checkpoint_after_step,
                 checkpoint_state_path=(
@@ -622,21 +905,287 @@ class NativeHotH3Engine:
             )
             started = time.monotonic()
             try:
-                result = await asyncio.to_thread(built.session.generate, request)
+                if ultimate_plan is not None and not ultimate_plan.full_canvas:
+                    from .ultimate_upscale import (
+                        append_av_temporal_piece,
+                        slice_av_temporal_piece,
+                    )
+                    import torch
+
+                    def run_temporal_windows():
+                        source = torch.load(
+                            Path(refinement_latents_path),
+                            map_location="cpu",
+                            weights_only=True,
+                        )
+                        source_video = source.get("video")
+                        source_audio = source.get("audio")
+                        if not isinstance(source_video, torch.Tensor) or source_video.ndim != 5:
+                            raise ValueError("second-sampling source has invalid video latent")
+                        if not isinstance(source_audio, torch.Tensor) or source_audio.ndim != 4:
+                            raise ValueError("second-sampling source has invalid audio latent")
+                        if source_video.shape[2] != ultimate_plan.temporal[-1].video_token_stop:
+                            raise ValueError("UltimateUpscale plan does not cover source video clock")
+                        if source_audio.shape[-1] < ultimate_plan.temporal[-1].audio_token_stop:
+                            raise ValueError("UltimateUpscale plan does not cover source audio clock")
+
+                        accumulated_video = None
+                        accumulated_audio = None
+                        all_phases: dict[str, float] = {}
+                        all_steps: list[float] = []
+                        window_profiles: list[dict[str, Any]] = []
+                        rebuilt_conditioning: dict[str, Any] | None = None
+                        peak_allocated = 0.0
+                        peak_reserved = 0.0
+                        window_count = len(ultimate_plan.temporal)
+                        with tempfile.TemporaryDirectory(
+                            prefix=".h3-ultimate-",
+                            dir=str(output_path.parent),
+                        ) as temporary_root:
+                            temporary = Path(temporary_root)
+                            for index, piece in enumerate(ultimate_plan.temporal):
+                                if cancel_event.is_set():
+                                    raise HotSessionCancelled(
+                                        "native H3 generation cancelled"
+                                    )
+                                piece_video, piece_audio = slice_av_temporal_piece(
+                                    source_video, source_audio, piece
+                                )
+                                piece_input = temporary / f"window-{index:02d}-source.pt"
+                                piece_output = temporary / f"window-{index:02d}-sampled.pt"
+                                torch.save(
+                                    {
+                                        "video": piece_video,
+                                        "audio": piece_audio,
+                                        "frames": piece.frames,
+                                        "fps": request.fps,
+                                        "width": source.get("width"),
+                                        "height": source.get("height"),
+                                        "engine": source.get("engine"),
+                                        "seed": request.seed,
+                                    },
+                                    piece_input,
+                                )
+
+                                def piece_progress(event, *, _index=index):
+                                    if progress_callback is None:
+                                        return
+                                    local = float(event.get("percent", 0.0)) / 100.0
+                                    progress_callback({
+                                        "percent": 8.0 + 76.0 * ((_index + local) / window_count),
+                                        "stage": "second_sampling_window",
+                                        "detail": (
+                                            f"{second_sampling.resolution} 时间窗口 "
+                                            f"{_index + 1}/{window_count} · "
+                                            f"{event.get('detail', event.get('stage', '执行中'))}"
+                                        ),
+                                    })
+
+                                piece_request = replace(
+                                    request,
+                                    frames=piece.frames,
+                                    output_path=temporary / f"window-{index:02d}.mp4",
+                                    first_frame=(request.first_frame if index == 0 else None),
+                                    last_frame=(
+                                        request.last_frame
+                                        if index == window_count - 1
+                                        else None
+                                    ),
+                                    progress_callback=piece_progress,
+                                    refinement_latents_path=piece_input,
+                                    save_final_latents_path=piece_output,
+                                    internal_video_tokens=(
+                                        piece.video_token_stop - piece.video_token_start
+                                    ),
+                                    internal_audio_tokens=(
+                                        piece.audio_token_stop - piece.audio_token_start
+                                    ),
+                                    latent_only=True,
+                                    formal_resume_state_path=None,
+                                    checkpoint_after_step=None,
+                                    checkpoint_state_path=None,
+                                    preview_step_index=None,
+                                    preview_output_path=None,
+                                    terminal_refinement_initial_width=None,
+                                    terminal_refinement_initial_height=None,
+                                    terminal_refinement_steps=0,
+                                )
+                                piece_result = built.session.generate(piece_request)
+                                sampled = torch.load(
+                                    piece_output, map_location="cpu", weights_only=True
+                                )
+                                accumulated_video, accumulated_audio = append_av_temporal_piece(
+                                    accumulated_video,
+                                    accumulated_audio,
+                                    sampled["video"],
+                                    sampled["audio"],
+                                    piece,
+                                )
+                                for name, seconds in piece_result.phases.items():
+                                    all_phases[
+                                        f"window_{index + 1:02d}.{name}"
+                                    ] = seconds
+                                all_steps.extend(piece_result.step_seconds)
+                                window_profiles.append(piece_result.execution_profile)
+                                latest_conditioning = getattr(
+                                    built.session,
+                                    "_last_conditioning_cache_payload",
+                                    None,
+                                )
+                                if (
+                                    rebuilt_conditioning is None
+                                    and isinstance(latest_conditioning, dict)
+                                ):
+                                    # A legacy source latent has no persisted
+                                    # Qwen cache.  The first temporal piece
+                                    # necessarily rebuilds it; retain that exact
+                                    # host payload so the stitched checkpoint is
+                                    # automatically upgraded for future runs.
+                                    rebuilt_conditioning = latest_conditioning
+                                peak_allocated = max(
+                                    peak_allocated, piece_result.peak_allocated_gib
+                                )
+                                peak_reserved = max(
+                                    peak_reserved, piece_result.peak_reserved_gib
+                                )
+                                del sampled, piece_video, piece_audio
+
+                            if accumulated_video is None or accumulated_audio is None:
+                                raise RuntimeError("UltimateUpscale produced no windows")
+                            # The upstream algorithm never re-samples audio.  Use
+                            # the original full clock byte-for-byte instead of a
+                            # numerically equivalent overlap blend.
+                            del accumulated_audio
+                            accumulated_audio = source_audio
+                            stitched_path = (
+                                Path(final_latents_path)
+                                if final_latents_path is not None
+                                else temporary / "stitched-final.pt"
+                            )
+                            stitched_path.parent.mkdir(parents=True, exist_ok=True)
+                            stitched_document = {
+                                "video": accumulated_video,
+                                "audio": accumulated_audio,
+                                "frames": request.frames,
+                                "fps": request.fps,
+                                "width": request.width,
+                                "height": request.height,
+                                "engine": source.get("engine"),
+                                "seed": request.seed,
+                            }
+                            source_conditioning = source.get(
+                                "qwen_conditioning_cache"
+                            )
+                            if not isinstance(source_conditioning, dict):
+                                source_conditioning = rebuilt_conditioning
+                            if isinstance(source_conditioning, dict):
+                                stitched_document["qwen_conditioning_cache"] = (
+                                    source_conditioning
+                                )
+                            torch.save(stitched_document, stitched_path)
+                            decode_request = replace(
+                                request,
+                                refinement_latents_path=None,
+                                refinement_denoise=None,
+                                refinement_spatial_mode="strict",
+                                save_final_latents_path=None,
+                                internal_video_tokens=None,
+                                internal_audio_tokens=None,
+                                latent_only=False,
+                                # The stitched high-resolution latent is intentionally
+                                # decoded through the already validated exact
+                                # host-temporal Video-VAE graph.  Reusing the
+                                # per-window DiT plan here would materialize a
+                                # full FP32 2K clip on GPU and consume the last
+                                # ~0.6 GiB of the card for no speed benefit.
+                                execution_plan=replace(
+                                    request.execution_plan,
+                                    vae_spatial_tile=request.execution_plan.vae_spatial_tile,
+                                    vae_temporal_tile=6,
+                                    vae_tile_batch_size=(
+                                        8
+                                        if built.vram_profile == "8gb"
+                                        else 1
+                                    ),
+                                ),
+                            )
+                            decoded = built.session.decode_latent_checkpoint(
+                                decode_request, stitched_path
+                            )
+                            all_phases.update({
+                                f"final_decode.{name}": seconds
+                                for name, seconds in decoded.phases.items()
+                            })
+                            return replace(
+                                decoded,
+                                total_seconds=time.monotonic() - started,
+                                phases=all_phases,
+                                step_seconds=tuple(all_steps),
+                                execution_profile={
+                                    **decoded.execution_profile,
+                                    **(
+                                        {
+                                            "qwen_conditioning_cache": dict(
+                                                window_profiles[0][
+                                                    "qwen_conditioning_cache"
+                                                ]
+                                            )
+                                        }
+                                        if window_profiles
+                                        and isinstance(
+                                            window_profiles[0].get(
+                                                "qwen_conditioning_cache"
+                                            ),
+                                            dict,
+                                        )
+                                        else {}
+                                    ),
+                                    "ultimate_upscale_windows": {
+                                        "provenance": ultimate_plan.provenance,
+                                        "count": window_count,
+                                        "full_spatial_canvas": True,
+                                        "audio_resampled": False,
+                                        "latent_crossfade": True,
+                                        "single_final_decode": True,
+                                        "window_profiles": window_profiles,
+                                    },
+                                },
+                                peak_allocated_gib=max(
+                                    peak_allocated, decoded.peak_allocated_gib
+                                ),
+                                peak_reserved_gib=max(
+                                    peak_reserved, decoded.peak_reserved_gib
+                                ),
+                            )
+
+                    result = await asyncio.to_thread(run_temporal_windows)
+                else:
+                    result = await asyncio.to_thread(built.session.generate, request)
             except HotSessionCancelled as error:
                 raise NativeGenerationCancelled(str(error)) from error
             if isinstance(result, HotSessionCheckpointResult):
+                public_plan = _public_inference_plan(
+                    getattr(result, "execution_profile", None)
+                )
+                if result.peak_allocated_gib > 0.0 or result.peak_reserved_gib > 0.0:
+                    public_plan = dict(public_plan or {})
+                    public_plan["runtime_memory"] = {
+                        "peak_allocated_gib": round(result.peak_allocated_gib, 4),
+                        "peak_reserved_gib": round(result.peak_reserved_gib, 4),
+                        "allocator_ceiling_gib": round(allocator_ceiling_gib, 4),
+                        "vram_profile": spec.vram_profile,
+                    }
                 return NativeCheckpointResult(
-                    runtime_key=f"{spec.engine}:native-sm89",
+                    runtime_key=(
+                        f"{spec.engine}:{spec.weight_tier}:{spec.vram_profile}:native-sm89"
+                    ),
                     elapsed_seconds=round(time.monotonic() - started, 3),
                     checkpoint_path=result.checkpoint_path,
                     preview_path=result.preview_path,
                     completed_steps=result.completed_steps,
                     total_steps=result.total_steps,
                     stage_seconds=dict(result.phases),
-                    inference_plan=(
-                        getattr(result, "execution_profile", None) or {}
-                    ).get("joint_acceleration"),
+                    inference_plan=public_plan,
                 )
             phases = dict(result.phases)
             if candidate is not None:
@@ -666,14 +1215,54 @@ class NativeHotH3Engine:
                 except DetailRestoreCancelled as error:
                     raise NativeGenerationCancelled(str(error)) from error
                 phases["intrame_detail_restore"] = restored.elapsed_seconds
+            public_plan = _public_inference_plan(
+                getattr(result, "execution_profile", None)
+            )
+            peak_allocated_gib = float(getattr(result, "peak_allocated_gib", 0.0))
+            peak_reserved_gib = float(getattr(result, "peak_reserved_gib", 0.0))
+            if peak_allocated_gib > 0.0 or peak_reserved_gib > 0.0:
+                public_plan = dict(public_plan or {})
+                public_plan["runtime_memory"] = {
+                    "peak_allocated_gib": round(peak_allocated_gib, 4),
+                    "peak_reserved_gib": round(peak_reserved_gib, 4),
+                    "allocator_ceiling_gib": round(allocator_ceiling_gib, 4),
+                    "vram_profile": spec.vram_profile,
+                }
+            if ultimate_plan is not None:
+                public_plan = dict(public_plan or {})
+                public_plan["ultimate_upscale"] = ultimate_plan.telemetry()
+            if second_sampling is not None:
+                public_plan = dict(public_plan or {})
+                public_plan["second_sampling_solver"] = {
+                    "model_variant": "base",
+                    "sampler": "sa_solver",
+                    "scheduler": "simple",
+                    "video_shift": 6.0,
+                    "audio_shift": 3.0,
+                    "steps": second_sampling.steps,
+                    "strength": second_sampling.strength,
+                    "denoise": second_sampling.denoise,
+                    "start_sigma": refinement_sigma_schedule(
+                        second_sampling.steps,
+                        second_sampling.denoise,
+                        6.0,
+                    )[0],
+                    "forecast_enabled": False,
+                }
             return NativeGenerationResult(
-                runtime_key=f"{spec.engine}:native-sm89",
+                runtime_key=(
+                    f"{spec.engine}:{spec.weight_tier}:"
+                    f"{spec.vram_profile}:native-sm89"
+                ),
                 elapsed_seconds=round(time.monotonic() - started, 3),
                 output_path=result.output_path,
                 stage_seconds=phases,
-                inference_plan=(
-                    getattr(result, "execution_profile", None) or {}
-                ).get("joint_acceleration"),
+                inference_plan=public_plan,
+                final_latents_path=(
+                    final_latents_path
+                    if final_latents_path is not None and final_latents_path.is_file()
+                    else None
+                ),
             )
 
     async def close(self) -> None:
@@ -691,6 +1280,7 @@ class NativeHotH3Engine:
             await asyncio.to_thread(release_host_session_pages)
             self._warm_state = {
                 "status": "cold", "engine": None,
+                "launcher": None, "weight_tier": None, "vram_profile": None,
                 "startup_seconds": None, "error": None,
             }
 

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import contextlib
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 from .contracts import FrameConditioning, KeyframeCondition, ReferenceConditioning
 from .preprocess import prepare_keyframes, prepare_reference_images, prepare_reference_videos
 
 KEYFRAME_ENCODE_SEED = 42
 VIDEO_LATENT_CHANNELS = 24
+EncodePrecision = Literal["full_fp32", "fp16_weights_fp32_posterior"]
 
 
 def _align_reference_image_for_vae(image: Any, alignment: int = 32):
@@ -72,19 +73,47 @@ def _module_device(model: Any):
 
 
 @contextlib.contextmanager
-def _scoped_encode_fp32(model: Any):
-    """Run sampled keyframe encodes in the checkpoint's verified FP32 mode."""
+def _scoped_encode_precision(model: Any, precision: EncodePrecision):
+    """Select conditioning-VAE arithmetic without permanently mutating weights.
+
+    ``full_fp32`` is the original, quality-first path used by the 24/16 GiB
+    engines.  ``fp16_weights_fp32_posterior`` keeps the resident VAE weights in
+    FP16 and lets CUDA autocast feed its convolutions.  MiniMax's
+    ``DiagonalGaussianDistribution`` still upcasts the encoded moments to FP32,
+    so sampling and normalization retain their numerically sensitive boundary.
+    """
 
     import torch
 
     parameter = next(model.parameters())
     previous_dtype = parameter.dtype
-    if previous_dtype != torch.float32:
-        model.to(torch.float32)
+    if precision == "fp16_weights_fp32_posterior":
+        if parameter.device.type == "cuda" and previous_dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            with torch.autocast(
+                device_type="cuda",
+                dtype=previous_dtype,
+            ):
+                yield
+        else:
+            # CPU fakes and already-compatible modules need no dtype mutation.
+            yield
+        return
+    if precision != "full_fp32":
+        raise ValueError(f"unsupported video-VAE encode precision: {precision}")
+
+    restore_dtype = previous_dtype != torch.float32
     try:
+        # Keep the conversion inside the try block.  Module.to() can fail part
+        # way through on a tight device; the finally block then restores any
+        # parameters already converted instead of leaving a poisoned session.
+        if restore_dtype:
+            model.to(torch.float32)
         yield
     finally:
-        if previous_dtype != torch.float32:
+        if restore_dtype:
             model.to(previous_dtype)
 
 
@@ -130,6 +159,7 @@ class H3VideoVAEAdapter:
         *,
         latents_mean: Sequence[float],
         latents_std: Sequence[float],
+        encode_precision: EncodePrecision = "full_fp32",
     ) -> None:
         if len(latents_mean) != VIDEO_LATENT_CHANNELS or len(latents_std) != VIDEO_LATENT_CHANNELS:
             raise ValueError("video VAE requires 24 latent means/stds")
@@ -137,9 +167,17 @@ class H3VideoVAEAdapter:
             getattr(model, "decode_base", None)
         ):
             raise TypeError("video VAE must expose decode() or decode_base()")
+        if encode_precision not in (
+            "full_fp32",
+            "fp16_weights_fp32_posterior",
+        ):
+            raise ValueError(
+                f"unsupported video-VAE encode precision: {encode_precision}"
+            )
         self.model = model
         self.latents_mean = tuple(float(value) for value in latents_mean)
         self.latents_std = tuple(float(value) for value in latents_std)
+        self.encode_precision = encode_precision
 
     def _stats(self, tensor: Any):
         import torch
@@ -204,7 +242,7 @@ class H3VideoVAEAdapter:
         encoded: list[KeyframeCondition] = []
         all_rows = []
         # One dtype transition for a first+last pair, not one per image.
-        with _scoped_encode_fp32(self.model):
+        with _scoped_encode_precision(self.model, self.encode_precision):
             for item in prepared:
                 latent = self._encode_one(item.image)
                 rows = patchify_keyframe(latent).to("cpu")
@@ -242,7 +280,7 @@ class H3VideoVAEAdapter:
         latents = []
         shapes = []
         kinds = []
-        with _scoped_encode_fp32(self.model):
+        with _scoped_encode_precision(self.model, self.encode_precision):
             for image in images:
                 latent = self._encode_one(_align_reference_image_for_vae(image))
                 latents.append(latent)

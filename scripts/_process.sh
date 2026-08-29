@@ -14,6 +14,15 @@ h3_same_file() {
      "$(stat -Lc '%d:%i' -- "${right}" 2>/dev/null)" ]]
 }
 
+h3_is_release_runtime_mirror() {
+  local candidate_server="$1"
+  local marker="$(dirname -- "${candidate_server}")/.h3-release-source"
+  local source_root
+  [[ -f "${marker}" ]] || return 1
+  IFS= read -r source_root < "${marker}" || return 1
+  h3_same_file "${source_root}" "${release_root}"
+}
+
 h3_is_release_server_pid() {
   local pid="$1"
   local target_server_path="${server_path:-${release_root}/server.py}"
@@ -29,7 +38,10 @@ h3_is_release_server_pid() {
         else
           candidate="${process_cwd}/${argument}"
         fi
-        h3_same_file "${candidate}" "${target_server_path}" && return 0
+        if h3_same_file "${candidate}" "${target_server_path}" \
+          || h3_is_release_runtime_mirror "${candidate}"; then
+          return 0
+        fi
         ;;
     esac
   done < "/proc/${pid}/cmdline" 2>/dev/null

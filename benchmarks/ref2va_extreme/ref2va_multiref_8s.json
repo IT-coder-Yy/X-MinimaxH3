@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "description": "Stable multi-image/multi-audio Ref2VA optimization anchor",
+  "expected_dialogue": [
+    {
+      "order": 1,
+      "speaker": "young-man",
+      "reference_audio": "Audio 2",
+      "text": "准备好了吗？今天上学别忘带东西。",
+      "window_seconds": [2.0, 5.2]
+    },
+    {
+      "order": 2,
+      "speaker": "girl",
+      "reference_audio": "Audio 1",
+      "text": "都带好了，我自己可以背。",
+      "window_seconds": [4.5, 7.8]
+    }
+  ],
+  "scenarios": [
+    {
+      "name": "campus_bag_dialogue",
+      "seed": 82416,
+      "width": 864,
+      "height": 480,
+      "frames": 192,
+      "reference_images": [
+        "ref-test/bag.png",
+        "ref-test/girl.png",
+        "ref-test/young-man.png"
+      ],
+      "reference_audios": [
+        "ref-test/girl.wav",
+        "ref-test/young-man.wav"
+      ],
+      "prompt": "8秒写实电影短片。<Picture 1>是必须保持外观一致的深蓝色书包，<Picture 2>是小女孩，<Picture 3>是年轻男青年。<Audio 1>是小女孩的参考音色，<Audio 2>是年轻男青年的参考音色。清晨的校园入口，阳光柔和地洒在教学楼和绿树之间。镜头先近距离展示书包的布料纹理、拉链、肩带和背部设计，然后慢慢拉远。年轻男青年从校园小路走来，微笑着轻拍小女孩肩膀。男青年使用<Audio 2>的音色说：“准备好了吗？今天上学别忘带东西。”小女孩使用<Audio 1>的音色回答：“都带好了，我自己可以背。”男青年帮她调整书包肩带，两人自然走进校园。写实、自然动作、稳定身份、同步口型和校园环境声。overall_soundscape: 清晨校园环境声、脚步声、书包布料摩擦声。non_diegetic_music: N/A"
+    }
+  ]
+}

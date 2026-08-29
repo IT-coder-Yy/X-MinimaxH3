@@ -1,206 +1,245 @@
 # X-MinimaxH3
 
-MiniMax H3 本地音视频生成与推理加速框架。
+**English** · [简体中文](README.zh-CN.md)
 
-本项目在 NVIDIA RTX 4090 24GB 上完成开发、测试和针对性调优。
+X-MinimaxH3 is a local MiniMax H3 video-generation service optimized for a
+single NVIDIA SM89 GPU. It provides one bilingual Web console and REST API for
+FL2VA and Ref2VA generation, Base/LoRA hot switching, resource-constrained
+execution, checkpoint previews and native H3 second sampling.
 
-## 效果对比
+> Model weights, user uploads, latent states and generated videos are not
+> distributed in this repository.
 
-下面是两组完整样片的轻量动态预览，不展示提示词；点击预览可以播放带原声的完整
-MP4。测试平台数据均为 RTX 4090 24GB 上测得的端到端时间，包含模型加载完成后的
-推理、解码与成片封装；加速指数越高，框架采用的加速策略越积极。官方未公开的数据
-不作推测。
+## Features
 
-<table>
-  <tr>
-    <td width="33.33%" align="center">
-      <strong>T2V · 官方</strong><br><br>
-      <a href="assets/comparison/fl2va-official.mp4"><img src="assets/comparison/fl2va-official.webp" width="100%" alt="T2V 官方生成效果"></a><br>
-      <sub>1344×768 · 成片 8 秒<br>推理步数 / 生成耗时：官方未公开</sub>
-    </td>
-    <td width="33.33%" align="center">
-      <strong>T2V · 测试平台 · INT8 加速</strong><br><br>
-      <a href="assets/comparison/fl2va-base.mp4"><img src="assets/comparison/fl2va-base.webp" width="100%" alt="T2V X-MinimaxH3 INT8 生成效果"></a><br>
-      <sub>1920×1088 · 20 步<br>加速指数 75 · 端到端 499 秒</sub>
-    </td>
-    <td width="33.33%" align="center">
-      <strong>T2V · 测试平台 · LoRA 加速</strong><br><br>
-      <a href="assets/comparison/fl2va-lora.mp4"><img src="assets/comparison/fl2va-lora.webp" width="100%" alt="T2V X-MinimaxH3 LoRA 生成效果"></a><br>
-      <sub>1920×1088 · 7 步<br>加速指数 40 · 端到端 350 秒</sub>
-    </td>
-  </tr>
-  <tr>
-    <td width="33.33%" align="center">
-      <strong>Ref2VA · 官方</strong><br><br>
-      <a href="assets/comparison/ref-official.mp4"><img src="assets/comparison/ref-official.webp" width="100%" alt="Ref2VA 官方生成效果"></a><br>
-      <sub>1024×768 · 成片 10 秒<br>推理步数 / 生成耗时：官方未公开</sub>
-    </td>
-    <td width="33.33%" align="center">
-      <strong>Ref2VA · 测试平台 · INT8 加速</strong><br><br>
-      <a href="assets/comparison/ref-base.mp4"><img src="assets/comparison/ref-base.webp" width="100%" alt="Ref2VA X-MinimaxH3 INT8 生成效果"></a><br>
-      <sub>1440×1088 · 20 步<br>加速指数 75 · 端到端 544 秒</sub>
-    </td>
-    <td width="33.33%" align="center">
-      <strong>Ref2VA · 测试平台 · LoRA 加速</strong><br><br>
-      <a href="assets/comparison/ref-lora.mp4"><img src="assets/comparison/ref-lora.webp" width="100%" alt="Ref2VA X-MinimaxH3 LoRA 生成效果"></a><br>
-      <sub>1440×1088 · 7 步<br>加速指数 40 · 端到端 373 秒</sub>
-    </td>
-  </tr>
-</table>
+- One public control surface: total sampling steps and a continuous `0–100`
+  acceleration value.
+- Joint Base scheduler for actual DiT evaluations, forecast evaluations and
+  per-step/per-layer attention budgets.
+- Six isolated launchers: FL2VA and Ref2VA on logical 24GB INT8, 16GB INT8 and
+  8GB W4A8 resource profiles.
+- Native generation from 360p through 1080p where admitted by the selected
+  profile, plus native H3 second sampling up to 1440p on INT8 profiles.
+- Text-only, first-frame, last-frame and first+last-frame FL2VA generation.
+- Multi-reference Ref2VA with images, videos and independent audio references.
+- Larry Turbo and three task-aware LightX2V LoRA profiles.
+- Resumable checkpoints with fixed low-cost previews.
+- Serial GPU queue, cancellation, task history and one-second hardware
+  telemetry.
+- Optional ComfyUI HTTP connector that does not load a second H3 model.
+- English and Simplified Chinese console and documentation.
 
-## 视频教程
+## Video tutorial
 
 <p align="center">
   <a href="https://www.bilibili.com/video/BV1Fn8q6JEhX/">
-    <img src="assets/tutorial/bilibili-quick-guide.jpg" width="860" alt="让你的 MiniMax H3 快如闪电——X-MinimaxH3 简易教程">
+    <img src="assets/tutorial/bilibili-quick-guide.jpg" width="860" alt="Make MiniMax H3 lightning fast — X-MinimaxH3 quick guide">
   </a>
 </p>
 
 <p align="center">
-  <strong>▶ 让你的 MiniMax H3 快如闪电</strong><br>
-  <sub>项目部署与使用简易教程 · 约 20 分钟 · BV1Fn8q6JEhX</sub><br>
-  <a href="https://www.bilibili.com/video/BV1Fn8q6JEhX/">前往哔哩哔哩观看完整视频</a>
+  <strong>▶ Make MiniMax H3 lightning fast</strong><br>
+  <sub>Quick deployment and usage guide · About 20 minutes · BV1Fn8q6JEhX · Chinese narration</sub><br>
+  <a href="https://www.bilibili.com/video/BV1Fn8q6JEhX/">Watch the complete tutorial on Bilibili</a>
 </p>
 
-## 交流与反馈
+## Community and feedback
 
-欢迎加入交流群讨论安装、使用和生成效果，也可以添加作者微信直接反馈问题。
+Join the community to discuss installation, usage and generation results, or
+contact the author directly on WeChat. Please include `X-MinimaxH3` in your
+friend request.
 
-| 添加作者 | 加入微信群 |
+| Contact the author | Join the WeChat group |
 |:---:|:---:|
-| <img src="assets/community/wechat-contact.jpg" width="260" alt="作者微信二维码"> | <img src="assets/community/wechat-group.jpg" width="260" alt="X-MinimaxH3 微信交流群二维码"> |
-| 请备注 `X-MinimaxH3` | 群二维码过期后会在这里更新 |
+| <img src="assets/community/wechat-contact.jpg" width="260" alt="Author WeChat QR code"> | <img src="assets/community/wechat-group.jpg" width="260" alt="X-MinimaxH3 WeChat group QR code"> |
+| Add `X-MinimaxH3` to the request | An updated QR code will be posted here after the current one expires |
 
-支持：
+For reproducible bugs and feature requests, please use
+[GitHub Issues](https://github.com/PullMyBoots/X-MinimaxH3/issues) so that the
+discussion and resolution remain searchable.
 
-- FL2VA 首尾帧生成视频
-- Ref2VA 图片、音频和视频参考生成
-- INT8 与 Turbo LoRA 动态切换
-- 稀疏注意力与预测步加速
-- 任务队列、断点保存与 LoRA 快速预览
-- Web UI、REST API 和 ComfyUI
-- 可选 FlashVSR 超分
+## Validated platform
 
-## 用户文档
+| Component | Validated configuration |
+|---|---|
+| GPU | NVIDIA GeForce RTX 4090, SM89 |
+| OS | Linux x86-64 / WSL2 |
+| Python | 3.10.20 |
+| PyTorch | 2.13.0+cu130 |
+| PyTorch CUDA runtime | 13.0 |
+| Service build toolkit | CUDA 13.3 |
+| Host memory | 64GB effective minimum recommended; more for long/high-resolution jobs |
 
-第一次使用请从 [《X-MinimaxH3 用户手册》](docs/USER_GUIDE.md) 开始。手册按实际
-操作顺序说明 Windows/Linux 安装、启动控制台、选择服务、Web 创作、ComfyUI 接入、
-REST API 提交与下载，以及常见错误排查。
+Other GPU architectures have not been release-validated. The logical 8GB and
+16GB routes were tested with hard allocator limits on SM89; a physical card of
+the same capacity still requires device-specific validation.
 
-## 运行要求
+## Quick start
 
-- NVIDIA CUDA 显卡；当前开发、测试和调优平台为 RTX 4090 24GB
-- 64GB 内存起步，推荐 96GB 以上
-- 至少 120GB 可用磁盘
-- Linux x86_64，或 Windows 11 + WSL2
+### Fresh installation
 
-当前预编译加速扩展在 RTX 4090（SM89）上完成验证，其他显卡型号尚未完成兼容性
-验证。Windows 原生 CUDA 暂不支持。
-
-## Windows 安装
-
-在 PowerShell 中进入项目目录：
-
-```powershell
-.\setup-and-start-windows.ps1 -AcceptModelLicense
-```
-
-也可以双击 `setup-and-start-windows.cmd`。安装完成后打开：
-
-<http://127.0.0.1:8090>
-
-以后启动和停止：
-
-```powershell
-.\start-windows.ps1
-.\stop-windows.ps1
-```
-
-模型和运行环境默认保存在 WSL 的
-`~/.local/share/x-minimaxh3`，生成结果保存在当前工作空间。
-
-## Linux 安装
+This creates the runtime, checks out pinned upstream sources and downloads all
+weights declared by `models/manifest.json`:
 
 ```bash
-chmod +x *.sh scripts/*.sh
-./setup-and-start.sh --accept-model-license
+git clone <your-github-url> X-MinimaxH3
+cd X-MinimaxH3
+./setup.sh --download-models --accept-model-license
+./run.sh
 ```
 
-只安装、不启动：
+`--accept-model-license` confirms that you have reviewed and accepted the
+publishers' model licenses. It does not alter or replace those licenses.
+
+### Reuse an existing installation
 
 ```bash
-./install.sh --accept-model-license
+./setup.sh \
+  --reuse-env /path/to/python-env \
+  --model-dir /path/to/h3-model-store \
+  --vendor-dir /path/to/vendor \
+  --sparse-build-dir /path/to/compiled/sparge
+./run.sh
 ```
 
-启动后打开 <http://127.0.0.1:8090>。
+The vendor directory must contain `MiniMax-H3/` and `LightX2V/`. The sparse
+build argument can be omitted when the compatible extension is in the standard
+sibling `extensions/` directory.
 
-## 按需安装
+Open <http://127.0.0.1:8090>. Stop the service with:
 
-| 配置 | 内容 | 约需下载 |
+```bash
+./stop.sh
+```
+
+On WSL2, `./run.sh` automatically mirrors the hot source tree and caches to the
+Linux filesystem, avoiding repeated imports and metadata access through
+`/mnt/c`.
+
+## Validation
+
+Run a quick installation check, full model/revision preflight and regression
+suite with:
+
+```bash
+./doctor.sh
+./doctor.sh --full
+./test.sh
+```
+
+The release validation recorded:
+
+- 709 release tests passed, 4 skipped and 0 failed; all 24 ComfyUI connector
+  tests also passed;
+- exact size and SHA-256 checks passed for all 12 declared model artifacts;
+- all six launchers and the SM89 INT8/W4A8 kernel smoke test passed;
+- real MP4 generation passed for Base FL2VA, LightX2V FL2VA 4-step and 8-step,
+  and LightX2V Ref2VA 4-step.
+
+See [VALIDATION.md](VALIDATION.md) for commands, timings and output hashes.
+
+## Resource profiles
+
+| Profile | Weights | Native first generation | Native H3 second sampling |
+|---|---|---|---|
+| 24GB | INT8 | up to 1080p × 15s | up to 1440p |
+| 16GB | INT8 | experimental up to 1080p × 15s | up to 1440p |
+| 8GB | W4A8 | up to 720p × 15s | up to 1080p |
+
+Out-of-envelope jobs are rejected instead of silently switching to another
+backend. Resolution, duration and media limits exposed by the active service
+are authoritative.
+
+The Settings page exposes a 68–362 frame temporal-context control for native
+H3 second sampling. Shorter windows usually reduce per-window DiT latency;
+longer windows preserve more motion and identity context. H3 phase alignment,
+17-frame overlap, latent crossfade and VRAM-safe shortening remain automatic.
+
+## LoRA profiles
+
+| Profile | Task family | Calibrated steps |
 |---|---|---:|
-| `full` | FL2VA、Ref2VA、LoRA、FlashVSR | 65.8GiB |
-| `core` | FL2VA、Ref2VA、LoRA | 59.8GiB |
-| `fl2va` | FL2VA 与 LoRA | 40.3GiB |
-| `ref2va` | Ref2VA 与 LoRA | 40.3GiB |
-| `upscaler` | 仅 FlashVSR | 6.0GiB |
+| Larry Turbo v4-600 EMA | FL2VA / Ref2VA | 4–8, default 6 |
+| LightX2V FL2VA Turbo v1.1 768p | FL2VA | 4 |
+| LightX2V FL2VA Turbo v1.0 768p | FL2VA | 8 |
+| LightX2V Ref2VA Turbo v0.1 | Ref2VA | 4 |
 
-例如只安装 FL2VA：
+FL2VA and Ref2VA LightX2V adapters are task-specific and cannot be
+interchanged. The settings page scans compatible files recursively under the
+configured model store's `loras/` directory.
 
-```bash
-./install.sh --profile fl2va --accept-model-license
-```
+## ComfyUI
 
-中国大陆默认优先从 ModelScope 下载公开权重，不需要 Token。下载支持断点续传和
-SHA-256 校验。
+See the [English ComfyUI guide](integrations/comfyui/README.en.md) or the
+[Chinese ComfyUI guide](integrations/comfyui/README.md).
 
-## 使用
-
-启动服务后，在首页选择 FL2VA 或 Ref2VA。INT8 与 LoRA 由每个任务自行选择，
-不需要启动多个后端进程。
-
-- Web UI：<http://127.0.0.1:8090>
-- API 合同：<http://127.0.0.1:8090/openapi.json>
-- ComfyUI 安装：[integrations/comfyui/README.md](integrations/comfyui/README.md)
-- 完整用户手册：[docs/USER_GUIDE.md](docs/USER_GUIDE.md)
-
-工作空间保存上传素材、任务记录、断点和生成视频。默认位置为
-`workspace/default`，也可以在 Web UI 中选择其他目录。
-
-## 设置
-
-Web UI 设置页可以统一配置：
-
-- MiMo API Key
-- 参考图片和参考视频的压缩上限
-- 每种分辨率与画面比例允许生成的最长时长
-- 主机内存策略
-
-这些限制同时作用于 Web UI、REST API 和 ComfyUI。参考媒体只会等比例降低
-分辨率，不会裁切、拉伸或改变时长。
-
-## 自检
+Start X-MinimaxH3 first, select a launcher in its console, and then run:
 
 ```bash
-./scripts/doctor.py --profile full
+./integrations/comfyui/start_comfyui.sh
 ```
 
-完整校验所有模型文件：
+Open <http://127.0.0.1:8188>. Example workflows are provided in
+`integrations/comfyui/example_workflows/` in both English and Simplified
+Chinese. The connector calls the same 8090
+HTTP service and does not allocate another copy of H3 inside ComfyUI.
 
-```bash
-./scripts/doctor.py --profile full --full-hash
+## Repository layout
+
+```text
+h3serve/                 Web/API, queue, scheduler and native H3 runtime
+backends/                SM89 kernels and audited narrow binary runtime
+static/                  bilingual Web console
+integrations/comfyui/    optional connector and example workflows
+models/manifest.json     weight provenance, sizes and SHA-256 contract
+scripts/                 setup, launch, validation and research utilities
+tests/                   unit, contract and runtime regression tests
+docs/                    user, deployment and architecture documentation
 ```
 
-## 注意事项
+## Documentation
 
-- 加速力度越高，生成速度越快，动作连续性、音色和画面稳定性的风险也越高。
-- Ref2VA 的参考视频编辑能力存在模型边界，复杂指令不保证完全遵循。
-- 1080P 长视频可能因显存不足进入低功耗卸载状态；请在设置中按本机显存调整时长上限。
+- [English user guide](docs/USER_GUIDE.en.md)
+- [English deployment guide](docs/DEPLOYMENT.en.md)
+- [中文用户指南](docs/USER_GUIDE.zh-CN.md)
+- [中文部署指南](docs/DEPLOYMENT.zh-CN.md)
+- [Native engine architecture](docs/NATIVE_ENGINE_ARCHITECTURE.md)
+- [Third-party notices](THIRD_PARTY_NOTICES.md)
+- [Release validation](VALIDATION.md)
 
-## 许可证
+## Security
 
-项目原创代码使用 [The Unlicense](LICENSE)，允许自由使用、修改和分发。
+The default server listens only on `127.0.0.1`. Set a strong
+`H3_SERVE_API_KEY` before binding to a non-loopback address. The service does
+not provide TLS or multi-tenant isolation; use a trusted reverse proxy for
+network deployments. See [SECURITY.md](SECURITY.md).
 
-MiniMax H3、模型权重和第三方组件仍受各自许可证约束。下载或分发前请阅读：
+## Acknowledgements
 
-- [MiniMax H3 Community License](third_party_licenses/MiniMax-H3-COMMUNITY-LICENSE)
-- [第三方组件与来源](THIRD_PARTY_NOTICES.md)
+X-MinimaxH3 builds on important work from the MiniMax H3 community. In
+particular, we thank:
+
+- [Comfyui-MMH3-UltimateUpscale](https://github.com/bbaudio-2025/Comfyui-MMH3-UltimateUpscale)
+  for the temporal/spatial chunking, overlap and stitching design underlying
+  our native second-sampling planner. We adapted this design into a
+  ComfyUI-independent runtime, added full-canvas admission, automatic resource
+  routing, H3 phase alignment and condition-cache reuse.
+- [Comfyui Minimax H3 Latent Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)
+  for the learned 3D latent-upscaling architecture and released H3 latent
+  upscaler weights used to initialize second sampling.
+- [SageAttention](https://github.com/thu-ml/SageAttention) for the quantized
+  dense-attention kernels and implementation foundation used by our SM89
+  dense Attention path. X-MinimaxH3 adds H3-specific layout, quantization,
+  long-sequence stability and scheduler integration around that foundation.
+
+The upstream projects are not affiliated with or responsible for
+X-MinimaxH3. Their original licenses and notices remain in force; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## License
+
+This is a **public-source** release, not an open-source license grant. Original
+project code is currently all rights reserved. Third-party software and model
+artifacts retain their own licenses. Review [LICENSE](LICENSE),
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
+[models/manifest.json](models/manifest.json) before use or redistribution.

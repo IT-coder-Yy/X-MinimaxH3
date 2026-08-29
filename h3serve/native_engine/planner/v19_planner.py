@@ -24,6 +24,7 @@ from .v19_calibration import (
 from .v19_contracts import (
     V19_CONTRACT_SCHEMA,
     V19HumanRiskVector,
+    V19ParetoObjectiveVector,
     V19TrajectoryDebt,
     V19_INPUT_CAPABILITY,
 )
@@ -196,6 +197,16 @@ class V19CandidatePlan:
             "maximum_debt": asdict(self.maximum_debt),
         })
 
+    @property
+    def pareto_objective(self) -> V19ParetoObjectiveVector:
+        return V19ParetoObjectiveVector(
+            cost_p90_ms=self.predicted_cost_p90_ms,
+            peak_vram_gib=self.predicted_peak_vram_gib,
+            human_risk=self.risk_ucb,
+            terminal_debt=self.terminal_debt,
+            maximum_debt=self.maximum_debt,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class V19PlanningRequest:
@@ -334,11 +345,7 @@ def validate_candidate_actions(
 
 
 def _dominates(left: V19CandidatePlan, right: V19CandidatePlan) -> bool:
-    left_values = (left.predicted_cost_p90_ms,) + left.risk_ucb.as_tuple()
-    right_values = (right.predicted_cost_p90_ms,) + right.risk_ucb.as_tuple()
-    return all(a <= b for a, b in zip(left_values, right_values)) and any(
-        a < b for a, b in zip(left_values, right_values)
-    )
+    return left.pareto_objective.dominates(right.pareto_objective)
 
 
 class V19ParetoPlanner:

@@ -2,10 +2,9 @@
 set -euo pipefail
 
 release_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-runtime_root="${H3_SERVE_RUNTIME_DIR:-${release_root}/runtime}"
 source "${release_root}/scripts/_process.sh"
 serve_port="${H3_SERVE_PORT:-8090}"
-pid_file="${H3_SERVE_PID_FILE:-${runtime_root}/h3serve-${serve_port}.pid}"
+pid_file="${H3_SERVE_PID_FILE:-${release_root}/runtime/h3serve-${serve_port}.pid}"
 server_path="${release_root}/server.py"
 flashvsr_path="${release_root}/scripts/flashvsr_worker.py"
 

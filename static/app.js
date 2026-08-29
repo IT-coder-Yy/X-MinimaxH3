@@ -1,9 +1,11 @@
 const $ = (selector, root=document) => root.querySelector(selector);
 const $$ = (selector, root=document) => [...root.querySelectorAll(selector)];
+const tr = value => window.H3I18n?.t(String(value)) || String(value);
 let options = null;
 let jobs = [];
 let videoObjectUrl = null;
 let currentEngine = null;
+let currentLauncher = null;
 let draggedJobId = null;
 let shots = [];
 let shotSequence = 0;
@@ -17,6 +19,14 @@ let activeShotIndex = 0;
 let engineReconcilePromise = null;
 let workspaceBrowseParent = null;
 let promptEditorMode = 'structured';
+let bootReady = false;
+let uiPollPromise = null;
+let checkpointPreviewPolicy = {steps:4, resolution:'360p'};
+let globalLoraPolicy = {selected:null, loaded:null, changing:false, available:[]};
+let secondSamplingWindowFrames = Math.max(
+  68,
+  Math.min(362, Number(localStorage.getItem('h3serve_second_sampling_window_frames')) || 136),
+);
 
 function invalidatePromptEnhancement(scope='visuals') {
   const scopes = scope === 'all' ? ['references','visuals','sound'] : [scope];
@@ -30,15 +40,23 @@ function invalidatePromptEnhancement(scope='visuals') {
   const message = $('#enhancementMessage'); if (message) message.hidden = true;
 }
 
-const engineDescriptions = {
-  first_last: '文生视频与首帧、尾帧、首尾帧约束；任务内可热切换原始权重或 LoRA。',
-  reference: '图片、视频、音频多模态参考；任务内可热切换原始权重或 LoRA。',
-};
-
 function currentVariant() { return $('[name="model_variant"]')?.value || 'base'; }
 function currentEngineKey() {
   if (currentEngine === 'reference') return currentVariant() === 'lora' ? 'reference_lora' : 'reference';
   return currentVariant() === 'lora' ? 'lora' : 'original';
+}
+
+function updateSubmitAvailability() {
+  const button = $('.submit-button', $('#generationForm'));
+  if (!button || button.dataset.submitting === 'true') return;
+  button.disabled = !bootReady || !currentEngine || Boolean(options?.engine_control?.switching);
+  button.title = !bootReady
+    ? '控制台正在初始化'
+    : !currentEngine
+      ? '请先选择生成模式'
+      : options?.engine_control?.switching
+        ? '模型正在切换，请稍候'
+        : '发送生成任务';
 }
 
 function renderEngineLobby() {
@@ -55,14 +73,38 @@ function renderEngineLobby() {
   }
   if (!unified) return;
   renderWorkspace();
-  const families = options.service_families || {};
-  $('#engineChoices').innerHTML = Object.entries(families).map(([key, info]) => `
-    <section class="engine-choice-group"><h2>${escapeHtml(info.label)}</h2><div>
+  const launchers = options.model_launchers || {};
+  const profileLabels = { '24gb':'24GB 独立高速后端', '16gb':'16GB 独立紧凑后端', '8gb':'8GB 独立低比特后端' };
+  $('#engineChoices').innerHTML = ['24gb', '16gb', '8gb'].map(profile => {
+    const profileLaunchers = Object.entries(launchers).filter(([, info]) => info.vram_profile === profile);
+    if (!profileLaunchers.length) return '';
+    return `<section class="engine-choice-group"><h2>${escapeHtml(profileLabels[profile])}</h2><div>${profileLaunchers.map(([key, info]) => `
       <button type="button" class="engine-choice" data-enter-engine="${escapeHtml(key)}">
-        <strong>${escapeHtml(info.label)}</strong><small>${escapeHtml(engineDescriptions[key] || info.description || '')}</small>
-      </button>
-    </div></section>`).join('');
+        <strong>${escapeHtml(info.label)}</strong><small>${escapeHtml(info.description || '')}</small>
+      </button>`).join('')}</div></section>`;
+  }).join('');
   $$('[data-enter-engine]').forEach(button => button.addEventListener('click', () => enterEngine(button.dataset.enterEngine)));
+  renderEngineLoadProgress(options?.warm_state, options?.engine_control?.switching);
+}
+
+function renderEngineLoadProgress(warmState, switching=false) {
+  const panel = $('#engineLoadProgress');
+  if (!panel) return;
+  const warm = warmState || {};
+  const visible = Boolean(switching) || warm.status === 'loading';
+  panel.hidden = !visible;
+  if (!visible) return;
+  const percent = Math.max(1, Math.min(99, Number(warm.progress_percent) || 1));
+  const stageNames = {
+    starting:'启动模型加载', preflight:'检查运行环境', model_paths:'准备本地权重',
+    text_encoder:'准备文本编码器', model_graphs:'装配模型组件',
+    vae_warmup:'编译预热视频VAE', host_memory:'整理主机内存',
+    finalize:'完成运行时初始化',
+  };
+  $('#engineLoadStage').textContent = tr(stageNames[warm.progress_stage] || '正在加载模型引擎');
+  $('#engineLoadPercent').textContent = `${percent.toFixed(0)}%`;
+  $('#engineLoadBar').value = percent;
+  $('#engineLoadDetail').textContent = tr(warm.progress_detail || '首次加载需要读取并装配模型权重');
 }
 
 function renderWorkspace() {
@@ -114,16 +156,17 @@ async function activateWorkspace() {
   finally { button.disabled = false; button.textContent = '使用这个文件夹'; }
 }
 
-async function enterEngine(engine) {
+async function enterEngine(launcher) {
   const lobby = $('#engineLobby'), message = $('#engineLobbyMessage');
   lobby.classList.add('loading');
-  message.textContent = `正在加载${options.service_families[engine].label}（含原始权重与LoRA开关），首次进入可能需要几十秒…`;
+  message.textContent = tr(`正在加载${options.model_launchers[launcher].label}（含原始权重与LoRA开关），首次进入可能需要几十秒…`);
   message.hidden = false;
+  renderEngineLoadProgress({status:'loading', progress_percent:1, progress_stage:'starting', progress_detail:'正在提交模型加载请求'}, true);
   $$('[data-enter-engine]').forEach(button => button.disabled = true);
   try {
     await api('/api/v1/engine', {
       method:'PUT', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({service_family:engine}),
+      body:JSON.stringify({launcher}),
     });
     await reloadOptions();
     switchPage('tasks');
@@ -139,27 +182,30 @@ async function enterEngine(engine) {
 }
 
 async function exitEngine() {
-  if (!confirm('退出当前模式会释放模型热态。确认退出？')) return;
+  if (!confirm(tr('退出当前模式会释放模型热态。确认退出？'))) return;
   const button = $('#exitEngine'); button.disabled = true; button.textContent = '正在释放…';
   try {
     await api('/api/v1/engine', {method:'DELETE'});
     await reloadOptions();
-  } catch (error) { alert(`退出失败：${error.message}`); }
+  } catch (error) { alert(tr(`退出失败：${error.message}`)); }
   finally { button.disabled = false; button.textContent = '切换模型'; }
 }
 
 function applyOptions(document) {
   const previousEngine = currentEngine;
+  const previousLauncher = currentLauncher;
   options = document;
   currentEngine = options.current_engine;
-  if (previousEngine !== currentEngine) invalidatePromptEnhancement('all');
+  currentLauncher = options.current_launcher;
+  if (previousEngine !== currentEngine || previousLauncher !== currentLauncher) invalidatePromptEnhancement('all');
+  synchronizeResolutionOptions();
   renderEngineLobby();
   renderReferenceMediaPolicy();
-  renderGenerationLimitPolicy();
   if (currentEngine) {
     applyEngineIdentity();
     switchPage(activePage);
   }
+  updateSubmitAvailability();
   renderMemoryProfiles(); updateContract();
 }
 
@@ -174,14 +220,35 @@ async function reconcileEngineState(force=false) {
     const document = await (await api('/api/v1/options')).json();
     const lobbyStuck = $('#engineLobby').classList.contains('loading');
     const changed = document.current_engine !== currentEngine
+      || document.current_launcher !== currentLauncher
       || Boolean(document.engine_control?.switching) !== Boolean(options?.engine_control?.switching);
-    if (force || changed || (lobbyStuck && document.current_engine)) {
+    if (force || changed || lobbyStuck) {
       applyOptions(document);
     }
     return Boolean(document.current_engine) && !document.engine_control?.switching;
   })();
   try { return await engineReconcilePromise; }
   finally { engineReconcilePromise = null; }
+}
+
+function synchronizeResolutionOptions() {
+  const select = $('[name="resolution"]');
+  if (!select || !options) return;
+  const allowed = new Set(options.resolutions || []);
+  Array.from(select.options).forEach(option => {
+    const enabled = allowed.has(option.value);
+    option.disabled = !enabled;
+    option.hidden = !enabled;
+  });
+  if (!allowed.has(select.value)) {
+    select.value = allowed.has(options.defaults?.resolution)
+      ? options.defaults.resolution
+      : (allowed.has('480p') ? '480p' : [...allowed][0]);
+  }
+  const limit = Number(options.advanced_limits?.dimension_max) || 2560;
+  $$('[name="width"],[name="height"]').forEach(input => {
+    input.max = String(limit);
+  });
 }
 
 function apiHeaders() {
@@ -192,10 +259,24 @@ function apiHeaders() {
 }
 
 async function api(path, init={}) {
-  init.headers = {...apiHeaders(), ...(init.headers || {})};
-  const response = await fetch(path, init);
-  if (!response.ok) throw new Error((await response.text()) || `HTTP ${response.status}`);
-  return response;
+  const request = {...init};
+  const method = String(request.method || 'GET').toUpperCase();
+  const timeoutMs = Number(request.timeoutMs ?? (method === 'GET' ? 10000 : 0));
+  delete request.timeoutMs;
+  request.headers = {...apiHeaders(), ...(request.headers || {})};
+  const controller = timeoutMs > 0 && !request.signal ? new AbortController() : null;
+  if (controller) request.signal = controller.signal;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    const response = await fetch(path, request);
+    if (!response.ok) throw new Error((await response.text()) || `HTTP ${response.status}`);
+    return response;
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new Error('服务响应超时；请检查8090端口转发，或等待当前计算阶段结束');
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function configureServerMimoKey(value) {
@@ -228,18 +309,109 @@ async function configureServerReferenceMedia(imageResolution, videoResolution) {
   return response.json();
 }
 
-async function serverGenerationLimitSettings() {
-  const response = await api('/api/v1/settings/generation-limits');
+async function serverCheckpointPreviewSettings() {
+  const response = await api('/api/v1/settings/checkpoint-preview');
   return response.json();
 }
 
-async function configureServerGenerationLimits(presetLimits) {
-  const response = await api('/api/v1/settings/generation-limits', {
+async function configureServerCheckpointPreview(steps, resolution) {
+  const response = await api('/api/v1/settings/checkpoint-preview', {
     method:'PUT',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({preset_limits:presetLimits}),
+    body:JSON.stringify({steps:Number(steps), resolution:String(resolution || '').trim()}),
   });
   return response.json();
+}
+
+async function serverLoraSettings() {
+  const response = await api('/api/v1/settings/lora');
+  return response.json();
+}
+
+async function configureServerLora(checkpoint) {
+  const response = await api('/api/v1/settings/lora', {
+    method:'PUT', timeoutMs:0,
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({checkpoint:String(checkpoint || '').trim()}),
+  });
+  return response.json();
+}
+
+function renderGlobalLoraPolicy(document=null) {
+  if (document) globalLoraPolicy = document;
+  const policy = globalLoraPolicy || {};
+  const select = $('#globalLoraCheckpoint');
+  const badge = $('#globalLoraBadge');
+  const status = $('#globalLoraStatus');
+  const button = $('#loadGlobalLora');
+  if (!select || !badge || !status || !button) return;
+  select.replaceChildren();
+  const available = Array.isArray(policy.available) ? policy.available : [];
+  if (!available.length) {
+    const option = new Option(tr('未发现 LoRA 权重'), '');
+    option.disabled = true; option.selected = true; select.add(option);
+  } else {
+    available.forEach(item => {
+      const size = Number(item.bytes) > 0 ? ` · ${(Number(item.bytes) / 1073741824).toFixed(2)} GiB` : '';
+      const compatibility = item.compatible ? '' : ` · ${tr('格式不兼容')}`;
+      const profile = item.profile || {};
+      const label = profile.display_name || item.id;
+      const steps = Array.isArray(profile.recommended_steps) && profile.recommended_steps.length
+        ? ` · ${profile.recommended_steps.join('/')}步`
+        : '';
+      const option = new Option(`${label}${steps}${size}${compatibility}`, item.id);
+      option.disabled = !item.compatible;
+      select.add(option);
+    });
+    if (policy.selected && available.some(item => item.id === policy.selected && item.compatible)) {
+      select.value = policy.selected;
+    }
+  }
+  const compatibleCount = available.filter(item => item.compatible).length;
+  badge.textContent = policy.changing ? tr('切换中') : `${compatibleCount} ${tr('个可用')}`;
+  status.textContent = policy.changing
+    ? tr('正在释放并重建当前 H3 热引擎，请勿提交任务。')
+    : policy.selected
+      ? `${tr('当前版本')}：${policy.selected}${policy.loaded ? ` · ${tr('热引擎已加载')}：${policy.loaded}` : ''}`
+      : tr('选择一个兼容权重；进入模型后加载会重建热引擎。');
+  select.disabled = Boolean(policy.changing) || compatibleCount === 0;
+  button.disabled = select.disabled || !select.value;
+}
+
+async function loadSelectedGlobalLora() {
+  const button = $('#loadGlobalLora');
+  const checkpoint = $('#globalLoraCheckpoint').value;
+  if (!checkpoint) return;
+  button.disabled = true;
+  button.textContent = tr('正在重建引擎…');
+  $('#globalLoraStatus').textContent = tr('切换要求队列为空；当前热引擎将完整释放并重新加载。');
+  try {
+    renderGlobalLoraPolicy(await configureServerLora(checkpoint));
+    await reloadOptions();
+  } catch (error) {
+    $('#globalLoraStatus').textContent = `${tr('加载失败')}：${error.message}`;
+  } finally {
+    button.textContent = tr('加载所选 LoRA');
+    button.disabled = !$('#globalLoraCheckpoint').value;
+  }
+}
+
+function renderCheckpointPreviewPolicy(document=null) {
+  const policy = document || options?.checkpoint_preview || checkpointPreviewPolicy;
+  checkpointPreviewPolicy = {
+    steps:Math.max(1, Math.min(8, Number(policy.steps) || 4)),
+    resolution:['360p','480p','720p'].includes(policy.resolution) ? policy.resolution : '360p',
+  };
+  const steps = $('#globalCheckpointPreviewSteps');
+  const resolution = $('#globalCheckpointPreviewResolution');
+  if (steps) steps.value = String(checkpointPreviewPolicy.steps);
+  if (resolution) resolution.value = checkpointPreviewPolicy.resolution;
+  const output = $('#globalCheckpointPreviewStepsValue');
+  if (output) output.textContent = `${checkpointPreviewPolicy.steps} 步`;
+  const summary = $('#checkpointPreviewPolicySummary');
+  if (summary) {
+    summary.textContent = `预览：${checkpointPreviewPolicy.resolution.toUpperCase()} · ${checkpointPreviewPolicy.steps}步 LoRA`;
+  }
 }
 
 function resolutionPolicyLabel(value) {
@@ -260,34 +432,23 @@ function renderReferenceMediaPolicy(document=null) {
   }
 }
 
-function renderGenerationLimitPolicy(document=null) {
-  const policy = document || options?.generation_limits;
-  if (!policy) return;
-  const detected = Number(policy.detected_vram_gib);
-  const status = $('#generationLimitStatus');
-  if (status) status.textContent = Number.isFinite(detected)
-    ? `当前GPU ${detected.toFixed(1)} GB`
-    : '显存未检测到';
-  const hint = $('#generationLimitHint');
-  if (hint) hint.textContent = '逐项设置每种分辨率和画面比例允许提交的最长时长；只限制任务提交，不改变输出画面。';
-  const matrix = policy.preset_limits || policy.max_by_preset || options?.duration?.max_by_preset;
-  const editor = $('#generationLimitEditor');
-  if (!editor || !matrix) return;
-  const ratios = policy.aspect_ratios || options?.aspect_ratios || ['1:1','4:3','3:4','16:9','9:16'];
-  const resolutions = policy.resolutions || options?.resolutions || Object.keys(matrix);
-  editor.innerHTML = `<div class="generation-limit-head"><b>规格</b>${ratios.map(ratio => `<b>${escapeHtml(ratio)}</b>`).join('')}</div>${resolutions.map(resolution => `<section><b>${escapeHtml(String(resolution).toUpperCase())}</b>${ratios.map(ratio => { const seconds=Number(matrix?.[resolution]?.[ratio] ?? 15); return `<label title="${escapeHtml(resolution)} ${escapeHtml(ratio)} 最长时长"><input type="range" min="1" max="15" step="0.5" value="${seconds}" data-limit-resolution="${escapeHtml(resolution)}" data-limit-ratio="${escapeHtml(ratio)}"><output>${seconds.toFixed(1)}秒</output></label>`; }).join('')}</section>`).join('')}`;
-  $$('[data-limit-resolution]', editor).forEach(input => input.addEventListener('input', () => { input.nextElementSibling.textContent = `${Number(input.value).toFixed(1)}秒`; }));
+function secondSamplingWindowLabel(frames=secondSamplingWindowFrames) {
+  const value = Math.max(68, Math.min(362, Math.round(Number(frames) || 136)));
+  return `约 ${(value / 24).toFixed(1)} 秒 · ${value} 帧`;
 }
 
-function readGenerationLimitEditor() {
-  const limits = {};
-  $$('[data-limit-resolution]', $('#generationLimitEditor')).forEach(input => {
-    const resolution = input.dataset.limitResolution;
-    const ratio = input.dataset.limitRatio;
-    if (!limits[resolution]) limits[resolution] = {};
-    limits[resolution][ratio] = Number(input.value);
-  });
-  return limits;
+function renderSecondSamplingWindowSetting(frames=secondSamplingWindowFrames) {
+  secondSamplingWindowFrames = Math.max(
+    68, Math.min(362, Math.round(Number(frames) || 136)),
+  );
+  const control = $('#globalSecondSamplingWindow');
+  const output = $('#globalSecondSamplingWindowValue');
+  if (control) control.value = String(secondSamplingWindowFrames);
+  if (output) output.textContent = secondSamplingWindowLabel();
+  const summary = $('#secondSamplingWindowSummary');
+  if (summary) {
+    summary.textContent = `时间窗口${secondSamplingWindowLabel()}；Overlap 与 latent 交叉融合自动处理。`;
+  }
 }
 
 function selected(name) { return $(`[name="${name}"]`).value; }
@@ -314,8 +475,23 @@ function renderMemoryProfiles() {
   activeMemoryProfile = memory.active_profile;
   const effective = Number(memory.detected?.effective_limit_gib || 0);
   const available = Number(memory.detected?.available_gib || 0);
-  $('#detectedMemory').textContent = `有效 ${effective.toFixed(1)} GiB · 当前可用 ${available.toFixed(1)} GiB`;
-  $('#memoryProfileList').innerHTML = memory.profiles.map(profile => {
+  $('#detectedMemory').textContent = tr(`有效 ${effective.toFixed(1)} GiB · 当前可用 ${available.toFixed(1)} GiB`);
+  const profileByKey = Object.fromEntries(memory.profiles.map(profile => [profile.key, profile]));
+  const releaseProfiles = [
+    {
+      ...profileByKey.fullspeed,
+      label:'＞64GB 高速模式',
+      description:'Qwen与H3保持热态，优先缩短生成和二次采样的切换等待。',
+      activeKeys:['fullspeed','generation_hot'],
+    },
+    {
+      ...profileByKey.compact,
+      label:'≤64GB 兼容模式',
+      description:'按执行阶段控制CPU权重驻留，在较小主机内存下保持完整生成能力。',
+      activeKeys:['compact'],
+    },
+  ].filter(profile => profile.key);
+  $('#memoryProfileList').innerHTML = releaseProfiles.map(profile => {
     // 128GB Windows hosts commonly expose about 110GiB to WSL. The backend
     // remains authoritative and also checks current free memory.
     const measuredCapacityFloors = {
@@ -328,14 +504,17 @@ function renderMemoryProfiles() {
     const enough = effective >= capacityFloor;
     const selectable = ['validated','review'].includes(profile.evidence);
     const enabled = enough && selectable;
-    const badge = profile.evidence === 'validated' ? `最低 ${profile.minimum_ram_gib}GB` : profile.evidence === 'review' ? `最低 ${profile.minimum_ram_gib}GB · 终审中` : '实验 · 尚未开放';
+    const isHigh = profile.key === 'fullspeed';
+    const isActive = profile.activeKeys.includes(memory.active_profile);
+    const selectedKey = isActive ? memory.active_profile : profile.key;
+    const badge = isHigh ? '64GB以上' : '64GB及以下';
     return `<label class="memory-profile-option ${enabled ? '' : 'unavailable'}">
-      <input type="radio" name="host_memory_profile" value="${escapeHtml(profile.key)}" ${profile.key === memory.active_profile ? 'checked' : ''} ${enabled ? '' : 'disabled'}>
+      <input type="radio" name="host_memory_profile" value="${escapeHtml(selectedKey)}" ${isActive ? 'checked' : ''} ${enabled ? '' : 'disabled'}>
       <span><strong>${escapeHtml(profile.label)}</strong><small>${escapeHtml(profile.description)}</small></span>
-      <em class="${profile.evidence === 'validated' ? '' : 'experimental'}">${badge}</em>
+      <em>${badge}</em>
     </label>`;
   }).join('');
-  $('#memoryProfileHint').textContent = currentEngine ? '模式改变CPU权重驻留和阶段切换，不改变模型权重、采样步数或画质。96GB/64GB超分时会自动释放H3，完成后恢复热态。' : '当前没有加载H3引擎；可先选择内存模式，再进入生成模式。';
+  $('#memoryProfileHint').textContent = currentEngine ? '模式只改变CPU权重驻留和阶段切换，不改变模型权重、采样步数或画质。' : '当前没有加载H3引擎；可先选择内存模式，再进入生成模式。';
 }
 
 async function applyMemoryProfile() {
@@ -397,6 +576,16 @@ function addShot({duration_seconds=5, prompt=''}={}) {
 }
 
 function shotTotal() { return shots.reduce((total, shot) => total + (Number(shot.duration_seconds) || 0), 0); }
+
+function syncStructuredEditorState() {
+  $$('#shotList .shot-card').forEach((card, index) => {
+    if (!shots[index]) return;
+    const duration = $('.shot-duration input', card);
+    const prompt = $('.shot-prompt textarea', card);
+    if (duration) shots[index].duration_seconds = Number(duration.value);
+    if (prompt) shots[index].prompt = prompt.value;
+  });
+}
 
 function currentMaxDuration() {
   const fallback = 15;
@@ -872,57 +1061,16 @@ function currentGeometry() {
   return options.geometry[selected('resolution')][selected('aspect_ratio')];
 }
 
-function even(value) { return Math.max(2, Math.round(Number(value) / 2) * 2); }
-
-function resolvedUpscaleGeometry() {
-  const source = currentGeometry();
-  if (!$('#upscaleEnabled').checked) return source;
-  const shortEdge = ({'720p':720, '1080p':1080, '2k':1440})[selected('upscale_resolution')] || 720;
-  return source.width >= source.height
-    ? {width:even(shortEdge * source.width / source.height), height:shortEdge}
-    : {width:shortEdge, height:even(shortEdge * source.height / source.width)};
-}
-
-function updateUpscaleControls() {
-  if (!options) return;
-  const enabled = $('#upscaleEnabled').checked;
-  const available = Boolean(options.advanced_limits?.upscaler?.available);
-  $('#upscaleCard').classList.toggle('unavailable', !available);
-  $('#upscaleEnabled').disabled = !available;
-  $('#upscaleControls').hidden = !enabled;
-  $('[name="upscale_mode"]').disabled = !enabled;
-  $('[name="upscale_resolution"]').disabled = !enabled;
-  const source = currentGeometry();
-  const sourceShortEdge = Math.min(source.width, source.height);
-  const levels = {'720p':720, '1080p':1080, '2k':1440};
-  const buttons = $$('.upscale-resolution-tabs button');
-  buttons.forEach(button => { button.disabled = levels[button.dataset.upscaleResolution] <= sourceShortEdge; });
-  if ((levels[selected('upscale_resolution')] || 0) <= sourceShortEdge) {
-    const next = buttons.find(button => !button.disabled)?.dataset.upscaleResolution;
-    if (next) {
-      $('[name="upscale_resolution"]').value = next;
-      buttons.forEach(button => button.classList.toggle('active', button.dataset.upscaleResolution === next));
-    }
-  }
-  $('#upscaleStateText').textContent = !available ? '不可用' : !enabled ? '关闭' : `开启 · ${selected('upscale_resolution')}`;
-  const target = resolvedUpscaleGeometry();
-  const deliveryText = $('#deliveryText');
-  if (deliveryText) deliveryText.textContent = `${target.width} × ${target.height}`;
-  const hint = $('#upscaleHint');
-  if (hint) hint.textContent = !available
-    ? 'FlashVSR 源码或权重未安装完整，请运行项目安装脚本。'
-    : `输出 ${target.width} × ${target.height}；H3仍按 ${source.width} × ${source.height} 生成，超分耗时单独记录。`;
-  updateSettingsSummaries();
-}
-
 function updateSettingsSummaries() {
   const inference = $('#inferenceSummary');
   if (inference) {
-    const variant = currentVariant() === 'lora' ? 'LoRA' : 'INT8';
+    const baseTier = options?.active_weight_tier === 'w4a8' ? 'W4A8' : 'INT8';
+    const variant = currentVariant() === 'lora' ? `${baseTier}+LoRA` : baseTier;
     const steps = Number(selected('sampling_steps')) || (currentVariant() === 'lora' ? 8 : 20);
     const acceleration = Number(selected('acceleration')) || 0;
-    const checkpoint = selected('execution_mode') === 'checkpoint'
-      ? ` · 断点@${Number(selected('checkpoint_step')) || 1}` : '';
+    const checkpoint = $('#checkpointEnabled')?.checked
+      ? ` · 第${Number($('#checkpointStep')?.value) || 1}步断点`
+      : '';
     inference.textContent = `${variant} · ${steps}步 · ${acceleration ? `加速${acceleration}` : 'Dense'}${checkpoint}`;
   }
   const video = $('#videoSettingsSummary');
@@ -931,9 +1079,8 @@ function updateSettingsSummaries() {
     const source = selected('size_mode') === 'custom'
       ? `自定义 ${geometry.width}×${geometry.height}`
       : `${String(selected('resolution')).toUpperCase()} · ${selected('aspect_ratio')}`;
-    const upscale = $('#upscaleEnabled').checked ? ` · 超分${String(selected('upscale_resolution')).toUpperCase()}` : ' · 不超分';
     const duration = promptEditorMode === 'freeform' ? ` · ${Number(selected('duration_seconds')).toFixed(1)}秒` : '';
-    video.textContent = source + duration + upscale;
+    video.textContent = source + duration;
   }
 }
 
@@ -967,25 +1114,39 @@ function updateJointAccelerationControls() {
   const accelerationLimits = options.advanced_limits?.acceleration || {min:0, max:100, step:1};
   steps.min = String(limits.min);
   steps.max = String(limits.max);
-  if (steps.dataset.variant !== variant) {
-    steps.value = String(limits.default);
+  const selectedLoRA = (globalLoraPolicy?.available || []).find(
+    item => item.id === globalLoraPolicy?.selected
+  );
+  const loraProfile = selectedLoRA?.profile || {};
+  const loraProfileId = variant === 'lora' ? String(loraProfile.profile_id || '') : '';
+  const profileDefault = variant === 'lora'
+    ? Number(loraProfile.default_steps) || limits.default
+    : limits.default;
+  if (steps.dataset.variant !== variant || steps.dataset.loraProfile !== loraProfileId) {
+    steps.value = String(profileDefault);
     steps.dataset.variant = variant;
+    steps.dataset.loraProfile = loraProfileId;
   }
-  steps.value = String(Math.max(limits.min, Math.min(limits.max, Number(steps.value) || limits.default)));
+  steps.value = String(Math.max(limits.min, Math.min(limits.max, Number(steps.value) || profileDefault)));
   steps.disabled = false;
   $('#samplingStepsValue').textContent = `${steps.value} 步`;
-  $('#samplingStepsHint').textContent = variant === 'lora'
-    ? Number(steps.value) > 8
+  const recommendedSteps = Array.isArray(loraProfile.recommended_steps)
+    ? loraProfile.recommended_steps.map(Number)
+    : [];
+  $('#samplingStepsHint').textContent = tr(variant === 'lora'
+    ? recommendedSteps.length && !recommendedSteps.includes(Number(steps.value))
+      ? `当前 ${loraProfile.display_name || 'LoRA'} 建议 ${recommendedSteps.join('/')} 步；其他步数可运行，但不在蒸馏标定点。`
+      : Number(steps.value) > 8
       ? '超过8步未经LoRA质量校准；允许运行，但不保证质量随步数单调增加。'
       : 'LoRA 使用完整 Turbo 步；内部加速只分配逐步逐层注意力，不擅自加入预测步。'
-    : '决定完整 σ 去噪轨迹长度；系统在这条轨迹内联合安排真实步和预测步。';
+    : '决定完整 σ 去噪轨迹长度；系统在这条轨迹内联合安排真实步和预测步。');
   if (!available) {
     acceleration.value = '0';
     acceleration.min = '0';
     acceleration.max = '0';
     acceleration.disabled = true;
     $('#accelerationAdvanced').classList.add('unavailable');
-    $('#accelerationSafety').textContent = '当前服务未安装 SM89 稀疏运行时，只能使用 0（Dense）；请运行项目安装脚本。';
+    $('#accelerationSafety').textContent = tr('当前服务未安装 SM89 稀疏运行时，只能使用 0（Dense）；请运行项目安装脚本。');
   } else {
     acceleration.min = String(accelerationLimits.min);
     acceleration.max = String(accelerationLimits.max);
@@ -995,14 +1156,29 @@ function updateJointAccelerationControls() {
     const scheduler = accelerationLimits.scheduler_by_variant?.[variant]
       || accelerationLimits.scheduler;
     const certified = scheduler === 'v19_certified_frontier';
-    $('#accelerationSafety').textContent = variant === 'lora'
+    const paretoV24 = String(scheduler || '').startsWith('h3_pareto_v24');
+    const qualityKnee = Number(accelerationLimits.quality_knee) || 75;
+    $('#accelerationSafety').textContent = tr(variant === 'lora'
       ? 'LoRA 无预测调度：全部 Turbo 步保持真实计算，档位只改变逐步逐层 Attention 配额。'
+      : paretoV24
+        ? `V24统一帕累托调度：0为Dense，${qualityKnee}为Human审核的发布质量拐点，${qualityKnee}–100为允许肉眼缺陷的激进区。`
       : certified
         ? 'V19认证前沿：仅命中已封存工作负载时加速；其他输入自动Dense回退。'
-        : '冻结的 Round229 调度：构图锚点、因果层、预测后恢复步和末端细节保护始终开启。';
+        : '冻结的 Round229 调度：构图锚点、因果层、预测后恢复步和末端细节保护始终开启。');
   }
   const level = Math.max(0, Math.min(100, Number(acceleration.value) || 0));
-  $('#accelerationValue').textContent = level === 0 ? '0 · Dense' : `${level} / 100`;
+  const qualityKnee = Number(accelerationLimits.quality_knee) || 75;
+  const activeScheduler = accelerationLimits.scheduler_by_variant?.[variant]
+    || accelerationLimits.scheduler;
+  const hasHumanKnee = variant === 'base'
+    && String(activeScheduler || '').startsWith('h3_pareto_v24');
+  $('#accelerationValue').textContent = level === 0
+    ? '0 · Dense'
+    : hasHumanKnee && level === qualityKnee
+      ? `${level} · 发布质量拐点`
+      : hasHumanKnee && level === 100
+        ? '100 · 激进'
+        : `${level} / 100`;
   updateSettingsSummaries();
 }
 
@@ -1024,7 +1200,6 @@ function updateContract() {
   const referenceAudios = $('#referenceAudios')?.files?.length || 0;
   const conditionText = $('#conditionText');
   if (conditionText) conditionText.textContent = currentEngine === 'reference' ? `多参考生视频 · ${references}图 / ${referenceVideos}视频 / ${referenceAudios}音频` : first && last ? '首尾帧生视频' : first ? '首帧生视频' : last ? '尾帧生视频' : '文生视频';
-  updateUpscaleControls();
   updateSettingsSummaries();
 }
 
@@ -1033,32 +1208,24 @@ function solverStepCount() {
 }
 
 function updateCheckpointControls() {
-  const panel = $('#checkpointSettings');
-  if (!panel) return;
-  const enabled = selected('execution_mode') === 'checkpoint';
-  const preview = $('#checkpointPreview').checked;
-  panel.hidden = !enabled;
+  const enabled = $('#checkpointEnabled');
+  const field = $('#checkpointStepField');
+  const slider = $('#checkpointStep');
+  const mode = $('[name="execution_mode"]');
+  if (!enabled || !field || !slider || !mode) return;
   const total = solverStepCount();
-  const step = $('#checkpointStep');
-  step.max = String(Math.max(1, total - 1));
-  step.value = String(Math.max(1, Math.min(Number(step.value) || Math.ceil(total * .4), total - 1)));
-  $('#checkpointStepValue').textContent = `第 ${step.value} 步`;
-  step.disabled = !enabled;
-  $('#checkpointRetain').disabled = !enabled;
-  $('#checkpointPreview').disabled = !enabled;
-  $$('.checkpoint-preview-option input, .checkpoint-preview-option select').forEach(input => {
-    input.disabled = !enabled || !preview;
-  });
-  const previewSteps = $('[name="checkpoint_preview_steps"]');
-  $('#checkpointPreviewStepsValue').textContent = `${previewSteps.value} 步`;
+  slider.min = '1';
+  slider.max = String(Math.max(1, total - 1));
+  if (!slider.dataset.initialized) {
+    slider.value = String(Math.max(1, Math.round(total / 2)));
+    slider.dataset.initialized = 'true';
+  } else {
+    slider.value = String(Math.max(1, Math.min(total - 1, Number(slider.value) || Math.round(total / 2))));
+  }
+  field.hidden = !enabled.checked;
+  mode.value = enabled.checked ? 'checkpoint' : 'complete';
+  $('#checkpointStepValue').textContent = tr(`第 ${slider.value} / ${total} 步后停止`);
   updateSettingsSummaries();
-}
-
-function setUpscaleResolution(value) {
-  const resolution = ['720p', '1080p', '2k'].includes(value) ? value : '720p';
-  $('[name="upscale_resolution"]').value = resolution;
-  $$('.upscale-resolution-tabs button').forEach(button => button.classList.toggle('active', button.dataset.upscaleResolution === resolution));
-  updateUpscaleControls();
 }
 
 function applyEngineIdentity() {
@@ -1067,12 +1234,19 @@ function applyEngineIdentity() {
   if (!currentEngine || !info) return;
   const reference = currentEngine === 'reference';
   const lora = currentVariant() === 'lora';
+  const w4a8 = options.active_weight_tier === 'w4a8';
+  const vramProfile = String(options.active_vram_profile || (w4a8 ? '8gb' : '24gb')).toUpperCase();
   $('#engineBanner').dataset.engine = currentEngine;
   $('#engineIcon').textContent = reference ? 'R' : 'F';
   $('#engineIcon').className = `engine-icon ${lora ? 'turbo' : 'original'}`;
   $('#engineName').textContent = info.label;
-  $('#engineBadge').textContent = lora ? 'LoRA 极速' : '原始权重';
-  $('#engineDescription').textContent = reference ? `Ref2VA 多参考 · ${lora ? 'LoRA 六步极速路线' : '原始权重高保真路线'}` : `FL2VA / 文生视频 · ${lora ? 'LoRA 六步极速路线' : '原始权重高保真路线'}`;
+  $('#engineBadge').textContent = `${w4a8 ? 'W4A8' : 'INT8'} · ${vramProfile}${lora ? ' · LoRA' : ''}`;
+  const backendLabel = `${vramProfile}${w4a8 ? '低比特' : '独立高速'}后端`;
+  const activeLoRA = (globalLoraPolicy?.available || []).find(
+    item => item.id === globalLoraPolicy?.selected
+  );
+  const loraLabel = activeLoRA?.profile?.display_name || 'LoRA Turbo';
+  $('#engineDescription').textContent = reference ? `Ref2VA 多参考 · ${backendLabel} · ${lora ? loraLabel : '原始采样'}` : `FL2VA / 文生视频 · ${backendLabel} · ${lora ? loraLabel : '原始采样'}`;
   $('#brandSubtitle').textContent = reference ? 'Native reference generation' : 'Native first/last generation';
   $('#keyframeFieldset').hidden = reference;
   $('#referenceFieldset').hidden = !reference;
@@ -1146,6 +1320,7 @@ function distributeReferenceFiles(files) {
 }
 
 function statusName(job) {
+  if (job.progress?.stage === 'cancelling') return '正在取消';
   return {queued:`等待 ${job.queue_position || ''}`,starting_backend:'准备模型',running:'生成中',checkpointed:'断点已保存',awaiting_preview:'等待抽卡决定',succeeded:'已完成',failed:'失败',cancelled:'已取消'}[job.status] || job.status;
 }
 
@@ -1159,39 +1334,64 @@ function progressMarkup(job) {
   return `<div class="job-progress"><div class="progress-copy"><span>${escapeHtml(progress.detail || statusName(job))}</span><b>${percent.toFixed(0)}%</b></div><div class="progress-track"><i style="width:${percent}%"></i></div><small>${etaLabel} ${eta}</small></div>`;
 }
 
-function advancedSummary(req) {
+function memoryExecutionSummary(req, job) {
+  const receipt = job?.inference_plan?.memory_execution;
+  const labels = {exact_streaming:'精确流式', compact_streaming:'紧凑流式'};
+  if (receipt && labels[receipt.selected_scheme]) {
+    return `${receipt.resource_profile || '自动显存'}→${labels[receipt.selected_scheme]}`;
+  }
+  return '显存自动优化';
+}
+
+function runtimeMemorySummary(job) {
+  const memory = job?.inference_plan?.runtime_memory || {};
+  const peak = Number(memory.peak_reserved_gib || memory.peak_allocated_gib);
+  const ceiling = Number(memory.allocator_ceiling_gib);
+  return Number.isFinite(peak) && peak > 0
+    ? ` · 保留峰值 ${peak.toFixed(2)}GiB${Number.isFinite(ceiling) ? ` / 硬上限 ${ceiling.toFixed(2)}GiB` : ''}`
+    : '';
+}
+
+function advancedSummary(req, job=null) {
+  const memory = memoryExecutionSummary(req, job);
   if (req.sampling_steps != null && req.acceleration != null) {
     const acceleration = Number(req.acceleration);
-    return `${req.sampling_steps}总步 · ${acceleration === 0 ? 'Dense' : `加速 ${acceleration}`}`;
+    return `${req.sampling_steps}总步 · ${acceleration === 0 ? 'Dense' : `加速 ${acceleration}`} · ${memory}`;
   }
-  if (!req.advanced) return req.quality || '默认计算';
+  if (!req.advanced) return `${req.quality || '默认计算'} · ${memory}`;
   const compute = req.model_variant === 'base'
     ? `${req.actual_steps}实际/${req.forecast_steps}预测`
     : `${req.lora_steps}步`;
   const attention = Number(req.attention_keep_ratio) >= 1
     ? '完整注意力'
     : `${Math.round(Number(req.attention_keep_ratio) * 100)}%注意力 · ${{full:'全程固定',guarded:'动态保护',middle_only:'仅中段'}[req.sparse_scope] || req.sparse_scope}`;
-  return `${compute} · ${attention}`;
+  return `${compute} · ${attention} · ${memory}`;
 }
 
 function jobCard(job, {draggable=false}={}) {
   const req = job.request;
-  const canCancel = ['queued','starting_backend','running','awaiting_preview'].includes(job.status);
+  const second = job.second_sampling || null;
+  const cancelling = job.progress?.stage === 'cancelling';
+  const canCancel = !cancelling && ['queued','starting_backend','running','awaiting_preview'].includes(job.status);
   const canDelete = !['starting_backend','running','awaiting_preview'].includes(job.status);
   const actions = [
     job.preview?.ready ? `<button data-view-preview="${job.id}">查看断点预览</button>` : '',
     job.checkpoint?.resume_available ? `<button data-resume="${job.id}">继续正式生成</button>` : '',
     job.status === 'awaiting_preview' ? `<button data-preview-continue="${job.id}">继续正式生成</button><button class="danger-action" data-preview-discard="${job.id}">放弃本次抽卡</button>` : '',
     job.status === 'succeeded' ? `<button data-view="${job.id}">预览与下载</button>` : '',
+    job.second_sampling_available && Math.min(req.width, req.height) < 1440 ? `<button data-second-sampling="${job.id}">H3 二次采样</button>` : '',
     canCancel ? `<button data-cancel="${job.id}">取消</button>` : '',
     canDelete ? `<button class="danger-action" data-delete="${job.id}">删除</button>` : '',
   ].join('');
   const elapsed = job.status === 'succeeded'
-    ? `<div class="job-elapsed"><span>实际总耗时</span><strong>${formatElapsed(job.elapsed_seconds)}</strong><small>${job.upscale_elapsed_seconds != null ? `H3 ${formatElapsed(job.generation_elapsed_seconds)} · FlashVSR ${formatElapsed(job.upscale_elapsed_seconds)}${job.upscale_peak_allocated_mib != null ? ` · 超分峰值 ${(Number(job.upscale_peak_allocated_mib) / 1024).toFixed(2)}GiB` : ''}` : '不含服务启动与模型预加载'}</small></div>`
+    ? `<div class="job-elapsed"><span>实际总耗时</span><strong>${formatElapsed(job.elapsed_seconds)}</strong><small>${second ? `H3 二次采样${runtimeMemorySummary(job)}` : job.upscale_elapsed_seconds != null ? `历史 H3 ${formatElapsed(job.generation_elapsed_seconds)} · FlashVSR ${formatElapsed(job.upscale_elapsed_seconds)}` : `不含服务启动与模型预加载${runtimeMemorySummary(job)}`}</small></div>`
     : '';
-  const delivery = req.upscale_enabled ? ` → ${req.upscale_target_width}×${req.upscale_target_height} FlashVSR` : '';
+  const delivery = second ? ` · 由 ${escapeHtml(second.source_job_id || '源任务')} 二次采样` : '';
+  const execution = second
+    ? `${second.steps}二采实际步 · 加速 ${Number(second.acceleration)} · ${memoryExecutionSummary(req, job)}`
+    : advancedSummary(req, job);
   return `<article class="job manager-job ${draggable ? 'draggable' : ''}" data-job-id="${job.id}" ${draggable ? 'draggable="true"' : ''}>
-    <div class="job-top"><div class="job-main">${draggable ? '<span class="drag-handle" title="拖动排序">⠿</span>' : ''}<div><div class="job-title">${escapeHtml(req.prompt)}</div><div class="job-meta">${req.width}×${req.height}${delivery} · ${req.actual_duration_seconds.toFixed(2)}秒 · ${escapeHtml(advancedSummary(req))} · Seed ${req.seed}</div></div></div><span class="status ${job.status}">${statusName(job)}</span></div>
+    <div class="job-top"><div class="job-main">${draggable ? '<span class="drag-handle" title="拖动排序">⠿</span>' : ''}<div><div class="job-title">${escapeHtml(req.prompt)}</div><div class="job-meta">${req.width}×${req.height}${delivery} · ${req.actual_duration_seconds.toFixed(2)}秒 · ${escapeHtml(execution)} · Seed ${req.seed}</div></div></div><span class="status ${job.status}">${statusName(job)}</span></div>
     ${progressMarkup(job)}${elapsed}${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ''}${actions ? `<div class="job-actions">${actions}</div>` : ''}
   </article>`;
 }
@@ -1212,7 +1412,7 @@ function conversationItem(job) {
   const completed = job.status === 'succeeded';
   const checkpointed = job.status === 'checkpointed';
   const output = completed
-    ? `<div class="conversation-result"><button class="conversation-video-placeholder" data-view="${job.id}" aria-label="打开成片预览"><span>▶</span><small>点击预览成片</small></button><div><strong>视频生成完成</strong><span>${req.width}×${req.height} · ${req.actual_duration_seconds.toFixed(2)}秒 · ${formatElapsed(job.elapsed_seconds)}</span><div class="conversation-actions"><button data-view="${job.id}">打开预览与下载</button></div></div></div>`
+    ? `<div class="conversation-result"><button class="conversation-video-placeholder" data-view="${job.id}" aria-label="打开成片预览"><span>▶</span><small>点击预览成片</small></button><div><strong>${job.second_sampling ? 'H3 二次采样完成' : '视频生成完成'}</strong><span>${req.width}×${req.height} · ${req.actual_duration_seconds.toFixed(2)}秒 · ${formatElapsed(job.elapsed_seconds)}</span><div class="conversation-actions"><button data-view="${job.id}">打开预览与下载</button>${job.second_sampling_available && Math.min(req.width, req.height) < 1440 ? `<button data-second-sampling="${job.id}">继续二次采样</button>` : ''}</div></div></div>`
     : checkpointed
       ? `<div class="conversation-response-state"><span class="conversation-spinner stopped"></span><div><strong>已在第 ${job.checkpoint?.completed_steps || '?'} / ${job.checkpoint?.total_steps || '?'} 步停止</strong><small>正式状态已落盘，当前任务不占用 GPU；恢复时重新进入队列。</small></div></div>`
     : `<div class="conversation-response-state"><span class="conversation-spinner ${['failed','cancelled'].includes(job.status) ? 'stopped' : ''}"></span><div><strong>${escapeHtml(statusName(job))}</strong><small>${escapeHtml(job.progress?.detail || '')}</small></div></div>`;
@@ -1256,6 +1456,7 @@ function bindJobActions() {
   $$('[data-resume]').forEach(button => button.addEventListener('click', () => resumeJob(button.dataset.resume)));
   $$('[data-preview-continue]').forEach(button => button.addEventListener('click', () => decidePreview(button.dataset.previewContinue, 'continue')));
   $$('[data-preview-discard]').forEach(button => button.addEventListener('click', () => decidePreview(button.dataset.previewDiscard, 'discard')));
+  $$('[data-second-sampling]').forEach(button => button.addEventListener('click', () => openSecondSampling(button.dataset.secondSampling)));
 }
 
 function bindDragAndDrop() {
@@ -1270,7 +1471,7 @@ function bindDragAndDrop() {
 async function saveQueueOrder() {
   const jobIds = $$('#queuedJobs [data-job-id]').map(card => card.dataset.jobId);
   try { await api('/api/v1/jobs/order', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({job_ids:jobIds})}); await refreshJobs(); }
-  catch (error) { alert(`调整顺序失败：${error.message}`); await refreshJobs(); }
+  catch (error) { alert(tr(`调整顺序失败：${error.message}`)); await refreshJobs(); }
 }
 
 async function refreshJobs() {
@@ -1280,9 +1481,10 @@ async function refreshJobs() {
 
 async function checkHealth() {
   try {
-    const response = await fetch('/healthz'); if (!response.ok) throw new Error('offline'); const health = await response.json();
+    const response = await api('/healthz', {timeoutMs:5000}); const health = await response.json();
     $('.server-state').className = 'server-state online';
     const warm = health.warm_state?.status || 'unknown';
+    renderEngineLoadProgress(health.warm_state, health.engine_control?.switching);
     const warmName = {cold:'未加载',loading:'加载中',ready:'已热身',failed:'加载失败',unsupported:'可用'}[warm] || warm;
     $('#warmStateText').textContent = warmName;
     const engineLabel = health.active_engine === 'reference' || health.active_engine === 'reference_lora'
@@ -1290,6 +1492,19 @@ async function checkHealth() {
         ? 'FL2VA' : '待选择模式';
     $('#healthText').textContent = health.engine_control?.switching ? '在线 · 正在切换引擎' : warm === 'loading' ? '在线 · 正在预加载模型' : warm === 'failed' ? '在线 · 模型加载失败' : `在线 · ${engineLabel} · ${warmName}`;
   } catch (_) { $('.server-state').className = 'server-state offline'; $('#healthText').textContent = '服务不可用'; $('#warmStateText').textContent = '离线'; }
+}
+
+async function pollUiState() {
+  if (document.hidden || uiPollPromise) return uiPollPromise;
+  uiPollPromise = (async () => {
+    await Promise.allSettled([checkHealth(), refreshJobs()]);
+    const lobbyLoading = $('#engineLobby').classList.contains('loading');
+    const needsReconcile = !options || !currentEngine
+      || Boolean(options?.engine_control?.switching) || lobbyLoading;
+    if (needsReconcile) await reconcileEngineState().catch(() => false);
+  })();
+  try { return await uiPollPromise; }
+  finally { uiPollPromise = null; }
 }
 
 function setResourceBar(id, percent) {
@@ -1301,17 +1516,23 @@ async function refreshResources() {
   try {
     const data = await (await api('/api/v1/resources')).json();
     $('#cpuUsage').textContent = `${data.cpu.utilization_percent.toFixed(0)}%`;
-    $('#cpuDetail').textContent = `${data.cpu.logical_cores} 线程 · 负载 ${data.cpu.load_1m}`;
+    $('#cpuDetail').textContent = window.H3I18n?.locale === 'en'
+      ? `${data.cpu.logical_cores} threads · load ${data.cpu.load_1m}`
+      : `${data.cpu.logical_cores} 线程 · 负载 ${data.cpu.load_1m}`;
     setResourceBar('#cpuBar', data.cpu.utilization_percent);
     $('#memoryUsage').textContent = `${data.memory.used_gib.toFixed(1)} / ${data.memory.total_gib.toFixed(1)} GiB`;
-    $('#memoryDetail').textContent = `${data.memory.percent.toFixed(0)}% · 服务进程 ${data.process.rss_gib.toFixed(1)} GiB`;
+    $('#memoryDetail').textContent = window.H3I18n?.locale === 'en'
+      ? `${data.memory.percent.toFixed(0)}% · service process ${data.process.rss_gib.toFixed(1)} GiB`
+      : `${data.memory.percent.toFixed(0)}% · 服务进程 ${data.process.rss_gib.toFixed(1)} GiB`;
     setResourceBar('#memoryBar', data.memory.percent);
     if (data.gpu) {
       $('#gpuUsage').textContent = `${data.gpu.utilization_percent.toFixed(0)}%`;
       $('#gpuDetail').textContent = `${data.gpu.name} · ${data.gpu.temperature_c.toFixed(0)}°C · ${data.gpu.power_w.toFixed(0)}W`;
       setResourceBar('#gpuBar', data.gpu.utilization_percent);
       $('#vramUsage').textContent = `${data.gpu.memory_used_gib.toFixed(1)} / ${data.gpu.memory_total_gib.toFixed(1)} GiB`;
-      $('#vramDetail').textContent = `${data.gpu.memory_percent.toFixed(0)}% 已使用`;
+      $('#vramDetail').textContent = window.H3I18n?.locale === 'en'
+        ? `${data.gpu.memory_percent.toFixed(0)}% used`
+        : `${data.gpu.memory_percent.toFixed(0)}% 已使用`;
       setResourceBar('#vramBar', data.gpu.memory_percent);
     } else {
       $('#gpuUsage').textContent = '不可用'; $('#gpuDetail').textContent = '未检测到 NVIDIA 监控接口';
@@ -1320,19 +1541,116 @@ async function refreshResources() {
   } catch (_) {}
 }
 
-async function cancelJob(id) { try { await api(`/api/v1/jobs/${id}`, {method:'DELETE'}); await refreshJobs(); } catch (error) { alert(error.message); } }
-async function deleteJob(id) { if (!confirm('删除该任务记录、上传帧和已生成视频？此操作不可恢复。')) return; try { await api(`/api/v1/jobs/${id}/record`, {method:'DELETE'}); await refreshJobs(); } catch (error) { alert(error.message); } }
-async function showVideo(id) { try { const blob = await (await api(`/api/v1/jobs/${id}/video`)).blob(); if (videoObjectUrl) URL.revokeObjectURL(videoObjectUrl); videoObjectUrl = URL.createObjectURL(blob); $('#resultVideo').src = videoObjectUrl; $('#downloadVideo').href = videoObjectUrl; $('#downloadVideo').download = `h3-${id}.mp4`; $('#videoDialog').showModal(); } catch (error) { alert(error.message); } }
-async function showPreview(id) { try { const blob = await (await api(`/api/v1/jobs/${id}/preview`)).blob(); if (videoObjectUrl) URL.revokeObjectURL(videoObjectUrl); videoObjectUrl = URL.createObjectURL(blob); $('#resultVideo').src = videoObjectUrl; $('#downloadVideo').href = videoObjectUrl; $('#downloadVideo').download = `h3-${id}-preview.mp4`; $('#videoDialog').showModal(); } catch (error) { alert(error.message); } }
-async function decidePreview(id, decision) { try { await api(`/api/v1/jobs/${id}/preview/${decision}`, {method:'POST'}); await refreshJobs(); } catch (error) { alert(error.message); } }
-async function resumeJob(id) { try { await api(`/api/v1/jobs/${id}/resume`, {method:'POST'}); await refreshJobs(); } catch (error) { alert(error.message); } }
+async function cancelJob(id) {
+  const button = document.querySelector(`[data-cancel="${id}"]`);
+  if (button) { button.disabled = true; button.textContent = '正在取消…'; }
+  try { await api(`/api/v1/jobs/${id}`, {method:'DELETE'}); await refreshJobs(); }
+  catch (error) { if (button) button.disabled = false; alert(tr(error.message)); }
+}
+async function deleteJob(id) { if (!confirm(tr('删除该任务记录、上传帧和已生成视频？此操作不可恢复。'))) return; try { await api(`/api/v1/jobs/${id}/record`, {method:'DELETE'}); await refreshJobs(); } catch (error) { alert(tr(error.message)); } }
+async function showVideo(id) { try { const blob = await (await api(`/api/v1/jobs/${id}/video`)).blob(); if (videoObjectUrl) URL.revokeObjectURL(videoObjectUrl); videoObjectUrl = URL.createObjectURL(blob); $('#resultVideo').src = videoObjectUrl; $('#downloadVideo').href = videoObjectUrl; $('#downloadVideo').download = `h3-${id}.mp4`; $('#videoDialog').showModal(); } catch (error) { alert(tr(error.message)); } }
+async function showPreview(id) { try { const blob = await (await api(`/api/v1/jobs/${id}/preview`)).blob(); if (videoObjectUrl) URL.revokeObjectURL(videoObjectUrl); videoObjectUrl = URL.createObjectURL(blob); $('#resultVideo').src = videoObjectUrl; $('#downloadVideo').href = videoObjectUrl; $('#downloadVideo').download = `h3-${id}-preview.mp4`; $('#videoDialog').showModal(); } catch (error) { alert(tr(error.message)); } }
+async function decidePreview(id, decision) { try { await api(`/api/v1/jobs/${id}/preview/${decision}`, {method:'POST'}); await refreshJobs(); } catch (error) { alert(tr(error.message)); } }
+async function resumeJob(id) { try { await api(`/api/v1/jobs/${id}/resume`, {method:'POST'}); await refreshJobs(); } catch (error) { alert(tr(error.message)); } }
+
+function openSecondSampling(id) {
+  const job = jobs.find(item => item.id === id);
+  if (!job || !job.second_sampling_available) return;
+  $('#secondSamplingSourceId').value = id;
+  const sourceShort = Math.min(Number(job.request.width), Number(job.request.height));
+  const targetShort = {'720p':736, '1080p':1088, '1440p':1440};
+  const allowedTargets = new Set(
+    options.advanced_limits?.second_sampling?.levels || []
+  );
+  const select = $('#secondSamplingResolution');
+  Array.from(select.options).forEach(option => {
+    option.disabled = !allowedTargets.has(option.value)
+      || targetShort[option.value] <= sourceShort;
+  });
+  const next = Array.from(select.options).find(option => !option.disabled);
+  if (!next) return;
+  select.value = next.value;
+  $('#secondSamplingSourceSummary').textContent = `源卡片 ${job.request.width}×${job.request.height} · ${job.request.actual_duration_seconds.toFixed(2)}秒；原提示词、参考图片与参考音频会原样复用。`;
+  renderSecondSamplingWindowSetting();
+  $('#secondSamplingMessage').hidden = true;
+  $('#secondSamplingDialog').showModal();
+}
+
+async function submitSecondSampling(event) {
+  event.preventDefault();
+  const id = $('#secondSamplingSourceId').value;
+  const message = $('#secondSamplingMessage');
+  const button = $('button[type="submit"]', event.target);
+  button.disabled = true;
+  message.hidden = false;
+  message.textContent = '正在创建 H3 二次采样任务…';
+  try {
+    const response = await api(`/api/v1/jobs/${id}/second-sampling`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        resolution:$('#secondSamplingResolution').value,
+        steps:Number($('#secondSamplingSteps').value),
+        acceleration:Number($('#secondSamplingAcceleration').value),
+        strength:$('#secondSamplingStrength').value,
+        temporal_window_frames:secondSamplingWindowFrames,
+      }),
+    });
+    jobs.push(await response.json());
+    $('#secondSamplingDialog').close();
+    renderJobs();
+    switchPage('tasks');
+  } catch (error) {
+    message.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function updateSecondSamplingStrengthHint() {
+  const levels = {
+    preserve:'Denoise 0.10 · 起始 Sigma 约 0.40',
+    standard:'Denoise 0.20 · 起始 Sigma 约 0.60',
+    enhance:'Denoise 0.25 · 起始 Sigma 约 0.67',
+    strong:'Denoise 0.30 · 起始 Sigma 约 0.72',
+  };
+  $('#secondSamplingStrengthHint').textContent = levels[$('#secondSamplingStrength').value];
+}
+
+async function clearLatentCache() {
+  if (!confirm(tr('清理所有Latent与断点缓存？成片和任务记录会保留，但历史任务将不能再二次采样或从断点继续。'))) return;
+  const button = $('#clearLatentCache');
+  button.disabled = true;
+  try {
+    const response = await api('/api/v1/cache/latents', {method:'DELETE'});
+    const result = await response.json();
+    const mib = Number(result.removed_bytes || 0) / 1024 / 1024;
+    alert(tr(`已清理 ${result.removed_files || 0} 个Latent文件，共 ${mib.toFixed(1)} MiB。`));
+    await refreshJobs();
+  } catch (error) {
+    alert(tr(error.message));
+  } finally {
+    button.disabled = false;
+  }
+}
 
 async function submit(event) {
-  event.preventDefault(); const button = $('.submit-button', event.target), message = $('#formMessage'); button.disabled = true; message.hidden = true;
+  event.preventDefault();
+  const button = $('.submit-button', event.target), message = $('#formMessage');
+  button.dataset.submitting = 'true';
+  button.disabled = true;
+  button.setAttribute('aria-busy', 'true');
+  button.textContent = '…';
+  message.textContent = '正在检查参数并提交任务…';
+  message.style.background = 'rgba(138,120,255,.10)';
+  message.style.color = '#d4ceff';
+  message.hidden = false;
   try {
+    if (!bootReady || !options) throw new Error('控制台仍在初始化，请稍候后重试');
     if (!currentEngine) throw new Error('请先选择生成模式');
     const maximumDuration = currentMaxDuration();
     if (promptEditorMode === 'structured') {
+      syncStructuredEditorState();
       synchronizeDurationInputs();
       const total = shotTotal();
       if (total < 1 || total > maximumDuration) {
@@ -1353,10 +1671,19 @@ async function submit(event) {
     const form = new FormData(event.target); form.delete('engine');
     form.set('service_family', currentEngine);
     form.set('model_variant', currentVariant());
-    if (selected('execution_mode') === 'checkpoint') {
-      form.set('checkpoint_retain', String($('#checkpointRetain').checked));
-      form.set('checkpoint_preview', String($('#checkpointPreview').checked));
+    if ($('#checkpointEnabled').checked) {
+      const previewShortEdge = {'360p':352, '480p':480, '720p':736}[checkpointPreviewPolicy.resolution] || 352;
+      if (Math.min(currentGeometry().width, currentGeometry().height) < previewShortEdge) {
+        throw new Error(`断点预览设置为${checkpointPreviewPolicy.resolution.toUpperCase()}，不能高于正式生成画布`);
+      }
+      form.set('execution_mode', 'checkpoint');
+      form.set('checkpoint_step', $('#checkpointStep').value);
+      form.set('checkpoint_retain', 'true');
+      form.set('checkpoint_preview', 'true');
+      form.set('checkpoint_preview_steps', String(checkpointPreviewPolicy.steps));
+      form.set('checkpoint_preview_resolution', checkpointPreviewPolicy.resolution);
     } else {
+      form.set('execution_mode', 'complete');
       ['checkpoint_step','checkpoint_retain','checkpoint_preview','checkpoint_preview_steps','checkpoint_preview_resolution'].forEach(name => form.delete(name));
     }
     if (currentEngine === 'reference') {
@@ -1387,8 +1714,18 @@ async function submit(event) {
     ['frames','advanced_seed','actual_steps','lora_steps','attention_keep_ratio','sparse_scope'].forEach(name => form.delete(name));
     for (const role of ['first_frame','last_frame']) if (!$(`[name="${role}"]`).files[0]) form.delete(role);
     const job = await (await api('/api/v1/generations', {method:'POST', body:form})).json(); jobs.push(job); renderJobs(); message.textContent = `任务 ${job.id.slice(0,8)} 已加入队列`; message.style.background = 'rgba(86,214,160,.1)'; message.style.color = '#8ce9bd'; message.hidden = false; $('#conversationFeed').lastElementChild?.scrollIntoView({behavior:'smooth', block:'center'});
-  } catch (error) { message.textContent = error.message; message.style.background = ''; message.style.color = ''; message.hidden = false; }
-  finally { button.disabled = false; }
+  } catch (error) {
+    message.textContent = error.message;
+    message.style.background = '';
+    message.style.color = '';
+    message.hidden = false;
+    message.scrollIntoView({behavior:'smooth', block:'nearest'});
+  } finally {
+    delete button.dataset.submitting;
+    button.removeAttribute('aria-busy');
+    button.textContent = '↑';
+    updateSubmitAvailability();
+  }
 }
 
 async function boot() {
@@ -1399,9 +1736,6 @@ async function boot() {
   $('#freeformPrompt').addEventListener('keydown', event => { if (event.key === 'Escape') $('.reference-mention-menu', $('#freeformPromptEditor')).hidden = true; });
   $('#freeformPrompt').addEventListener('blur', () => setTimeout(() => { $('.reference-mention-menu', $('#freeformPromptEditor')).hidden = true; }, 120));
   $('[name="model_variant"]').addEventListener('change', () => { applyEngineIdentity(); updateContract(); });
-  $('#executionMode').addEventListener('change', updateCheckpointControls);
-  $('#checkpointPreview').addEventListener('change', updateCheckpointControls);
-  $('#checkpointStep').addEventListener('input', updateSettingsSummaries);
   $('#referenceFiles').addEventListener('change', event => distributeReferenceFiles(event.target.files));
   bindFileDrop($('#referenceFileDrop'), $('#referenceFiles'), {maxFiles:15, accept:file => file.type.startsWith('image/') || file.type.startsWith('video/') || file.type.startsWith('audio/') || /\.(mp4|mov|mkv|webm|avi|wav|mp3|flac|m4a|ogg|opus)$/i.test(file.name)});
   $('#referenceImages').addEventListener('change', event => {
@@ -1460,9 +1794,12 @@ async function boot() {
     textarea.addEventListener('keydown', event => { if (event.key === 'Escape') $('.reference-mention-menu', root).hidden = true; });
     textarea.addEventListener('blur', () => setTimeout(() => { $('.reference-mention-menu', root).hidden = true; }, 120));
   });
-  $('#upscaleEnabled').addEventListener('change', updateUpscaleControls);
-  $$('.upscale-resolution-tabs button').forEach(button => button.addEventListener('click', () => setUpscaleResolution(button.dataset.upscaleResolution)));
-  $('[name="upscale_resolution"]').addEventListener('change', () => setUpscaleResolution(selected('upscale_resolution')));
+  $('#secondSamplingForm').addEventListener('submit', submitSecondSampling);
+  $('#closeSecondSampling').addEventListener('click', () => $('#secondSamplingDialog').close());
+  $('#secondSamplingSteps').addEventListener('input', event => { $('#secondSamplingStepsValue').textContent = `${event.target.value} 步`; });
+  $('#secondSamplingAcceleration').addEventListener('input', event => { $('#secondSamplingAccelerationValue').textContent = event.target.value; });
+  $('#secondSamplingStrength').addEventListener('change', updateSecondSamplingStrengthHint);
+  $('#clearLatentCache').addEventListener('click', clearLatentCache);
   $$('.workspace-tabs button').forEach(button => button.addEventListener('click', () => switchPage(button.dataset.page)));
   $('#sizeMode').addEventListener('change', () => updateSizeModeControls({initialize:true}));
   $$('[name="resolution"],[name="aspect_ratio"]').forEach(element => element.addEventListener('input', syncStoryboardTiming));
@@ -1473,21 +1810,42 @@ async function boot() {
   $$('[name="width"],[name="height"]').forEach(element => element.addEventListener('input', () => updateSizeModeControls()));
   $('[name="sampling_steps"]').addEventListener('input', () => { updateJointAccelerationControls(); updateCheckpointControls(); });
   $('[name="acceleration"]').addEventListener('input', updateJointAccelerationControls);
+  $('#checkpointEnabled').addEventListener('change', updateCheckpointControls);
   $('#checkpointStep').addEventListener('input', updateCheckpointControls);
-  $('[name="checkpoint_preview_steps"]').addEventListener('input', updateCheckpointControls);
+  $('#globalCheckpointPreviewSteps').addEventListener('input', event => { $('#globalCheckpointPreviewStepsValue').textContent = `${event.target.value} 步`; });
+  $('#globalSecondSamplingWindow').addEventListener('input', event => renderSecondSamplingWindowSetting(event.target.value));
   $('#refreshJobs').addEventListener('click', refreshJobs);
-  $('#settingsButton').addEventListener('click', async () => { $('#apiKeyInput').value = localStorage.getItem('h3serve_api_key') || ''; $('#mimoApiKeyInput').value = ''; const [status, referencePolicy, generationPolicy] = await Promise.all([serverMimoKeyStatus().catch(() => ({configured:false})), serverReferenceMediaSettings().catch(() => null), serverGenerationLimitSettings().catch(() => null)]); $('#mimoKeyStatus').textContent = status.configured ? '服务器已保存MiMo Key；留空不会覆盖。' : '服务器尚未配置MiMo Key。'; if (referencePolicy) renderReferenceMediaPolicy(referencePolicy); if (generationPolicy) renderGenerationLimitPolicy(generationPolicy); renderMemoryProfiles(); $('#settingsDialog').showModal(); });
-  $('#saveSettings').addEventListener('click', async event => { event.preventDefault(); const value = $('#apiKeyInput').value.trim(); value ? localStorage.setItem('h3serve_api_key', value) : localStorage.removeItem('h3serve_api_key'); const mimo = $('#mimoApiKeyInput').value.trim(); try { if (mimo) await configureServerMimoKey(mimo); const referencePolicy = await configureServerReferenceMedia($('#globalReferenceImageResolution').value, $('#globalReferenceVideoResolution').value); renderReferenceMediaPolicy(referencePolicy); const generationPolicy = await configureServerGenerationLimits(readGenerationLimitEditor()); renderGenerationLimitPolicy(generationPolicy); sessionStorage.removeItem('h3serve_mimo_api_key'); await applyMemoryProfile(); $('#settingsDialog').close(); } catch (error) { $('#formMessage').textContent = error.message; $('#formMessage').hidden = false; } setTimeout(() => { reloadOptions().catch(() => {}); bootData(); }, 0); });
+  $('#settingsButton').addEventListener('click', async () => { $('#apiKeyInput').value = localStorage.getItem('h3serve_api_key') || ''; $('#mimoApiKeyInput').value = ''; renderSecondSamplingWindowSetting(); const [status, referencePolicy, checkpointPolicy, loraPolicy] = await Promise.all([serverMimoKeyStatus().catch(() => ({configured:false})), serverReferenceMediaSettings().catch(() => null), serverCheckpointPreviewSettings().catch(() => null), serverLoraSettings().catch(() => null)]); $('#mimoKeyStatus').textContent = status.configured ? '服务器已保存MiMo Key；留空不会覆盖。' : '服务器尚未配置MiMo Key。'; if (referencePolicy) renderReferenceMediaPolicy(referencePolicy); if (checkpointPolicy) renderCheckpointPreviewPolicy(checkpointPolicy); if (loraPolicy) renderGlobalLoraPolicy(loraPolicy); renderMemoryProfiles(); $('#settingsDialog').showModal(); });
+  $('#loadGlobalLora').addEventListener('click', loadSelectedGlobalLora);
+  $('#saveSettings').addEventListener('click', async event => { event.preventDefault(); const value = $('#apiKeyInput').value.trim(); value ? localStorage.setItem('h3serve_api_key', value) : localStorage.removeItem('h3serve_api_key'); renderSecondSamplingWindowSetting($('#globalSecondSamplingWindow').value); localStorage.setItem('h3serve_second_sampling_window_frames', String(secondSamplingWindowFrames)); const mimo = $('#mimoApiKeyInput').value.trim(); try { if (mimo) await configureServerMimoKey(mimo); const referencePolicy = await configureServerReferenceMedia($('#globalReferenceImageResolution').value, $('#globalReferenceVideoResolution').value); renderReferenceMediaPolicy(referencePolicy); const checkpointPolicy = await configureServerCheckpointPreview($('#globalCheckpointPreviewSteps').value, $('#globalCheckpointPreviewResolution').value); renderCheckpointPreviewPolicy(checkpointPolicy); sessionStorage.removeItem('h3serve_mimo_api_key'); await applyMemoryProfile(); $('#settingsDialog').close(); } catch (error) { $('#formMessage').textContent = error.message; $('#formMessage').hidden = false; } setTimeout(() => { reloadOptions().catch(() => {}); bootData(); }, 0); });
   $('#clearMimoKey').addEventListener('click', async () => { try { await configureServerMimoKey(''); sessionStorage.removeItem('h3serve_mimo_api_key'); $('#mimoApiKeyInput').value = ''; $('#mimoKeyStatus').textContent = '服务器尚未配置MiMo Key。'; } catch (error) { $('#mimoKeyStatus').textContent = error.message; } });
   try { await reloadOptions(); }
   catch (error) { $('#formMessage').textContent = error.message; $('#formMessage').hidden = false; }
   const rememberedMimoKey = sessionStorage.getItem('h3serve_mimo_api_key') || '';
   if (rememberedMimoKey) { await configureServerMimoKey(rememberedMimoKey).catch(() => {}); sessionStorage.removeItem('h3serve_mimo_api_key'); }
+  renderCheckpointPreviewPolicy(options?.checkpoint_preview);
+  renderSecondSamplingWindowSetting();
   await bootData();
   setPromptEditorMode('structured');
-  setInterval(() => { checkHealth(); refreshJobs(); reconcileEngineState().catch(() => {}); }, 1500);
-  setInterval(refreshResources, 3000);
+  bootReady = true;
+  updateSubmitAvailability();
+  setInterval(pollUiState, 2500);
+  setInterval(() => { if (!document.hidden) refreshResources(); }, 1000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) { pollUiState(); refreshResources(); }
+  });
 }
 
 async function bootData() { await Promise.allSettled([checkHealth(), refreshJobs(), refreshResources()]); }
+window.addEventListener('h3serve:locale-changed', () => {
+  if (!options) return;
+  updateJointAccelerationControls();
+  updateCheckpointControls();
+  renderCheckpointPreviewPolicy(options.checkpoint_preview);
+  renderReferenceMediaPolicy();
+  renderMemoryProfiles();
+  renderGlobalLoraPolicy();
+  renderJobs();
+  refreshResources().catch(() => {});
+});
 document.addEventListener('DOMContentLoaded', boot);

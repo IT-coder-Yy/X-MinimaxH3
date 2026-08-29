@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "purpose": "Integrated 720p15 motion/detail split: run the quality-screened MTCR 12/8 motion trajectory at 864x480, keep its clean AV latents in the hot session, then execute one protected dense low-noise 1280x736 detail correction without an intermediate decode, mux, text encode, or model reload.",
+  "anchor": "motorcycle_480p15_seed82303.json",
+  "candidates": [
+    {
+      "version": "round95_terminal_refine1_12a8f_motorcycle_720p15",
+      "width": 1280,
+      "height": 736,
+      "actual_steps": [0, 1, 2, 3, 4, 6, 8, 11, 14, 17, 18, 19],
+      "fused_rms_adaln": true,
+      "terminal_refinement_initial_width": 864,
+      "terminal_refinement_initial_height": 480,
+      "terminal_refinement_steps": 1,
+      "terminal_refinement_denoise": 0.0125
+    }
+  ]
+}

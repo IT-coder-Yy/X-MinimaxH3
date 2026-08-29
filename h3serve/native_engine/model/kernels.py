@@ -67,6 +67,51 @@ _ATTENTION_ONLINE_BUDGET: ContextVar["AttentionOnlineBudget | None"] = ContextVa
 _LONG_VIDEO_ATTENTION_ENABLED: ContextVar[bool] = ContextVar(
     "h3_native_long_video_attention_enabled", default=False
 )
+_LONG_SEQUENCE_QUERY_CHUNK_TOKENS: ContextVar[int | None] = ContextVar(
+    "h3_native_long_sequence_query_chunk_tokens", default=None
+)
+_LONG_SEQUENCE_PROJECTION_CHUNK_TOKENS: ContextVar[int] = ContextVar(
+    "h3_native_long_sequence_projection_chunk_tokens", default=8192
+)
+_LONG_SEQUENCE_SPLIT_QKV_OUTPUTS: ContextVar[bool] = ContextVar(
+    "h3_native_long_sequence_split_qkv_outputs", default=False
+)
+_LONG_SEQUENCE_SHARED_QKV_QUANTIZATION: ContextVar[bool] = ContextVar(
+    "h3_native_long_sequence_shared_qkv_quantization", default=False
+)
+_LONG_SEQUENCE_COMPACT_KV: ContextVar[bool] = ContextVar(
+    "h3_native_long_sequence_compact_kv", default=False
+)
+_LONG_SEQUENCE_SINGLE_QKNORM_ROPE: ContextVar[bool] = ContextVar(
+    "h3_native_long_sequence_single_qknorm_rope", default=False
+)
+_LONG_SEQUENCE_EXACT_HELPER_STACK: ContextVar[bool] = ContextVar(
+    "h3_native_long_sequence_exact_helper_stack", default=False
+)
+_LONG_SEQUENCE_PARALLEL_SPARSE_LUT: ContextVar[bool] = ContextVar(
+    "h3_native_long_sequence_parallel_sparse_lut", default=False
+)
+_LONG_SEQUENCE_PARTIAL_SPARSE_TOPK: ContextVar[bool] = ContextVar(
+    "h3_native_long_sequence_partial_sparse_topk", default=False
+)
+_LONG_SEQUENCE_FUSED_PREFIX_K_QUANT: ContextVar[bool] = ContextVar(
+    "h3_native_long_sequence_fused_prefix_k_quant", default=False
+)
+_LONG_SEQUENCE_FUSED_QUERY_PROJECTION: ContextVar[bool] = ContextVar(
+    "h3_native_long_sequence_fused_query_projection", default=False
+)
+_LONG_SEQUENCE_FUSED_QKNORM_HND_LAYOUT: ContextVar[bool] = ContextVar(
+    "h3_native_long_sequence_fused_qknorm_hnd_layout", default=False
+)
+_LONG_SEQUENCE_DIRECT_NHD_OUTPUT: ContextVar[bool] = ContextVar(
+    "h3_native_long_sequence_direct_nhd_output", default=False
+)
+_LONG_SEQUENCE_DIRECT_NHD_KV: ContextVar[bool] = ContextVar(
+    "h3_native_long_sequence_direct_nhd_kv", default=False
+)
+_LONG_SEQUENCE_DIRECT_HND_FP8_VALUE: ContextVar[bool] = ContextVar(
+    "h3_native_long_sequence_direct_hnd_fp8_value", default=False
+)
 _FUSED_RMS_ADALN: ContextVar[bool] = ContextVar(
     "h3_native_fused_rms_adaln", default=False
 )
@@ -316,6 +361,255 @@ def current_long_video_attention_enabled() -> bool:
 
 
 @contextmanager
+def long_sequence_query_chunking(
+    chunk_tokens: int | None,
+    *,
+    projection_chunk_tokens: int = 8192,
+    split_qkv_outputs: bool = False,
+    shared_qkv_quantization: bool = False,
+    compact_kv: bool = False,
+    single_qknorm_rope: bool = False,
+    exact_helper_stack: bool = False,
+    parallel_sparse_lut: bool = False,
+    partial_sparse_topk: bool = False,
+    fused_prefix_k_quant: bool = False,
+    fused_query_projection: bool = False,
+    fused_qknorm_hnd_layout: bool = False,
+    direct_nhd_output: bool = False,
+    direct_nhd_kv: bool = False,
+    direct_hnd_fp8_value: bool = False,
+):
+    """Select the exact memory-bounded Attention execution for one request.
+
+    ``None`` preserves the established whole-query path.  A positive value is
+    deliberately request scoped so the 1080p/15s memory rescue cannot leak
+    into validated 720p or short-1080p workloads.  Sparge groups Query rows in
+    physical blocks of 128, therefore every non-terminal chunk must respect
+    that boundary.
+    """
+
+    if chunk_tokens is not None:
+        chunk_tokens = int(chunk_tokens)
+        if chunk_tokens < 128 or chunk_tokens % 128:
+            raise ValueError(
+                "long-sequence Query chunks must be positive multiples of 128"
+            )
+    if compact_kv and (chunk_tokens is None or not split_qkv_outputs):
+        raise ValueError(
+            "compact K/V requires split QKV output streaming"
+        )
+    if shared_qkv_quantization and (
+        chunk_tokens is None or not split_qkv_outputs
+    ):
+        raise ValueError(
+            "shared QKV activation quantization requires split QKV streaming"
+        )
+    if compact_kv and direct_nhd_kv:
+        raise ValueError("direct NHD K/V and compact K/V are distinct executors")
+    if direct_hnd_fp8_value and (
+        chunk_tokens is None
+        or not split_qkv_outputs
+        or compact_kv
+        or direct_nhd_kv
+    ):
+        raise ValueError(
+            "direct HND FP8 V requires non-compact split-QKV HND streaming"
+        )
+    if fused_qknorm_hnd_layout and (
+        chunk_tokens is None
+        or not split_qkv_outputs
+        or not single_qknorm_rope
+        or not fused_query_projection
+        or compact_kv
+        or direct_nhd_kv
+    ):
+        raise ValueError(
+            "fused QK-Norm/HND layout requires non-compact split-QKV "
+            "streaming with the single-sided kernel"
+        )
+    projection_chunk_tokens = int(projection_chunk_tokens)
+    if projection_chunk_tokens <= 0:
+        raise ValueError("long-sequence projection chunks must be positive")
+    token = _LONG_SEQUENCE_QUERY_CHUNK_TOKENS.set(chunk_tokens)
+    projection_token = _LONG_SEQUENCE_PROJECTION_CHUNK_TOKENS.set(
+        projection_chunk_tokens
+    )
+    split_qkv_token = _LONG_SEQUENCE_SPLIT_QKV_OUTPUTS.set(
+        bool(split_qkv_outputs)
+    )
+    shared_qkv_quantization_token = (
+        _LONG_SEQUENCE_SHARED_QKV_QUANTIZATION.set(
+            bool(shared_qkv_quantization)
+        )
+    )
+    compact_kv_token = _LONG_SEQUENCE_COMPACT_KV.set(bool(compact_kv))
+    single_qknorm_token = _LONG_SEQUENCE_SINGLE_QKNORM_ROPE.set(
+        bool(single_qknorm_rope)
+    )
+    exact_helper_token = _LONG_SEQUENCE_EXACT_HELPER_STACK.set(
+        bool(exact_helper_stack)
+    )
+    parallel_lut_token = _LONG_SEQUENCE_PARALLEL_SPARSE_LUT.set(
+        bool(parallel_sparse_lut)
+    )
+    partial_topk_token = _LONG_SEQUENCE_PARTIAL_SPARSE_TOPK.set(
+        bool(partial_sparse_topk)
+    )
+    fused_prefix_token = _LONG_SEQUENCE_FUSED_PREFIX_K_QUANT.set(
+        bool(fused_prefix_k_quant)
+    )
+    fused_query_projection_token = _LONG_SEQUENCE_FUSED_QUERY_PROJECTION.set(
+        bool(fused_query_projection)
+    )
+    fused_qknorm_hnd_token = _LONG_SEQUENCE_FUSED_QKNORM_HND_LAYOUT.set(
+        bool(fused_qknorm_hnd_layout)
+    )
+    direct_nhd_output_token = _LONG_SEQUENCE_DIRECT_NHD_OUTPUT.set(
+        bool(direct_nhd_output)
+    )
+    direct_nhd_kv_token = _LONG_SEQUENCE_DIRECT_NHD_KV.set(
+        bool(direct_nhd_kv)
+    )
+    direct_hnd_fp8_value_token = _LONG_SEQUENCE_DIRECT_HND_FP8_VALUE.set(
+        bool(direct_hnd_fp8_value)
+    )
+    try:
+        yield
+    finally:
+        _LONG_SEQUENCE_DIRECT_HND_FP8_VALUE.reset(
+            direct_hnd_fp8_value_token
+        )
+        _LONG_SEQUENCE_DIRECT_NHD_KV.reset(direct_nhd_kv_token)
+        _LONG_SEQUENCE_DIRECT_NHD_OUTPUT.reset(direct_nhd_output_token)
+        _LONG_SEQUENCE_FUSED_QKNORM_HND_LAYOUT.reset(
+            fused_qknorm_hnd_token
+        )
+        _LONG_SEQUENCE_FUSED_QUERY_PROJECTION.reset(
+            fused_query_projection_token
+        )
+        _LONG_SEQUENCE_COMPACT_KV.reset(compact_kv_token)
+        _LONG_SEQUENCE_FUSED_PREFIX_K_QUANT.reset(fused_prefix_token)
+        _LONG_SEQUENCE_PARTIAL_SPARSE_TOPK.reset(partial_topk_token)
+        _LONG_SEQUENCE_PARALLEL_SPARSE_LUT.reset(parallel_lut_token)
+        _LONG_SEQUENCE_EXACT_HELPER_STACK.reset(exact_helper_token)
+        _LONG_SEQUENCE_SINGLE_QKNORM_ROPE.reset(single_qknorm_token)
+        _LONG_SEQUENCE_SHARED_QKV_QUANTIZATION.reset(
+            shared_qkv_quantization_token
+        )
+        _LONG_SEQUENCE_SPLIT_QKV_OUTPUTS.reset(split_qkv_token)
+        _LONG_SEQUENCE_PROJECTION_CHUNK_TOKENS.reset(projection_token)
+        _LONG_SEQUENCE_QUERY_CHUNK_TOKENS.reset(token)
+
+
+def current_long_sequence_query_chunk_tokens() -> int | None:
+    """Return the request-local exact Attention Query chunk size."""
+
+    return _LONG_SEQUENCE_QUERY_CHUNK_TOKENS.get()
+
+
+def current_long_sequence_projection_chunk_tokens() -> int:
+    """Return the request-local fused-QKV/out projection row chunk."""
+
+    return int(_LONG_SEQUENCE_PROJECTION_CHUNK_TOKENS.get())
+
+
+def current_long_sequence_split_qkv_outputs() -> bool:
+    """Return whether exact output-row Q/K/V projection is request enabled."""
+
+    return bool(_LONG_SEQUENCE_SPLIT_QKV_OUTPUTS.get())
+
+
+def current_long_sequence_shared_qkv_quantization() -> bool:
+    """Whether Q and K/V reuse one exact ConvRot row-INT8 activation."""
+
+    return bool(_LONG_SEQUENCE_SHARED_QKV_QUANTIZATION.get())
+
+
+def current_long_sequence_compact_kv() -> bool:
+    """Whether this request uses two-pass quantized K/V construction."""
+
+    return bool(_LONG_SEQUENCE_COMPACT_KV.get())
+
+
+def current_long_sequence_single_qknorm_rope() -> bool:
+    """Return whether the measured exact single-sided Q/K kernel is enabled."""
+
+    return bool(_LONG_SEQUENCE_SINGLE_QKNORM_ROPE.get())
+
+
+def current_long_sequence_exact_helper_stack() -> bool:
+    """Return whether the quarantined v015 three-helper bundle is enabled.
+
+    The historical field name is retained only to reproduce v015 evidence.
+    Full-video evaluation disproved end-to-end exactness, so new experiments
+    should use the three component switches below.
+    """
+
+    return bool(_LONG_SEQUENCE_EXACT_HELPER_STACK.get())
+
+
+def current_long_sequence_parallel_sparse_lut() -> bool:
+    """Return whether parallel sparse LUT construction is request enabled."""
+
+    return bool(_LONG_SEQUENCE_PARALLEL_SPARSE_LUT.get())
+
+
+def current_long_sequence_partial_sparse_topk() -> bool:
+    """Return whether partial sparse Top-K selection is request enabled."""
+
+    return bool(_LONG_SEQUENCE_PARTIAL_SPARSE_TOPK.get())
+
+
+def current_long_sequence_fused_prefix_k_quant() -> bool:
+    """Return whether fused prefix-K quantization is request enabled."""
+
+    return bool(_LONG_SEQUENCE_FUSED_PREFIX_K_QUANT.get())
+
+
+def current_long_sequence_fused_query_projection() -> bool:
+    """Whether one live Query slab uses one output-sliced INT8 projection.
+
+    The established memory-bounded path projects 8K row fragments and copies
+    them into a second Query-sized allocation.  The fused candidate projects
+    the already bounded Query slab directly.  ConvRot activation quantization
+    and GEMM remain row-local and therefore preserve the model operation; only
+    the temporary fragmentation and copy schedule change.
+    """
+
+    return bool(_LONG_SEQUENCE_FUSED_QUERY_PROJECTION.get())
+
+
+def current_long_sequence_fused_qknorm_hnd_layout() -> bool:
+    """Fuse single-sided QK-Norm/RoPE with the final NHD→HND write."""
+
+    return bool(_LONG_SEQUENCE_FUSED_QKNORM_HND_LAYOUT.get())
+
+
+def current_long_sequence_direct_nhd_output() -> bool:
+    """Write streamed Attention output directly in projection-ready NHD.
+
+    The SM89 kernels accept arbitrary sequence/head output strides even when
+    Q/K use HND.  Backing their HND-shaped output view with contiguous NHD
+    storage removes the otherwise mandatory HND→NHD materialization before
+    the row-major output projection, without changing kernel arithmetic.
+    """
+
+    return bool(_LONG_SEQUENCE_DIRECT_NHD_OUTPUT.get())
+
+
+def current_long_sequence_direct_nhd_kv() -> bool:
+    """Whether sparse streamed K/V remains in projection-native NHD."""
+
+    return bool(_LONG_SEQUENCE_DIRECT_NHD_KV.get())
+
+
+def current_long_sequence_direct_hnd_fp8_value() -> bool:
+    """Whether HND V is quantized directly into Sage's final FP8 ABI."""
+
+    return bool(_LONG_SEQUENCE_DIRECT_HND_FP8_VALUE.get())
+
+
+@contextmanager
 def attention_layer(layer_index: int):
     """Expose the true H3 block index to request-scoped attention policies."""
 
@@ -344,6 +638,17 @@ def current_attention_actual_steps() -> tuple[int, ...] | None:
     """Return the request's complete set of real DiT evaluations."""
 
     return _ATTENTION_ACTUAL_STEPS.get()
+
+
+def current_attention_protected_prefix() -> int:
+    """Return the actual packed text/reference/audio prefix length.
+
+    The value comes from the request's :class:`PackedLayout`; it is not a
+    calibrated prompt-length constant.  Consequently Ref2VA image/audio
+    references and arbitrary text lengths remain part of the exact prefix.
+    """
+
+    return int(_ATTENTION_PROTECTED_PREFIX.get())
 
 
 def current_attention_video_layout() -> tuple[int, int] | None:
@@ -471,6 +776,35 @@ def dense_qk_quantization(granularity: str):
         yield
     finally:
         _DENSE_QK_QUANT_GRAN.reset(token)
+
+
+def _resolve_long_sequence_physical_backend(backend, query_tokens: int):
+    """Resolve one wrapper stack to a memory-bounded physical operator."""
+
+    if backend is sage_attention_sm89:
+        # The prepared-K/V Dense streaming kernel is numerically validated
+        # only for Sage's per-warp Q/K path.  Medium V22 requests deliberately
+        # retain their reviewed per-thread path, so fail closed to the normal
+        # whole-query Dense operator for those cells while still allowing the
+        # exact sparse cells to use split-QKV streaming.
+        return (
+            _DENSE_LONG_SEQUENCE_BACKEND
+            if _DENSE_QK_QUANT_GRAN.get() == "per_warp"
+            else None
+        )
+    resolver = getattr(backend, "resolve_long_sequence_backend", None)
+    return None if resolver is None else resolver(int(query_tokens))
+
+
+def _can_fallback_to_unstreamed_exact_attention(
+    backend, query_tokens: int
+) -> bool:
+    """Whether one unsupported streamed cell may safely use its old operator."""
+
+    if backend is sage_attention_sm89:
+        return True
+    selector = getattr(backend, "current_action_is_exact", None)
+    return bool(callable(selector) and selector(int(query_tokens)))
 
 
 class StepScheduledAttentionBackend:
@@ -733,6 +1067,24 @@ class RequestActionScheduledAttentionBackend:
             return _ATTENTION_SPARSE_TOPK.get() is None
         return action == self.exact_action
 
+    def resolve_long_sequence_backend(self, query_tokens: int):
+        """Resolve the current V19 cell without materializing whole QKV."""
+
+        action = self.current_action(query_tokens)
+        if action is None:
+            physical = _resolve_long_sequence_physical_backend(
+                self.legacy_backend, query_tokens
+            )
+            if physical is not None:
+                self._legacy_calls += 1
+            return physical
+        physical = _resolve_long_sequence_physical_backend(
+            self.action_backends[action], query_tokens
+        )
+        if physical is not None:
+            self._action_calls[action] += 1
+        return physical
+
     def __call__(self, query, key, value):
         action = self.current_action(int(query.shape[0]))
         if action is None:
@@ -746,11 +1098,19 @@ class RequestActionScheduledAttentionBackend:
         return self.action_backends[action](query, key, value)
 
     def telemetry(self) -> dict[str, object]:
+        physical: dict[str, object] = {}
+        for action, backend in self.action_backends.items():
+            method = getattr(backend, "telemetry", None)
+            if callable(method):
+                report = method()
+                if report.get("route_probe_enabled", False):
+                    physical[action] = report
         return {
             "policy": "request_joint_action_schedule",
             "action_calls": dict(self._action_calls),
             "legacy_calls": self._legacy_calls,
             "exact_fallback_calls": self._exact_fallback_calls,
+            "physical_action_telemetry": physical,
         }
 
 
@@ -950,6 +1310,45 @@ class CausalCheckpointVerifierAttentionBackend:
         # A decision made by a probe layer must reach all later true H3 layers.
         memo[id(self)] = self
         return self
+
+    def current_action_is_exact(self, query_tokens: int | None = None) -> bool:
+        """Expose exact offline cells through the verifier wrapper stack."""
+
+        if query_tokens is not None and query_tokens < self.minimum_sparse_tokens:
+            return True
+        if _ATTENTION_STEP.get() is None or _ATTENTION_LAYER.get() is None:
+            return True
+        selector = getattr(self.draft_backend, "current_action_is_exact", None)
+        return bool(callable(selector) and selector(query_tokens))
+
+    def resolve_long_sequence_backend(self, query_tokens: int):
+        """Resolve frozen/offline V19 cells for exact memory-bounded execution.
+
+        Online verifier modes can condition later layers on a sampled result,
+        so they intentionally remain unsupported until that state machine is
+        expressed in chunk space.  Current V19 offline plans carry no online
+        ledger and therefore resolve to the same draft/exact action as
+        ``__call__``.
+        """
+
+        step = _ATTENTION_STEP.get()
+        layer = _ATTENTION_LAYER.get()
+        if query_tokens < self.minimum_sparse_tokens or step is None or layer is None:
+            return _DENSE_LONG_SEQUENCE_BACKEND
+        draft_is_exact = getattr(
+            self.draft_backend, "current_action_is_exact", None
+        )
+        if draft_is_exact is not None and draft_is_exact(query_tokens):
+            return _resolve_long_sequence_physical_backend(
+                self.draft_backend, query_tokens
+            )
+        if self.online_guard_ids:
+            ledger = _ATTENTION_ONLINE_BUDGET.get()
+            if ledger is None or ledger.policy_id not in self.online_guard_ids:
+                return _resolve_long_sequence_physical_backend(
+                    self.draft_backend, query_tokens
+                )
+        return None
 
     def _reset_step(self, step_index: int) -> None:
         if self._active_step != step_index:
@@ -1933,6 +2332,30 @@ class RequestRoutedSpargeAttentionBackend:
         )
         return output.squeeze(0)
 
+    def resolve_long_sequence_backend(self, query_tokens: int):
+        """Keep the legacy Dense request route inside bounded Query memory.
+
+        V24 normally installs a per-cell action schedule.  A fail-closed Dense
+        selection intentionally leaves that schedule empty and reaches this
+        legacy request router.  Returning the prepared Dense backend here is
+        essential: otherwise a low-VRAM plan silently falls back to whole-QKV
+        SageAttention precisely on the quality-protection path.
+
+        The legacy sparse branch is not claimed here because its monolithic
+        operator has different protected-prefix semantics; scheduled sparse
+        actions already resolve through their validated physical backends.
+        """
+
+        if query_tokens < self.minimum_sparse_tokens:
+            return None
+        if _ATTENTION_SPARSE_TOPK.get() is not None:
+            return None
+        return (
+            _DENSE_LONG_SEQUENCE_BACKEND
+            if _DENSE_QK_QUANT_GRAN.get() == "per_warp"
+            else None
+        )
+
 
 class ModalityProtectedSpargeAttentionBackend:
     """Sparsify video-to-video attention while preserving conditioning rows.
@@ -2026,6 +2449,321 @@ _H3_HEAD_RISK_TIERS = (
 )
 
 
+@dataclass(slots=True)
+class PreparedLongSequenceKV:
+    """One layer's reusable SM89 K/V state for Query-streamed Attention.
+
+    The object intentionally owns no unquantized V tensor.  The caller drops
+    that 2.94-GiB 1080p/15s allocation before the sparse K pool/quant pass is
+    launched, preventing two individually safe preparation phases from
+    overlapping into an allocator oversubscription event.
+    """
+
+    key: torch.Tensor | None
+    key_mean: torch.Tensor
+    pooled_key: torch.Tensor
+    similar_key_blocks: torch.Tensor
+    key_int8: torch.Tensor
+    key_scale: torch.Tensor
+    prefix_key_int8: torch.Tensor | None
+    prefix_key_scale: torch.Tensor | None
+    value_fp8: torch.Tensor
+    value_scale: torch.Tensor
+    heads: int
+    key_tokens: int
+    head_dim: int
+    tensor_layout: str = "HND"
+
+
+@dataclass(slots=True)
+class PreparedLongSequenceDenseKV:
+    """Reusable exact Sage SM89 K/V state for Query-streamed Dense cells."""
+
+    key_int8: torch.Tensor
+    key_scale: torch.Tensor
+    value_fp8: torch.Tensor
+    value_scale: torch.Tensor
+    heads: int
+    key_tokens: int
+    head_dim: int
+
+
+def _write_compact_value_fp8(
+    target: torch.Tensor,
+    value: torch.Tensor,
+    value_absmax: torch.Tensor,
+    *,
+    start: int,
+    layout: str,
+) -> None:
+    """Quantize one NHD V slab into Sage/Sparge's permuted FP8 storage."""
+
+    if value.ndim != 3 or value.shape[-1] != 128:
+        raise ValueError("compact V slabs must use [tokens,heads,128]")
+    if start < 0 or start % 16:
+        raise ValueError("compact V slab offsets must align to 16 tokens")
+    heads = int(value.shape[1])
+    head_dim = int(value.shape[2])
+    if value_absmax.shape != (heads, head_dim):
+        raise ValueError("compact V absmax must use [heads,head_dim]")
+    from .compact_fp8 import write_sage_fp8_slab
+
+    write_sage_fp8_slab(
+        target,
+        value,
+        value_absmax,
+        start=start,
+        layout=layout,
+        division_mode=2,
+    )
+
+
+class _CompactValueBuilder:
+    """Incrementally quantize V while retaining the accepted full-K path."""
+
+    def __init__(
+        self,
+        *,
+        key_tokens: int,
+        heads: int,
+        head_dim: int,
+        value_absmax: torch.Tensor,
+        device: torch.device,
+        layout: str,
+    ) -> None:
+        self.key_tokens = int(key_tokens)
+        self.heads = int(heads)
+        self.head_dim = int(head_dim)
+        self.layout = layout
+        self.value_absmax = value_absmax.float().contiguous()
+        padding = 64 if layout == "NHD" else 128
+        padded_tokens = (key_tokens + padding - 1) // padding * padding
+        shape = (
+            (1, head_dim, heads, padded_tokens)
+            if layout == "NHD"
+            else (1, heads, head_dim, padded_tokens)
+        )
+        self.value_fp8 = torch.zeros(
+            shape, device=device, dtype=torch.float8_e4m3fn
+        )
+        self.value_scale = (
+            value_absmax.float().reshape(1, heads, head_dim) / 2.25
+        ).clamp_min_(1.0e-12)
+
+    def add(self, start: int, value: torch.Tensor) -> None:
+        if value.shape[1:] != (self.heads, self.head_dim):
+            raise ValueError("compact V slab shape mismatch")
+        if start % 16 or start + int(value.shape[0]) > self.key_tokens:
+            raise ValueError("compact V slab boundary is invalid")
+        _write_compact_value_fp8(
+            self.value_fp8,
+            value,
+            self.value_absmax,
+            start=start,
+            layout=self.layout,
+        )
+
+    def finish(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
+        return (
+            self.value_fp8,
+            self.value_scale,
+            self.heads,
+            self.key_tokens,
+            self.head_dim,
+        )
+
+
+class _CompactDenseKVBuilder:
+    """Incrementally construct NHD Sage K/V without full BF16 K or V."""
+
+    def __init__(
+        self,
+        *,
+        key_tokens: int,
+        heads: int,
+        head_dim: int,
+        key_mean: torch.Tensor,
+        value_absmax: torch.Tensor,
+        device: torch.device,
+    ) -> None:
+        self.key_tokens = int(key_tokens)
+        self.heads = int(heads)
+        self.head_dim = int(head_dim)
+        self.key_mean = key_mean.to(torch.bfloat16).reshape(
+            1, 1, heads, head_dim
+        )
+        self.key_int8 = torch.empty(
+            (1, key_tokens, heads, head_dim),
+            device=device,
+            dtype=torch.int8,
+        )
+        self.key_scale = torch.empty(
+            (1, heads, (key_tokens + 63) // 64),
+            device=device,
+            dtype=torch.float32,
+        )
+        padded_tokens = (key_tokens + 63) // 64 * 64
+        self.value_fp8 = torch.zeros(
+            (1, head_dim, heads, padded_tokens),
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
+        self.value_scale = (
+            value_absmax.float().reshape(1, heads, head_dim) / 2.25
+        ).clamp_min_(1.0e-12)
+        self.value_absmax = value_absmax.float().contiguous()
+
+    def add(self, start: int, key: torch.Tensor, value: torch.Tensor) -> None:
+        from sageattention import _fused
+
+        rows = int(key.shape[0])
+        if key.shape != value.shape or key.shape[1:] != (
+            self.heads,
+            self.head_dim,
+        ):
+            raise ValueError("compact Dense K/V slab shape mismatch")
+        if start % 64 or start + rows > self.key_tokens:
+            raise ValueError("compact Dense K/V slab boundary is invalid")
+        key_nhd = key.unsqueeze(0).contiguous()
+        chunk_int8 = torch.empty_like(key_nhd, dtype=torch.int8)
+        chunk_scale = torch.empty(
+            (1, self.heads, (rows + 63) // 64),
+            device=key.device,
+            dtype=torch.float32,
+        )
+        _fused.quant_per_block_int8_fuse_sub_mean_cuda(
+            key_nhd,
+            self.key_mean.squeeze(1),
+            chunk_int8,
+            chunk_scale,
+            64,
+            0,
+        )
+        self.key_int8[:, start : start + rows].copy_(chunk_int8)
+        block_start = start // 64
+        self.key_scale[
+            :, :, block_start : block_start + chunk_scale.shape[-1]
+        ].copy_(chunk_scale)
+        _write_compact_value_fp8(
+            self.value_fp8,
+            value,
+            self.value_absmax,
+            start=start,
+            layout="NHD",
+        )
+
+    def finish(self) -> PreparedLongSequenceDenseKV:
+        return PreparedLongSequenceDenseKV(
+            key_int8=self.key_int8,
+            key_scale=self.key_scale,
+            value_fp8=self.value_fp8,
+            value_scale=self.value_scale,
+            heads=self.heads,
+            key_tokens=self.key_tokens,
+            head_dim=self.head_dim,
+        )
+
+
+class _CompactSparseKVBuilder:
+    """Incrementally construct HND Sparge K/V and discard BF16 slabs."""
+
+    def __init__(
+        self,
+        *,
+        key_tokens: int,
+        heads: int,
+        head_dim: int,
+        key_mean: torch.Tensor,
+        value_absmax: torch.Tensor,
+        device: torch.device,
+    ) -> None:
+        self.key_tokens = int(key_tokens)
+        self.heads = int(heads)
+        self.head_dim = int(head_dim)
+        self.key_mean = key_mean.to(torch.bfloat16).reshape(
+            1, heads, 1, head_dim
+        )
+        key_blocks = (key_tokens + 63) // 64
+        self.pooled_key = torch.empty(
+            (1, heads, key_blocks, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        self.similar_key_blocks = torch.empty(
+            (1, heads, key_blocks), device=device, dtype=torch.bool
+        )
+        self.key_int8 = torch.empty(
+            (1, heads, key_tokens, head_dim), device=device, dtype=torch.int8
+        )
+        self.key_scale = torch.empty(
+            (1, heads, key_blocks), device=device, dtype=torch.float32
+        )
+        padded_tokens = (key_tokens + 127) // 128 * 128
+        self.value_fp8 = torch.zeros(
+            (1, heads, head_dim, padded_tokens),
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
+        self.value_scale = (
+            value_absmax.float().reshape(1, heads, head_dim) / 2.25
+        ).clamp_min_(1.0e-12)
+        self.value_absmax = value_absmax.float().contiguous()
+
+    def add(self, start: int, key: torch.Tensor, value: torch.Tensor) -> None:
+        from spas_sage_attn.utils import (
+            get_pool_sim_triton_simmean_fuse_quant,
+            hyperparameter_check,
+        )
+
+        rows = int(key.shape[0])
+        if key.shape != value.shape or key.shape[1:] != (
+            self.heads,
+            self.head_dim,
+        ):
+            raise ValueError("compact Sparse K/V slab shape mismatch")
+        if start % 128 or start + rows > self.key_tokens:
+            raise ValueError("compact Sparse K/V slab boundary is invalid")
+        key_hnd = key.permute(1, 0, 2).unsqueeze(0).contiguous()
+        sim_threshold = hyperparameter_check(-0.1, self.heads, key.device)
+        pooled, similar, quantized, scale = (
+            get_pool_sim_triton_simmean_fuse_quant(
+                key_hnd, self.key_mean, 64, sim_threshold
+            )
+        )
+        self.key_int8[:, :, start : start + rows].copy_(quantized)
+        block_start = start // 64
+        block_stop = block_start + int(scale.shape[-1])
+        self.key_scale[:, :, block_start:block_stop].copy_(scale)
+        self.pooled_key[:, :, block_start:block_stop].copy_(pooled)
+        self.similar_key_blocks[:, :, block_start:block_stop].copy_(similar)
+        _write_compact_value_fp8(
+            self.value_fp8,
+            value,
+            self.value_absmax,
+            start=start,
+            layout="HND",
+        )
+
+    def finish(self) -> PreparedLongSequenceKV:
+        return PreparedLongSequenceKV(
+            key=None,
+            key_mean=self.key_mean,
+            pooled_key=self.pooled_key,
+            similar_key_blocks=self.similar_key_blocks,
+            key_int8=self.key_int8,
+            key_scale=self.key_scale,
+            prefix_key_int8=None,
+            prefix_key_scale=None,
+            value_fp8=self.value_fp8,
+            value_scale=self.value_scale,
+            heads=self.heads,
+            key_tokens=self.key_tokens,
+            head_dim=self.head_dim,
+        )
+
+
 class SplitModalityProtectedSpargeAttentionBackend:
     """Run packed conditioning queries dense and video queries sparse.
 
@@ -2036,6 +2774,8 @@ class SplitModalityProtectedSpargeAttentionBackend:
     """
 
     approximate = True
+    long_sequence_value_dtype = torch.float16
+    supports_direct_nhd_kv = True
 
     def __init__(
         self,
@@ -2048,7 +2788,14 @@ class SplitModalityProtectedSpargeAttentionBackend:
         temporal_global_anchor_stride: int = 0,
         temporal_global_spatial_block_radius: int = 0,
         selection_mode: str = "fixed_topk",
+        maximum_selected_key_blocks: int | tuple[int, ...] | None = None,
+        minimum_retained_topk_mass: float = 0.95,
+        mass_probe_selected_key_blocks: tuple[int, ...] | None = None,
         adaptive_safety_margin: float = 0.65,
+        route_probe: bool = False,
+        parallel_long_sequence_lut: bool = False,
+        partial_long_sequence_topk: bool = False,
+        fused_long_sequence_prefix_k_quant: bool = False,
     ) -> None:
         budgets = (float(topk),) if isinstance(topk, (float, int)) else tuple(topk)
         if not 0.0625 <= experimental_minimum_topk <= 0.5:
@@ -2073,6 +2820,9 @@ class SplitModalityProtectedSpargeAttentionBackend:
             raise ValueError("adaptive safety margin must lie inside [0, 1]")
         if selection_mode not in (
             "fixed_topk",
+            "fixed_topk_absolute_cap",
+            "fixed_topk_mass_guarded_cap",
+            "fixed_topk_mass_probe",
             "mass_budget",
             "mass_rebate",
             "route_cache",
@@ -2089,13 +2839,79 @@ class SplitModalityProtectedSpargeAttentionBackend:
             "unified_fixed_topk",
         ):
             raise ValueError(
-                "selection_mode must be fixed_topk, mass_budget, mass_rebate, "
+                "selection_mode must be fixed_topk, fixed_topk_absolute_cap, "
+                "fixed_topk_mass_guarded_cap, "
+                "fixed_topk_mass_probe, "
+                "mass_budget, mass_rebate, "
                 "route_cache, temporal_motion_guard, interaction_guard, "
                 "interaction_rail, interaction_recovery, "
                 "interaction_rebalance, interaction_hybrid, "
                 "interaction_dense, disagreement_sentinel, "
                 "causal_head_guard, budget_adaptive or "
                 "unified_fixed_topk"
+            )
+        if maximum_selected_key_blocks is None:
+            maximum_block_counts = None
+        elif isinstance(maximum_selected_key_blocks, int) and not isinstance(
+            maximum_selected_key_blocks, bool
+        ):
+            maximum_block_counts = (int(maximum_selected_key_blocks),)
+        elif isinstance(maximum_selected_key_blocks, tuple):
+            maximum_block_counts = tuple(maximum_selected_key_blocks)
+        else:
+            raise ValueError(
+                "maximum selected key blocks must be an integer or tuple"
+            )
+        if maximum_block_counts is not None and (
+            not maximum_block_counts
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                for value in maximum_block_counts
+            )
+        ):
+            raise ValueError(
+                "maximum selected key blocks must contain positive integers"
+            )
+        if not 0.0 < minimum_retained_topk_mass <= 1.0:
+            raise ValueError("minimum retained Top-K mass must lie inside (0, 1]")
+        probe_counts = (
+            ()
+            if mass_probe_selected_key_blocks is None
+            else tuple(mass_probe_selected_key_blocks)
+        )
+        if probe_counts and (
+            tuple(sorted(set(probe_counts))) != probe_counts
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                for value in probe_counts
+            )
+        ):
+            raise ValueError(
+                "mass-probe selected key blocks must be sorted unique positive integers"
+            )
+        if probe_counts and selection_mode != "fixed_topk_mass_probe":
+            raise ValueError(
+                "mass-probe selected key blocks require fixed_topk_mass_probe"
+            )
+        if probe_counts and len(budgets) != 1:
+            raise ValueError("mass-probe cap ladder currently requires scalar Top-K")
+        absolute_cap_modes = (
+            "fixed_topk_absolute_cap",
+            "fixed_topk_mass_guarded_cap",
+            "fixed_topk_mass_probe",
+        )
+        if selection_mode in absolute_cap_modes:
+            if maximum_block_counts is None:
+                raise ValueError(
+                    f"{selection_mode} requires maximum selected key blocks"
+                )
+        elif maximum_block_counts is not None:
+            raise ValueError(
+                "maximum selected key blocks require an absolute-cap selector"
             )
         self.topk = budgets[0] if len(budgets) == 1 else budgets
         self.minimum_sparse_tokens = int(minimum_sparse_tokens)
@@ -2106,8 +2922,23 @@ class SplitModalityProtectedSpargeAttentionBackend:
             temporal_global_spatial_block_radius
         )
         self.selection_mode = selection_mode
+        self.maximum_selected_key_blocks = (
+            maximum_block_counts[0]
+            if maximum_block_counts is not None and len(maximum_block_counts) == 1
+            else maximum_block_counts
+        )
+        self.minimum_retained_topk_mass = float(minimum_retained_topk_mass)
+        self.mass_probe_selected_key_blocks = probe_counts
         self.adaptive_safety_margin = float(adaptive_safety_margin)
         self.experimental_minimum_topk = float(experimental_minimum_topk)
+        self.route_probe = bool(route_probe)
+        self.parallel_long_sequence_lut = bool(parallel_long_sequence_lut)
+        self.partial_long_sequence_topk = bool(partial_long_sequence_topk)
+        self.fused_long_sequence_prefix_k_quant = bool(
+            fused_long_sequence_prefix_k_quant
+        )
+        if self.route_probe and self.selection_mode != "fixed_topk":
+            raise ValueError("route probe requires the fixed_topk selector")
         # Research-only sparse-route metadata cache. It never reuses Attention
         # values, projections, MLP outputs or hidden residuals. Entries are
         # scoped by true H3 layer and shape; two consecutive maps must first
@@ -2116,12 +2947,28 @@ class SplitModalityProtectedSpargeAttentionBackend:
         self._route_cache_hits = 0
         self._route_cache_misses = 0
         self._route_cache_rejected = 0
+        # Research-only recorder for the final, rail-protected sparse map. It
+        # never changes the LUT consumed by Attention. Reductions remain on
+        # device during denoising and are materialized only for telemetry, so
+        # no CPU synchronization is introduced in each H3 layer.
+        self._route_probe_previous: dict[
+            tuple[int, int, int, int], tuple[int, torch.Tensor]
+        ] = {}
+        self._route_probe_records: list[dict[str, object]] = []
         self._sentinel_calls = 0
         self._sentinel_dense_query_tokens = 0
         self._sentinel_total_query_tokens = 0
         self._causal_head_guard_calls = 0
         self._causal_head_guard_dense_heads = 0
         self._causal_head_guard_total_heads = 0
+        # Research-only absolute-cap evidence.  The tensors are tiny views of
+        # the most recent prepared-KV call and are materialized only when
+        # telemetry is requested, keeping the timed CUDA path free of host
+        # synchronization.  This mode is a distinct physical action and does
+        # not alter the accepted fixed_topk implementation.
+        self._absolute_cap_calls = 0
+        self._absolute_cap_last: dict[str, object] | None = None
+        self._mass_guard_records: list[dict[str, object]] = []
 
     @staticmethod
     def _project_counts_to_exact_budget(
@@ -2348,6 +3195,55 @@ class SplitModalityProtectedSpargeAttentionBackend:
             )
         return torch.tensor(self.topk, device=device, dtype=torch.float32)
 
+    def _selected_key_block_counts(
+        self,
+        heads: int,
+        key_blocks: int,
+        device: torch.device,
+        *,
+        apply_absolute_cap: bool = True,
+    ) -> torch.Tensor:
+        """Return fixed-TopK counts before mandatory structural rails.
+
+        ``fixed_topk_absolute_cap`` preserves the accepted fractional policy
+        up to its calibrated reference horizon, then stops discretionary
+        global KV selection from growing with sequence length.  Dense prefix,
+        MTCR and rotating global anchors are applied afterwards and therefore
+        remain non-negotiable.  The helper deliberately preserves the exact
+        floor conversion used by the prepared-KV production path.
+        """
+
+        if heads <= 0 or key_blocks <= 0:
+            raise ValueError("head and key block counts must be positive")
+        budgets = self._head_topk(heads, device)
+        if isinstance(budgets, float):
+            budgets = torch.full(
+                (heads,), budgets, device=device, dtype=torch.float32
+            )
+        nominal = (budgets * key_blocks).to(torch.int64)
+        if not apply_absolute_cap or self.selection_mode not in (
+            "fixed_topk_absolute_cap",
+            "fixed_topk_mass_guarded_cap",
+            "fixed_topk_mass_probe",
+        ):
+            return nominal
+
+        maximum = self.maximum_selected_key_blocks
+        if isinstance(maximum, int):
+            cap = torch.full(
+                (heads,), maximum, device=device, dtype=torch.int64
+            )
+        elif isinstance(maximum, tuple):
+            if len(maximum) != heads:
+                raise ValueError(
+                    "head-wise absolute cap has "
+                    f"{len(maximum)} values for {heads} heads"
+                )
+            cap = torch.tensor(maximum, device=device, dtype=torch.int64)
+        else:  # Constructor validation makes this a fail-closed invariant.
+            raise RuntimeError("absolute-cap selector is missing its block cap")
+        return torch.minimum(nominal, cap)
+
     def _interaction_risk_guard(
         self,
         pooled_q: torch.Tensor,
@@ -2450,6 +3346,651 @@ class SplitModalityProtectedSpargeAttentionBackend:
         )
         return k, v_fp8, v_scale, heads, kv_len, head_dim
 
+    def resolve_long_sequence_backend(self, query_tokens: int):
+        """Return this physical backend when exact Query streaming is legal."""
+
+        if query_tokens < self.minimum_sparse_tokens:
+            return None
+        # The first production route deliberately implements the frozen V19
+        # fixed-TopK family.  Adaptive selectors carry whole-request state and
+        # must gain their own equivalence evidence before opting in.
+        if self.selection_mode not in (
+            "fixed_topk",
+            "fixed_topk_absolute_cap",
+            "fixed_topk_mass_guarded_cap",
+            "fixed_topk_mass_probe",
+        ):
+            return None
+        return self
+
+    @staticmethod
+    def begin_compact_long_sequence_kv(
+        *,
+        key_tokens: int,
+        heads: int,
+        head_dim: int,
+        key_mean: torch.Tensor,
+        value_absmax: torch.Tensor,
+        device: torch.device,
+    ) -> _CompactSparseKVBuilder:
+        """Start an HND K/V build that never owns sequence-long BF16 K/V."""
+
+        return _CompactSparseKVBuilder(
+            key_tokens=key_tokens,
+            heads=heads,
+            head_dim=head_dim,
+            key_mean=key_mean,
+            value_absmax=value_absmax,
+            device=device,
+        )
+
+    @staticmethod
+    def begin_compact_long_sequence_values(
+        *,
+        key_tokens: int,
+        heads: int,
+        head_dim: int,
+        value_absmax: torch.Tensor,
+        device: torch.device,
+    ) -> _CompactValueBuilder:
+        return _CompactValueBuilder(
+            key_tokens=key_tokens,
+            heads=heads,
+            head_dim=head_dim,
+            value_absmax=value_absmax,
+            device=device,
+            layout="HND",
+        )
+
+    @staticmethod
+    def prepare_long_sequence_values(
+        value_hnd: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
+        """Quantize one already-HND V tensor without materializing another V.
+
+        ``value_hnd`` is produced directly by the chunked fused-QKV projector.
+        Keeping this seam separate from K preparation lets its owner release
+        the BF16/FP16 V allocation before the 1-byte K representation is built.
+        """
+
+        from spas_sage_attn import core as sparge_core
+
+        if current_long_sequence_direct_nhd_kv():
+            if value_hnd.ndim != 4 or value_hnd.shape[0] != 1:
+                raise ValueError("long-sequence NHD V must use [1,L,H,D] layout")
+            if value_hnd.dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError("long-sequence NHD V must be FP16 or BF16")
+            if not value_hnd.is_contiguous():
+                raise ValueError("long-sequence NHD V must be contiguous")
+            batch, kv_len, heads, head_dim = value_hnd.shape
+            padded_len = (kv_len + 127) // 128 * 128
+            transposed = torch.empty(
+                (batch, head_dim, heads, padded_len),
+                dtype=value_hnd.dtype,
+                device=value_hnd.device,
+            )
+            sparge_core.fused.transpose_pad_permute_cuda(
+                value_hnd, transposed, 0
+            )
+            value_fp8 = torch.empty_like(
+                transposed, dtype=torch.float8_e4m3fn
+            )
+            value_scale = torch.empty(
+                (batch, heads, head_dim),
+                dtype=torch.float32,
+                device=value_hnd.device,
+            )
+            sparge_core.fused.scale_fuse_quant_cuda(
+                transposed, value_fp8, value_scale, kv_len, 2.25, 0
+            )
+            del transposed
+            return value_fp8, value_scale, heads, kv_len, head_dim
+
+        if value_hnd.ndim != 4 or value_hnd.shape[0] != 1:
+            raise ValueError("long-sequence V must use [1,H,L,D] layout")
+        if value_hnd.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("long-sequence V must be FP16 or BF16")
+        if not value_hnd.is_contiguous():
+            raise ValueError("long-sequence V must be contiguous")
+        batch, heads, kv_len, head_dim = value_hnd.shape
+        padded_len = (kv_len + 127) // 128 * 128
+        transposed = torch.empty(
+            (batch, heads, head_dim, padded_len),
+            dtype=value_hnd.dtype,
+            device=value_hnd.device,
+        )
+        sparge_core.fused.transpose_pad_permute_cuda(value_hnd, transposed, 1)
+        value_fp8 = torch.empty_like(transposed, dtype=torch.float8_e4m3fn)
+        value_scale = torch.empty(
+            (batch, heads, head_dim),
+            dtype=torch.float32,
+            device=value_hnd.device,
+        )
+        sparge_core.fused.scale_fuse_quant_cuda(
+            transposed, value_fp8, value_scale, kv_len, 2.25, 1
+        )
+        del transposed
+        return value_fp8, value_scale, heads, kv_len, head_dim
+
+    def prepare_long_sequence_keys(
+        self,
+        key_hnd: torch.Tensor,
+        value_fp8: torch.Tensor,
+        value_scale: torch.Tensor,
+    ) -> PreparedLongSequenceKV:
+        """Pool and quantize K once for every streamed video Query chunk."""
+
+        from spas_sage_attn.utils import (
+            get_pool_sim_triton_simmean_fuse_quant,
+            hyperparameter_check,
+        )
+
+        if current_long_sequence_direct_nhd_kv():
+            from .sparge_nhd import (
+                hnd_compatible_key_mean_nhd,
+                pool_sim_quant_nhd,
+            )
+
+            if key_hnd.ndim != 4 or key_hnd.shape[0] != 1:
+                raise ValueError("long-sequence NHD K must use [1,L,H,D]")
+            if key_hnd.dtype != torch.bfloat16 or not key_hnd.is_contiguous():
+                raise ValueError("long-sequence NHD K must be contiguous BF16")
+            batch, key_tokens, heads, head_dim = key_hnd.shape
+            if value_fp8.shape != (
+                batch,
+                head_dim,
+                heads,
+                (key_tokens + 127) // 128 * 128,
+            ):
+                raise ValueError(
+                    "prepared long-sequence NHD V shape does not match K"
+                )
+            if value_scale.shape != (batch, heads, head_dim):
+                raise ValueError("prepared long-sequence NHD V scale mismatch")
+            key_mean = hnd_compatible_key_mean_nhd(key_hnd)
+            sim_threshold = hyperparameter_check(-0.1, heads, key_hnd.device)
+            pooled_key, similar_key_blocks, key_int8, key_scale = (
+                pool_sim_quant_nhd(
+                    key_hnd, key_mean, 64, sim_threshold
+                )
+            )
+            return PreparedLongSequenceKV(
+                key=key_hnd,
+                key_mean=key_mean,
+                pooled_key=pooled_key,
+                similar_key_blocks=similar_key_blocks,
+                key_int8=key_int8,
+                key_scale=key_scale,
+                prefix_key_int8=None,
+                prefix_key_scale=None,
+                value_fp8=value_fp8,
+                value_scale=value_scale,
+                heads=heads,
+                key_tokens=key_tokens,
+                head_dim=head_dim,
+                tensor_layout="NHD",
+            )
+
+        if key_hnd.ndim != 4 or key_hnd.shape[0] != 1:
+            raise ValueError("long-sequence K must use [1,H,L,D] layout")
+        if key_hnd.dtype != torch.bfloat16 or not key_hnd.is_contiguous():
+            raise ValueError("long-sequence K must be contiguous BF16")
+        batch, heads, key_tokens, head_dim = key_hnd.shape
+        if value_fp8.shape != (
+            batch,
+            heads,
+            head_dim,
+            (key_tokens + 127) // 128 * 128,
+        ):
+            raise ValueError("prepared long-sequence V shape does not match K")
+        if value_scale.shape != (batch, heads, head_dim):
+            raise ValueError("prepared long-sequence V scale does not match K")
+        key_mean = key_hnd.mean(dim=-2, keepdim=True)
+        sim_threshold = hyperparameter_check(-0.1, heads, key_hnd.device)
+        pooled_key, similar_key_blocks, key_int8, key_scale = (
+            get_pool_sim_triton_simmean_fuse_quant(
+                key_hnd, key_mean, 64, sim_threshold
+            )
+        )
+        return PreparedLongSequenceKV(
+            key=key_hnd,
+            key_mean=key_mean,
+            pooled_key=pooled_key,
+            similar_key_blocks=similar_key_blocks,
+            key_int8=key_int8,
+            key_scale=key_scale,
+            prefix_key_int8=None,
+            prefix_key_scale=None,
+            value_fp8=value_fp8,
+            value_scale=value_scale,
+            heads=heads,
+            key_tokens=key_tokens,
+            head_dim=head_dim,
+        )
+
+    def long_sequence_prefix_queries(
+        self,
+        query: torch.Tensor,
+        prepared: PreparedLongSequenceKV,
+    ) -> torch.Tensor:
+        """Evaluate the small protected prefix with the accepted Dense math."""
+
+        if prepared.key is None:
+            return self._compact_full_context_queries(query, prepared)
+
+        if prepared.tensor_layout == "NHD":
+            return self._dense_prefix_nhd(
+                query,
+                prepared.key,
+                prepared.value_fp8,
+                prepared.value_scale,
+                head_dim=prepared.head_dim,
+                key_mean=prepared.key_mean,
+                fused_key_quant=(
+                    self.fused_long_sequence_prefix_k_quant
+                    or current_long_sequence_fused_prefix_k_quant()
+                    or current_long_sequence_exact_helper_stack()
+                ),
+            )
+
+        return self._dense_prefix(
+            query,
+            prepared.key,
+            prepared.value_fp8,
+            prepared.value_scale,
+            head_dim=prepared.head_dim,
+            key_mean=prepared.key_mean,
+            fused_key_quant=(
+                self.fused_long_sequence_prefix_k_quant
+                or current_long_sequence_fused_prefix_k_quant()
+                or current_long_sequence_exact_helper_stack()
+            ),
+        )
+
+    @staticmethod
+    def _compact_full_context_queries(
+        query: torch.Tensor,
+        prepared: PreparedLongSequenceKV,
+    ) -> torch.Tensor:
+        """Run compact prefix queries through Dense Sage over every KV row.
+
+        The ordinary protected prefix uses Sage's dense helper and therefore
+        needs sequence-long BF16 K.  Compact execution deliberately does not
+        retain that tensor.  The stable per-warp Sage kernel directly reuses
+        Sparge's per-64-row K representation, retaining full prefix-to-KV
+        connectivity without a second sequence-long INT8 K copy.
+        """
+
+        from einops import rearrange
+        from sageattention import _fused, sm89_compile
+
+        if (
+            query.ndim != 3
+            or query.shape[0] <= 0
+            or query.shape[1] != prepared.heads
+            or query.shape[2] != prepared.head_dim
+        ):
+            raise ValueError("compact prefix Query does not match prepared K/V")
+        q = rearrange(query, "L H D -> 1 H L D").contiguous().to(torch.bfloat16)
+        query_tokens = int(q.shape[2])
+        q_int8 = torch.empty_like(q, dtype=torch.int8)
+        q_scale = torch.empty(
+            (1, prepared.heads, ((query_tokens + 127) // 128) * 4),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        _fused.quant_per_warp_int8_cuda(q, q_int8, q_scale, 128, 32, 1)
+        output = torch.empty_like(q)
+        sm89_compile.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
+            q_int8,
+            prepared.key_int8,
+            prepared.value_fp8,
+            output,
+            q_scale,
+            prepared.key_scale,
+            prepared.value_scale,
+            1,
+            0,
+            2,
+            1.0 / (prepared.head_dim**0.5),
+            0,
+        )
+        return rearrange(output, "1 H L D -> L H D")
+
+    def long_sequence_video_queries(
+        self,
+        query: torch.Tensor,
+        prepared: PreparedLongSequenceKV,
+        *,
+        protected_tokens: int,
+        query_token_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate one aligned video Query chunk with reusable K/V state."""
+
+        from einops import rearrange
+        from spas_sage_attn import core as sparge_core
+        from spas_sage_attn.utils import (
+            block_map_lut_triton,
+            fill_block_map_triton,
+            get_pool_sim_triton_simmean_fuse_quant,
+            hyperparameter_check,
+        )
+
+        if self.selection_mode not in (
+            "fixed_topk",
+            "fixed_topk_absolute_cap",
+            "fixed_topk_mass_guarded_cap",
+            "fixed_topk_mass_probe",
+        ):
+            raise RuntimeError(
+                "long-sequence prepared-KV requires a stateless fixed-TopK selector"
+            )
+        if (
+            query.ndim != 3
+            or query.shape[0] <= 0
+            or query.shape[1] != prepared.heads
+            or query.shape[2] != prepared.head_dim
+        ):
+            raise ValueError("long-sequence Query chunk does not match prepared K/V")
+        if (
+            query_token_indices.ndim != 1
+            or query_token_indices.numel() != query.shape[0]
+            or query_token_indices.device != query.device
+        ):
+            raise ValueError("long-sequence Query indices must align with the chunk")
+
+        if prepared.tensor_layout == "NHD":
+            from .sparge_nhd import pool_sim_quant_nhd
+
+            q = query.unsqueeze(0).contiguous().to(torch.bfloat16)
+        else:
+            q = rearrange(
+                query, "L H D -> 1 H L D"
+            ).contiguous().to(torch.bfloat16)
+        sim_threshold = hyperparameter_check(-0.1, prepared.heads, q.device)
+        if prepared.tensor_layout == "NHD":
+            pooled_query, similar_query_blocks, q_int8, q_scale = (
+                pool_sim_quant_nhd(q, None, 128, sim_threshold)
+            )
+        else:
+            pooled_query, similar_query_blocks, q_int8, q_scale = (
+                get_pool_sim_triton_simmean_fuse_quant(
+                    q, None, 128, sim_threshold
+                )
+            )
+        query_blocks = int(pooled_query.shape[-2])
+        key_blocks = int(prepared.pooled_key.shape[-2])
+        expanded_key = prepared.similar_key_blocks.unsqueeze(-2).expand(
+            -1, -1, query_blocks, -1
+        )
+        expanded_query = similar_query_blocks.unsqueeze(-1).expand(
+            -1, -1, -1, key_blocks
+        )
+        scores = pooled_query @ prepared.pooled_key.transpose(-1, -2)
+        scores.mul_(q.shape[-1] ** -0.5)
+        scores.masked_fill_(~expanded_key, -torch.inf)
+        mass_guard_mode = self.selection_mode in (
+            "fixed_topk_mass_guarded_cap",
+            "fixed_topk_mass_probe",
+        )
+        use_partial_topk = (
+            self.partial_long_sequence_topk
+            or current_long_sequence_partial_sparse_topk()
+            or current_long_sequence_exact_helper_stack()
+        )
+        if use_partial_topk and not mass_guard_mode:
+            budgets = (
+                (self.topk,)
+                if isinstance(self.topk, float)
+                else self.topk
+            )
+            maximum_selected = max(
+                1,
+                min(key_blocks, int(max(budgets) * key_blocks)),
+            )
+            selected_indices = torch.topk(
+                scores.softmax(-1),
+                maximum_selected,
+                dim=-1,
+                largest=True,
+                sorted=True,
+            ).indices
+            sorted_scores = None
+        else:
+            sorted_scores = torch.sort(
+                scores.softmax(-1), dim=-1, descending=True
+            )
+            selected_indices = sorted_scores.indices
+        nominal_head_count = self._selected_key_block_counts(
+            prepared.heads,
+            key_blocks,
+            q.device,
+            apply_absolute_cap=False,
+        )
+        capped_head_count = self._selected_key_block_counts(
+            prepared.heads, key_blocks, q.device
+        )
+        nominal_selected = nominal_head_count.view(1, prepared.heads, 1).expand(
+            scores.shape[0], -1, query_blocks
+        )
+        capped_selected = capped_head_count.view(1, prepared.heads, 1).expand(
+            scores.shape[0], -1, query_blocks
+        )
+        cap_activated = None
+        retained_mass = None
+        if mass_guard_mode:
+            assert sorted_scores is not None
+            # The selector has already sorted proxy Attention probability.
+            # Cumsum only the accepted Top-K prefix (<=10% on the current V19
+            # rail), not all KV blocks.  This adds a compact request-local
+            # confidence test: use the cap only where it retains the declared
+            # fraction of the original fixed-TopK mass; diffuse rows fail
+            # closed to their accepted nominal count.
+            maximum_nominal = max(
+                1,
+                math.ceil(
+                    max(
+                        (self.topk,)
+                        if isinstance(self.topk, float)
+                        else self.topk
+                    )
+                    * key_blocks
+                ),
+            )
+            prefix_cdf = torch.cumsum(
+                sorted_scores.values[..., :maximum_nominal],
+                dim=-1,
+                dtype=torch.float32,
+            )
+            nominal_mass = prefix_cdf.gather(
+                -1,
+                (nominal_selected - 1).clamp_min(0).unsqueeze(-1),
+            ).squeeze(-1)
+            capped_mass = prefix_cdf.gather(
+                -1,
+                (capped_selected - 1).clamp_min(0).unsqueeze(-1),
+            ).squeeze(-1)
+            retained_mass = capped_mass / nominal_mass.clamp_min(1e-8)
+            cap_activated = retained_mass >= self.minimum_retained_topk_mass
+            selected_count = (
+                nominal_selected.contiguous()
+                if self.selection_mode == "fixed_topk_mass_probe"
+                else torch.where(
+                    cap_activated,
+                    capped_selected,
+                    nominal_selected,
+                ).contiguous()
+            )
+            step = _ATTENTION_STEP.get()
+            self._mass_guard_records.append(
+                {
+                    "step": None if step is None else int(step[0]),
+                    "layer": _ATTENTION_LAYER.get(),
+                    "key_blocks": key_blocks,
+                    "query_blocks": query_blocks,
+                    "selected_blocks": int(
+                        self.maximum_selected_key_blocks
+                        if isinstance(self.maximum_selected_key_blocks, int)
+                        else max(self.maximum_selected_key_blocks)
+                    ),
+                    "activated": cap_activated.sum().detach(),
+                    "total": int(cap_activated.numel()),
+                    "retained_sum": retained_mass.sum().detach(),
+                    "retained_min": retained_mass.min().detach(),
+                    "retained_max": retained_mass.max().detach(),
+                    "threshold_counts": torch.stack(
+                        tuple(
+                            (retained_mass >= threshold).sum()
+                            for threshold in (0.90, 0.925, 0.95, 0.975, 0.99)
+                        )
+                    ).detach(),
+                }
+            )
+            if (
+                self.selection_mode == "fixed_topk_mass_probe"
+                and self.mass_probe_selected_key_blocks
+            ):
+                for probe_count in self.mass_probe_selected_key_blocks:
+                    probe_count = min(probe_count, maximum_nominal)
+                    if (
+                        isinstance(self.maximum_selected_key_blocks, int)
+                        and probe_count == self.maximum_selected_key_blocks
+                    ):
+                        continue
+                    probe_selected = torch.full_like(
+                        nominal_selected, probe_count
+                    )
+                    probe_mass = prefix_cdf.gather(
+                        -1,
+                        (probe_selected - 1).clamp_min(0).unsqueeze(-1),
+                    ).squeeze(-1)
+                    probe_retained = probe_mass / nominal_mass.clamp_min(1e-8)
+                    probe_activated = (
+                        probe_retained >= self.minimum_retained_topk_mass
+                    )
+                    self._mass_guard_records.append(
+                        {
+                            "step": None if step is None else int(step[0]),
+                            "layer": _ATTENTION_LAYER.get(),
+                            "key_blocks": key_blocks,
+                            "query_blocks": query_blocks,
+                            "selected_blocks": probe_count,
+                            "activated": probe_activated.sum().detach(),
+                            "total": int(probe_activated.numel()),
+                            "retained_sum": probe_retained.sum().detach(),
+                            "retained_min": probe_retained.min().detach(),
+                            "retained_max": probe_retained.max().detach(),
+                            "threshold_counts": torch.stack(
+                                tuple(
+                                    (probe_retained >= threshold).sum()
+                                    for threshold in (
+                                        0.90,
+                                        0.925,
+                                        0.95,
+                                        0.975,
+                                        0.99,
+                                    )
+                                )
+                            ).detach(),
+                        }
+                    )
+                    del probe_selected, probe_mass, probe_retained, probe_activated
+            del prefix_cdf, nominal_mass, capped_mass
+        else:
+            selected_count = capped_selected.contiguous()
+        block_map = torch.zeros_like(scores, dtype=torch.bool)
+        block_map[~expanded_key] = True
+        block_map[~expanded_query] = True
+        if use_partial_topk and not mass_guard_mode:
+            from .sparse_lut import fill_block_map_partial_topk
+
+            block_map = fill_block_map_partial_topk(
+                block_map, selected_count, selected_indices
+            )
+        else:
+            block_map = fill_block_map_triton(
+                block_map, selected_count, selected_indices
+            )
+        protected_key_blocks = (protected_tokens + 63) // 64
+        block_map[:, :, :, :protected_key_blocks] = True
+        self._protect_temporal_correspondence(
+            block_map,
+            query_tokens=int(query.shape[0]),
+            key_tokens=prepared.key_tokens,
+            protected_tokens=protected_tokens,
+            query_token_indices=query_token_indices,
+        )
+        block_map = block_map.contiguous()
+        if (
+            self.parallel_long_sequence_lut
+            or current_long_sequence_parallel_sparse_lut()
+            or current_long_sequence_exact_helper_stack()
+        ):
+            from .sparse_lut import parallel_block_map_lut
+
+            lut, valid_block_num = parallel_block_map_lut(block_map)
+        else:
+            lut, valid_block_num = block_map_lut_triton(block_map)
+        if self.selection_mode in (
+            "fixed_topk_absolute_cap",
+            "fixed_topk_mass_guarded_cap",
+            "fixed_topk_mass_probe",
+        ):
+            self._absolute_cap_calls += 1
+            self._absolute_cap_last = {
+                "key_blocks": key_blocks,
+                "query_blocks": query_blocks,
+                "nominal_selected": nominal_head_count.detach(),
+                "capped_selected": capped_head_count.detach(),
+                "selected_before_rails": selected_count.detach(),
+                "valid_after_mandatory_rails": valid_block_num.detach(),
+                "cap_activated": (
+                    cap_activated.detach() if cap_activated is not None else None
+                ),
+                "retained_mass": (
+                    retained_mass.detach() if retained_mass is not None else None
+                ),
+            }
+        tensor_layout = 0 if prepared.tensor_layout == "NHD" else 1
+        direct_nhd_output = (
+            prepared.tensor_layout == "NHD"
+            or current_long_sequence_direct_nhd_output()
+        )
+        if prepared.tensor_layout == "NHD":
+            output_nhd = torch.empty_like(q)
+            output = output_nhd
+        elif direct_nhd_output:
+            output_nhd = torch.empty(
+                (q.shape[0], q.shape[2], q.shape[1], q.shape[3]),
+                device=q.device,
+                dtype=q.dtype,
+            )
+            output = output_nhd.permute(0, 2, 1, 3)
+        else:
+            output_nhd = None
+            output = torch.empty_like(q)
+        pv_threshold = hyperparameter_check(50, prepared.heads, q.device)
+        sparge_core.qk_int8_sv_f8_accum_f16_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold(
+            q_int8,
+            prepared.key_int8,
+            prepared.value_fp8,
+            output,
+            lut,
+            valid_block_num,
+            pv_threshold,
+            q_scale,
+            prepared.key_scale,
+            prepared.value_scale,
+            tensor_layout,
+            0,
+            1,
+            1.0 / (prepared.head_dim**0.5),
+            0,
+        )
+        if output_nhd is not None:
+            return output_nhd[0]
+        return rearrange(output, "1 H L D -> L H D")
+
     @staticmethod
     def _dense_prefix(
         query: torch.Tensor,
@@ -2458,15 +3999,29 @@ class SplitModalityProtectedSpargeAttentionBackend:
         v_scale: torch.Tensor,
         *,
         head_dim: int,
+        key_mean: torch.Tensor | None = None,
+        fused_key_quant: bool = False,
     ) -> torch.Tensor:
         from einops import rearrange
         from sageattention import sm89_compile
         from sageattention.triton.quant_per_thread import per_thread_int8
 
         prefix_q = rearrange(query, "L H D -> 1 H L D").contiguous()
-        prefix_key_mean = k.mean(dim=2, keepdim=True)
-        prefix_q_int8, prefix_q_scale, prefix_k_int8, prefix_k_scale = (
-            per_thread_int8(
+        prefix_key_mean = (
+            k.mean(dim=2, keepdim=True) if key_mean is None else key_mean
+        )
+        if fused_key_quant:
+            from .sage_fused_quant import (
+                quantize_qk_sub_mean_per_thread_int8_hnd,
+            )
+
+            prefix_q_int8, prefix_q_scale, prefix_k_int8, prefix_k_scale = (
+                quantize_qk_sub_mean_per_thread_int8_hnd(
+                    prefix_q, k, prefix_key_mean
+                )
+            )
+        else:
+            prefix_q_int8, prefix_q_scale, prefix_k_int8, prefix_k_scale = per_thread_int8(
                 prefix_q,
                 k,
                 prefix_key_mean,
@@ -2476,7 +4031,6 @@ class SplitModalityProtectedSpargeAttentionBackend:
                 BLKK=64,
                 WARPK=64,
             )
-        )
         prefix_output_hnd = torch.empty_like(prefix_q)
         sm89_compile.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
             prefix_q_int8,
@@ -2493,6 +4047,64 @@ class SplitModalityProtectedSpargeAttentionBackend:
             0,
         )
         return rearrange(prefix_output_hnd, "1 H L D -> L H D")
+
+    @staticmethod
+    def _dense_prefix_nhd(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value_fp8: torch.Tensor,
+        value_scale: torch.Tensor,
+        *,
+        head_dim: int,
+        key_mean: torch.Tensor,
+        fused_key_quant: bool,
+    ) -> torch.Tensor:
+        """Dense protected-prefix Attention without leaving native NHD."""
+
+        from sageattention import sm89_compile
+
+        prefix_q = query.unsqueeze(0).contiguous()
+        if fused_key_quant:
+            from .sage_fused_quant import (
+                quantize_qk_sub_mean_per_thread_int8_nhd,
+            )
+
+            prefix_q_int8, prefix_q_scale, prefix_k_int8, prefix_k_scale = (
+                quantize_qk_sub_mean_per_thread_int8_nhd(
+                    prefix_q, key, key_mean
+                )
+            )
+        else:
+            from sageattention.triton.quant_per_thread import per_thread_int8
+
+            prefix_q_int8, prefix_q_scale, prefix_k_int8, prefix_k_scale = (
+                per_thread_int8(
+                    prefix_q,
+                    key,
+                    key_mean,
+                    tensor_layout="NHD",
+                    BLKQ=128,
+                    WARPQ=32,
+                    BLKK=64,
+                    WARPK=64,
+                )
+            )
+        output = torch.empty_like(prefix_q)
+        sm89_compile.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
+            prefix_q_int8,
+            prefix_k_int8,
+            value_fp8,
+            output,
+            prefix_q_scale,
+            prefix_k_scale,
+            value_scale,
+            0,
+            0,
+            3,
+            1.0 / (head_dim**0.5),
+            0,
+        )
+        return output[0]
 
     @staticmethod
     def _dense_from_prepared_kv(
@@ -2753,6 +4365,13 @@ class SplitModalityProtectedSpargeAttentionBackend:
             hyperparameter_check,
         )
 
+        if self.selection_mode in (
+            "fixed_topk_mass_guarded_cap",
+            "fixed_topk_mass_probe",
+        ):
+            raise RuntimeError(
+                "mass-guarded cap/probe currently requires prepared-KV streaming"
+            )
         q = rearrange(query, "L H D -> 1 H L D").contiguous().to(torch.bfloat16)
         key_mean = k.mean(dim=-2, keepdim=True)
         if self.selection_mode == "route_cache":
@@ -2958,14 +4577,17 @@ class SplitModalityProtectedSpargeAttentionBackend:
             scores.mul_(q.shape[-1] ** -0.5)
             scores.masked_fill_(~expanded_k, -torch.inf)
             sorted_scores = torch.sort(scores.softmax(-1), dim=-1, descending=True)
-            budgets = self._head_topk(heads, q.device)
-            if isinstance(budgets, float):
-                budgets = torch.full(
-                    (heads,), budgets, device=q.device, dtype=torch.float32
-                )
-            base_count = (budgets * key_blocks).to(torch.int64).clamp(1, key_blocks)
+            base_count = self._selected_key_block_counts(
+                heads, int(key_blocks), q.device
+            ).clamp(1, key_blocks)
             query_protection_mask = None
-            if self.selection_mode == "causal_head_guard":
+            if self.selection_mode == "fixed_topk_absolute_cap":
+                selected_count = base_count.view(1, heads, 1).expand(
+                    scores.shape[0], -1, query_blocks
+                ).contiguous()
+                boundary_mass = None
+                cdf = None
+            elif self.selection_mode == "causal_head_guard":
                 dense_heads = self._causal_head_dense_mask(sorted_scores.values)
                 selected_count = base_count.view(1, heads, 1).expand(
                     scores.shape[0], -1, query_blocks
@@ -3250,6 +4872,8 @@ class SplitModalityProtectedSpargeAttentionBackend:
                 else None
             ),
         )
+        if self.route_probe:
+            self._record_route_probe(block_map)
         if "audit_block_map" in locals() and audit_block_map is not None:
             audit_block_map[:, :, :, :protected_k_blocks] = True
             self._protect_temporal_correspondence(
@@ -3352,9 +4976,192 @@ class SplitModalityProtectedSpargeAttentionBackend:
             self._sentinel_total_query_tokens += token_count
         return rearrange(output, "1 H L D -> L H D")
 
+    def _record_route_probe(self, block_map: torch.Tensor) -> None:
+        """Record sampled cross-Actual map overlap without changing output."""
+
+        layer = _ATTENTION_LAYER.get()
+        step = _ATTENTION_STEP.get()
+        actual_steps = _ATTENTION_ACTUAL_STEPS.get()
+        if (
+            layer is None
+            or step is None
+            or actual_steps is None
+            or int(step[0]) not in actual_steps
+            or block_map.ndim != 4
+            or not int(block_map.shape[-2])
+        ):
+            return
+        step_index = int(step[0])
+        query_blocks = int(block_map.shape[-2])
+        key_blocks = int(block_map.shape[-1])
+        heads = int(block_map.shape[1])
+        sample_indices = (
+            torch.linspace(
+                0,
+                query_blocks - 1,
+                min(16, query_blocks),
+                device=block_map.device,
+            )
+            .round()
+            .to(torch.long)
+            .unique(sorted=True)
+        )
+        sampled = block_map.index_select(-2, sample_indices).detach().clone()
+        cache_key = (int(layer), query_blocks, key_blocks, heads)
+        previous = self._route_probe_previous.get(cache_key)
+        if previous is not None:
+            previous_step, previous_map = previous
+            # Solver step indices restart for every hot request. A
+            # non-increasing index is a request boundary, not a reuse chance.
+            if step_index > previous_step:
+                self._route_probe_records.append(
+                    {
+                        "previous_step": previous_step,
+                        "step": step_index,
+                        "step_gap": step_index - previous_step,
+                        "layer": int(layer),
+                        "query_blocks": query_blocks,
+                        "key_blocks": key_blocks,
+                        "sampled_query_blocks": int(sample_indices.numel()),
+                        "intersection": (sampled & previous_map).sum(
+                            dim=(0, 2, 3)
+                        ),
+                        "union": (sampled | previous_map).sum(dim=(0, 2, 3)),
+                    }
+                )
+        self._route_probe_previous[cache_key] = (step_index, sampled)
+
     def telemetry(self) -> dict[str, object]:
         total = self._sentinel_total_query_tokens
         causal_total = self._causal_head_guard_total_heads
+        route_probe_records: list[dict[str, object]] = []
+        if self._route_probe_records:
+            intersections = torch.stack(
+                [row["intersection"] for row in self._route_probe_records]
+            ).float()
+            unions = torch.stack(
+                [row["union"] for row in self._route_probe_records]
+            ).float().clamp_min_(1.0)
+            per_head = (intersections / unions).detach().cpu()
+            intersections_cpu = intersections.sum(dim=1).detach().cpu()
+            unions_cpu = unions.sum(dim=1).detach().cpu()
+            for index, source in enumerate(self._route_probe_records):
+                head_values = per_head[index]
+                route_probe_records.append(
+                    {
+                        key: value
+                        for key, value in source.items()
+                        if key not in ("intersection", "union")
+                    }
+                    | {
+                        "global_jaccard": float(
+                            intersections_cpu[index] / unions_cpu[index]
+                        ),
+                        "head_jaccard_min": float(head_values.min()),
+                        "head_jaccard_p10": float(
+                            torch.quantile(head_values, 0.10)
+                        ),
+                        "head_jaccard_median": float(head_values.median()),
+                    }
+                )
+        absolute_cap: dict[str, object] | None = None
+        if self._absolute_cap_last is not None:
+            source = self._absolute_cap_last
+            nominal = source["nominal_selected"].detach().cpu()
+            capped = source["capped_selected"].detach().cpu()
+            selected = source["selected_before_rails"].detach().cpu().float()
+            final = source["valid_after_mandatory_rails"].detach().cpu().float()
+            activated_source = source.get("cap_activated")
+            retained_source = source.get("retained_mass")
+            absolute_cap = {
+                "key_blocks": int(source["key_blocks"]),
+                "query_blocks": int(source["query_blocks"]),
+                "nominal_selected_per_head": nominal.tolist(),
+                "capped_selected_per_head": capped.tolist(),
+                "capped_head_count": int((capped < nominal).sum()),
+                "selected_before_rails_min": int(selected.min()),
+                "selected_before_rails_mean": float(selected.mean()),
+                "selected_before_rails_max": int(selected.max()),
+                "valid_after_mandatory_rails_min": int(final.min()),
+                "valid_after_mandatory_rails_mean": float(final.mean()),
+                "valid_after_mandatory_rails_max": int(final.max()),
+            }
+            if activated_source is not None and retained_source is not None:
+                activated = activated_source.detach().cpu()
+                retained = retained_source.detach().cpu().float()
+                absolute_cap.update(
+                    {
+                        "minimum_retained_topk_mass": (
+                            self.minimum_retained_topk_mass
+                        ),
+                        "mass_guard_activated_rows": int(activated.sum()),
+                        "mass_guard_total_rows": int(activated.numel()),
+                        "mass_guard_activated_fraction": float(
+                            activated.float().mean()
+                        ),
+                        "retained_topk_mass_min": float(retained.min()),
+                        "retained_topk_mass_mean": float(retained.mean()),
+                        "retained_topk_mass_max": float(retained.max()),
+                    }
+                )
+        mass_guard_profiles: list[dict[str, object]] = []
+        if self._mass_guard_records:
+            grouped: dict[tuple[object, ...], list[dict[str, object]]] = {}
+            for row in self._mass_guard_records:
+                key = (
+                    row["step"],
+                    row["layer"],
+                    row["key_blocks"],
+                    row["selected_blocks"],
+                )
+                grouped.setdefault(key, []).append(row)
+            for (step, layer, key_blocks, selected_blocks), rows in sorted(
+                grouped.items(),
+                key=lambda item: (
+                    -1 if item[0][0] is None else int(item[0][0]),
+                    -1 if item[0][1] is None else int(item[0][1]),
+                    int(item[0][2]),
+                    int(item[0][3]),
+                ),
+            ):
+                activated = int(
+                    torch.stack([row["activated"] for row in rows]).sum().cpu()
+                )
+                total_rows = sum(int(row["total"]) for row in rows)
+                retained_sum = float(
+                    torch.stack([row["retained_sum"] for row in rows]).sum().cpu()
+                )
+                retained_min = float(
+                    torch.stack([row["retained_min"] for row in rows]).min().cpu()
+                )
+                retained_max = float(
+                    torch.stack([row["retained_max"] for row in rows]).max().cpu()
+                )
+                threshold_counts = torch.stack(
+                    [row["threshold_counts"] for row in rows]
+                ).sum(dim=0).detach().cpu()
+                mass_guard_profiles.append(
+                    {
+                        "step": step,
+                        "layer": layer,
+                        "key_blocks": int(key_blocks),
+                        "selected_blocks": int(selected_blocks),
+                        "query_chunk_calls": len(rows),
+                        "activated_rows": activated,
+                        "total_rows": total_rows,
+                        "activated_fraction": activated / total_rows,
+                        "retained_topk_mass_min": retained_min,
+                        "retained_topk_mass_mean": retained_sum / total_rows,
+                        "retained_topk_mass_max": retained_max,
+                        "activation_fraction_by_retained_mass": {
+                            str(threshold): float(threshold_counts[index])
+                            / total_rows
+                            for index, threshold in enumerate(
+                                (0.90, 0.925, 0.95, 0.975, 0.99)
+                            )
+                        },
+                    }
+                )
         return {
             "sentinel_calls": self._sentinel_calls,
             "sentinel_dense_query_tokens": self._sentinel_dense_query_tokens,
@@ -3370,6 +5177,22 @@ class SplitModalityProtectedSpargeAttentionBackend:
                 if causal_total
                 else 0.0
             ),
+            "route_probe_enabled": self.route_probe,
+            "route_probe_record_count": len(route_probe_records),
+            "route_probe_records": route_probe_records,
+            "absolute_cap_enabled": (
+                self.selection_mode
+                in (
+                    "fixed_topk_absolute_cap",
+                    "fixed_topk_mass_guarded_cap",
+                    "fixed_topk_mass_probe",
+                )
+            ),
+            "absolute_cap_calls": self._absolute_cap_calls,
+            "absolute_cap_last": absolute_cap,
+            "mass_guard_probe_only": self.selection_mode == "fixed_topk_mass_probe",
+            "mass_guard_profile_count": len(mass_guard_profiles),
+            "mass_guard_profiles": mass_guard_profiles,
         }
 
     def _protect_temporal_correspondence(
@@ -3605,6 +5428,187 @@ class SplitModalityProtectedSpargeAttentionBackend:
             heads=heads,
             head_dim=head_dim,
         )
+
+
+class DenseLongSequenceAttentionBackend:
+    """Exact per-warp SageAttention with K/V prepared once per H3 layer."""
+
+    approximate = False
+    long_sequence_value_dtype = torch.bfloat16
+    long_sequence_kv_layout = "NHD"
+
+    @staticmethod
+    def resolve_long_sequence_backend(query_tokens: int):
+        return _DENSE_LONG_SEQUENCE_BACKEND if query_tokens >= 128 else None
+
+    @staticmethod
+    def begin_compact_long_sequence_kv(
+        *,
+        key_tokens: int,
+        heads: int,
+        head_dim: int,
+        key_mean: torch.Tensor,
+        value_absmax: torch.Tensor,
+        device: torch.device,
+    ) -> _CompactDenseKVBuilder:
+        """Start an NHD K/V build that never owns sequence-long BF16 K/V."""
+
+        return _CompactDenseKVBuilder(
+            key_tokens=key_tokens,
+            heads=heads,
+            head_dim=head_dim,
+            key_mean=key_mean,
+            value_absmax=value_absmax,
+            device=device,
+        )
+
+    @staticmethod
+    def begin_compact_long_sequence_values(
+        *,
+        key_tokens: int,
+        heads: int,
+        head_dim: int,
+        value_absmax: torch.Tensor,
+        device: torch.device,
+    ) -> _CompactValueBuilder:
+        return _CompactValueBuilder(
+            key_tokens=key_tokens,
+            heads=heads,
+            head_dim=head_dim,
+            value_absmax=value_absmax,
+            device=device,
+            layout="NHD",
+        )
+
+    @staticmethod
+    def prepare_long_sequence_values(value_hnd: torch.Tensor):
+        from sageattention.quant import per_channel_fp8
+
+        if value_hnd.ndim != 4 or value_hnd.shape[0] != 1:
+            raise ValueError("long-sequence Dense V must use [1,L,H,D]")
+        if value_hnd.dtype != torch.bfloat16 or not value_hnd.is_contiguous():
+            raise ValueError("long-sequence Dense V must be contiguous BF16")
+        batch, key_tokens, heads, head_dim = value_hnd.shape
+        value_fp8, value_scale, _ = per_channel_fp8(
+            value_hnd,
+            tensor_layout="NHD",
+            scale_max=2.25,
+            smooth_v=False,
+        )
+        return value_fp8, value_scale, heads, key_tokens, head_dim
+
+    @staticmethod
+    def prepare_long_sequence_keys(
+        key_hnd: torch.Tensor,
+        value_fp8: torch.Tensor,
+        value_scale: torch.Tensor,
+    ) -> PreparedLongSequenceDenseKV:
+        if key_hnd.ndim != 4 or key_hnd.shape[0] != 1:
+            raise ValueError("long-sequence Dense K must use [1,L,H,D]")
+        if key_hnd.dtype != torch.bfloat16 or not key_hnd.is_contiguous():
+            raise ValueError("long-sequence Dense K must be contiguous BF16")
+        from sageattention import _fused
+
+        batch, key_tokens, heads, head_dim = key_hnd.shape
+        key_mean = key_hnd.mean(dim=1, keepdim=True)
+        key_int8 = torch.empty_like(key_hnd, dtype=torch.int8)
+        key_scale = torch.empty(
+            (batch, heads, (key_tokens + 63) // 64),
+            device=key_hnd.device,
+            dtype=torch.float32,
+        )
+        _fused.quant_per_block_int8_fuse_sub_mean_cuda(
+            key_hnd,
+            key_mean.squeeze(1),
+            key_int8,
+            key_scale,
+            64,
+            0,
+        )
+        return PreparedLongSequenceDenseKV(
+            key_int8=key_int8,
+            key_scale=key_scale,
+            value_fp8=value_fp8,
+            value_scale=value_scale,
+            heads=heads,
+            key_tokens=key_tokens,
+            head_dim=head_dim,
+        )
+
+    @staticmethod
+    def _queries(
+        query: torch.Tensor,
+        prepared: PreparedLongSequenceDenseKV,
+    ) -> torch.Tensor:
+        from sageattention import _fused, sm89_compile
+
+        if _DENSE_QK_QUANT_GRAN.get() != "per_warp":
+            raise RuntimeError(
+                "long-sequence Dense Attention requires the validated per_warp Q/K path"
+            )
+        if (
+            query.ndim != 3
+            or query.shape[1] != prepared.heads
+            or query.shape[2] != prepared.head_dim
+        ):
+            raise ValueError("long-sequence Dense Query does not match K/V")
+        q = query.unsqueeze(0).contiguous()
+        query_tokens = int(q.shape[1])
+        q_int8 = torch.empty_like(q, dtype=torch.int8)
+        q_scale = torch.empty(
+            (1, prepared.heads, ((query_tokens + 127) // 128) * 4),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        _fused.quant_per_warp_int8_cuda(
+            q, q_int8, q_scale, 128, 32, 0
+        )
+        output = torch.empty_like(q)
+        sm89_compile.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
+            q_int8,
+            prepared.key_int8,
+            prepared.value_fp8,
+            output,
+            q_scale,
+            prepared.key_scale,
+            prepared.value_scale,
+            0,
+            0,
+            2,
+            1.0 / (prepared.head_dim**0.5),
+            0,
+        )
+        return output.squeeze(0)
+
+    def long_sequence_prefix_queries(
+        self,
+        query: torch.Tensor,
+        prepared: PreparedLongSequenceDenseKV,
+    ) -> torch.Tensor:
+        return self._queries(query, prepared)
+
+    def long_sequence_all_queries(
+        self,
+        query: torch.Tensor,
+        prepared: PreparedLongSequenceDenseKV,
+    ) -> torch.Tensor:
+        """Keep per-warp Query groups aligned to the packed sequence origin."""
+
+        return self._queries(query, prepared)
+
+    def long_sequence_video_queries(
+        self,
+        query: torch.Tensor,
+        prepared: PreparedLongSequenceDenseKV,
+        *,
+        protected_tokens: int,
+        query_token_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        del protected_tokens, query_token_indices
+        return self._queries(query, prepared)
+
+
+_DENSE_LONG_SEQUENCE_BACKEND = DenseLongSequenceAttentionBackend()
 
 
 class BudgetConstrainedAdaptiveSpargeAttentionBackend:
@@ -5777,7 +7781,9 @@ def make_routed_sparge_attention_sm89() -> RequestRoutedSpargeAttentionBackend:
     return RequestRoutedSpargeAttentionBackend(minimum_sparse_tokens=128)
 
 
-def make_joint_physical_action_backends_sm89() -> dict[str, Callable]:
+def make_joint_physical_action_backends_sm89(
+    *, route_probe: bool = False
+) -> dict[str, Callable]:
     """Return the exact action map shared by production and V19 calibration."""
 
     actions: dict[str, Callable] = {"dense": sage_attention_sm89}
@@ -5825,6 +7831,7 @@ def make_joint_physical_action_backends_sm89() -> dict[str, Callable]:
         actions[name] = SplitModalityProtectedSpargeAttentionBackend(
             topk,
             selection_mode="fixed_topk",
+            route_probe=route_probe,
             **shared,
         )
         actions[f"round215:{name}"] = SplitModalityProtectedSpargeAttentionBackend(
@@ -5835,11 +7842,13 @@ def make_joint_physical_action_backends_sm89() -> dict[str, Callable]:
         actions[f"frontier:{name}"] = SplitModalityProtectedSpargeAttentionBackend(
             frontier_head_budgets[name],
             selection_mode="fixed_topk",
+            route_probe=route_probe,
             **shared,
         )
         actions[f"fastfrontier:{name}"] = SplitModalityProtectedSpargeAttentionBackend(
             fast_frontier_head_budgets[name],
             selection_mode="fixed_topk",
+            route_probe=route_probe,
             **shared,
         )
         actions[f"forecastfrontier:{name}"] = actions[f"fastfrontier:{name}"]
@@ -5847,6 +7856,7 @@ def make_joint_physical_action_backends_sm89() -> dict[str, Callable]:
 
 
 def make_joint_action_scheduled_sparge_attention_sm89(
+    *, route_probe: bool = False
 ) -> CausalCheckpointVerifierAttentionBackend:
     """Build the hot, request-local backend for the two-control scheduler.
 
@@ -5858,7 +7868,7 @@ def make_joint_action_scheduled_sparge_attention_sm89(
     therefore execute their frozen offline schedules unchanged.
     """
 
-    actions = make_joint_physical_action_backends_sm89()
+    actions = make_joint_physical_action_backends_sm89(route_probe=route_probe)
     scheduled = RequestActionScheduledAttentionBackend(
         actions,
         exact_action="dense",
@@ -6033,7 +8043,23 @@ __all__ = [
     "QualityConstrainedAdaptiveSpargeAttentionBackend",
     "StepScheduledAttentionBackend",
     "attention_protected_prefix",
+    "current_attention_protected_prefix",
     "current_long_video_attention_enabled",
+    "long_sequence_query_chunking",
+    "current_long_sequence_projection_chunk_tokens",
+    "current_long_sequence_query_chunk_tokens",
+    "current_long_sequence_split_qkv_outputs",
+    "current_long_sequence_shared_qkv_quantization",
+    "current_long_sequence_single_qknorm_rope",
+    "current_long_sequence_exact_helper_stack",
+    "current_long_sequence_parallel_sparse_lut",
+    "current_long_sequence_partial_sparse_topk",
+    "current_long_sequence_fused_prefix_k_quant",
+    "current_long_sequence_fused_query_projection",
+    "current_long_sequence_fused_qknorm_hnd_layout",
+    "current_long_sequence_direct_nhd_output",
+    "current_long_sequence_direct_nhd_kv",
+    "current_long_sequence_direct_hnd_fp8_value",
     "attention_layer",
     "current_attention_layer",
     "attention_sparsity",

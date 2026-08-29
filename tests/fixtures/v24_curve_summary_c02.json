@@ -1,0 +1,61 @@
+{
+  "schema_version": "h3_v24_final_curve_summary_v1",
+  "candidate_id": "v24_final_c02_round2_trajectory_u7p00",
+  "sampling_steps": 20,
+  "accelerations": [0, 25, 50, 75, 90, 100],
+  "units": "modeled dense-equivalent compute; not wall-clock seconds",
+  "workloads": [
+    {
+      "name": "720p5",
+      "geometry": [1280, 736, 124],
+      "packed_tokens": 34780,
+      "points": [
+        {"acceleration": 0, "actual": 20, "forecast": 0, "compute_units": 20.0, "max_forecast_run": 0},
+        {"acceleration": 25, "actual": 16, "forecast": 4, "compute_units": 16.18, "max_forecast_run": 1},
+        {"acceleration": 50, "actual": 12, "forecast": 8, "compute_units": 11.7455, "max_forecast_run": 2},
+        {"acceleration": 75, "actual": 10, "forecast": 10, "compute_units": 7.6113, "max_forecast_run": 3},
+        {"acceleration": 90, "actual": 10, "forecast": 10, "compute_units": 6.0117, "max_forecast_run": 3},
+        {"acceleration": 100, "actual": 9, "forecast": 11, "compute_units": 4.4377, "max_forecast_run": 4}
+      ]
+    },
+    {
+      "name": "720p10",
+      "geometry": [1280, 736, 243],
+      "packed_tokens": 67535,
+      "points": [
+        {"acceleration": 0, "actual": 20, "forecast": 0, "compute_units": 20.0, "max_forecast_run": 0},
+        {"acceleration": 25, "actual": 15, "forecast": 5, "compute_units": 15.225, "max_forecast_run": 1},
+        {"acceleration": 50, "actual": 12, "forecast": 8, "compute_units": 11.3811, "max_forecast_run": 2},
+        {"acceleration": 75, "actual": 10, "forecast": 10, "compute_units": 6.4296, "max_forecast_run": 3},
+        {"acceleration": 90, "actual": 10, "forecast": 10, "compute_units": 5.5094, "max_forecast_run": 3},
+        {"acceleration": 100, "actual": 9, "forecast": 11, "compute_units": 4.4377, "max_forecast_run": 4}
+      ]
+    },
+    {
+      "name": "720p15",
+      "geometry": [1280, 736, 362],
+      "packed_tokens": 100141,
+      "points": [
+        {"acceleration": 0, "actual": 20, "forecast": 0, "compute_units": 20.0, "max_forecast_run": 0},
+        {"acceleration": 25, "actual": 16, "forecast": 4, "compute_units": 16.18, "max_forecast_run": 1},
+        {"acceleration": 50, "actual": 12, "forecast": 8, "compute_units": 11.4714, "max_forecast_run": 2},
+        {"acceleration": 75, "actual": 12, "forecast": 8, "compute_units": 6.9991, "max_forecast_run": 2},
+        {"acceleration": 90, "actual": 12, "forecast": 8, "compute_units": 6.2046, "max_forecast_run": 2},
+        {"acceleration": 100, "actual": 10, "forecast": 10, "compute_units": 4.8308, "max_forecast_run": 3}
+      ]
+    },
+    {
+      "name": "1080p15",
+      "geometry": [1920, 1088, 362],
+      "packed_tokens": 219890,
+      "points": [
+        {"acceleration": 0, "actual": 20, "forecast": 0, "compute_units": 20.0, "max_forecast_run": 0},
+        {"acceleration": 25, "actual": 15, "forecast": 5, "compute_units": 15.225, "max_forecast_run": 1},
+        {"acceleration": 50, "actual": 12, "forecast": 8, "compute_units": 10.9212, "max_forecast_run": 2},
+        {"acceleration": 75, "actual": 12, "forecast": 8, "compute_units": 5.7044, "max_forecast_run": 2},
+        {"acceleration": 90, "actual": 12, "forecast": 8, "compute_units": 5.6544, "max_forecast_run": 2},
+        {"acceleration": 100, "actual": 10, "forecast": 10, "compute_units": 4.8308, "max_forecast_run": 3}
+      ]
+    }
+  ]
+}

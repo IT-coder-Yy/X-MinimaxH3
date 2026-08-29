@@ -1,0 +1,67 @@
+diff --git a/FL2VA/video_vae/klvae.py b/FL2VA/video_vae/klvae.py
+index 3e66f17..bd962a4 100644
+--- a/FL2VA/video_vae/klvae.py
++++ b/FL2VA/video_vae/klvae.py
+@@ -583,28 +583,44 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
+         split_count = int(self.token_drop > 0) + 1
+         dec = None
+         dec_overlap = None
++        # A release runtime may install a phase-local sink which consumes
++        # finalized temporal pieces as soon as overlap blending is complete.
++        # The sink is deliberately generic: this vendored model still owns
++        # temporal decoding, while transport policy (for example exact uint8
++        # host output) remains outside the model implementation.
++        temporal_output_sink = getattr(self, "_h3_temporal_output_sink", None)
++        sink_started = False
+         write_pos = 0
+         logical_frames = 0
+         dropped_frames = 0
+         decoded_count = 0
+ 
+         def write_part(part):
+-            nonlocal dec, write_pos, logical_frames, dropped_frames
++            nonlocal dec, sink_started, write_pos, logical_frames, dropped_frames
+             part_frames = int(part.shape[2])
+             if part_frames <= 0:
+                 return
+             logical_frames += part_frames
+-            if dec is None:
++            if dec is None and not sink_started:
+                 out_shape = list(part.shape)
+                 out_shape[2] = output_frames
+-                dec = torch.empty(out_shape, dtype=part.dtype, device=part.device)
++                if temporal_output_sink is None:
++                    dec = torch.empty(out_shape, dtype=part.dtype, device=part.device)
++                else:
++                    temporal_output_sink.begin(tuple(out_shape), part)
++                    sink_started = True
+ 
+-            remaining = int(dec.shape[2]) - write_pos
++            remaining = output_frames - write_pos
+             copy_frames = min(part_frames, max(0, remaining))
+             if copy_frames > 0:
+-                dec[:, :, write_pos : write_pos + copy_frames, :, :].copy_(
+-                    part[:, :, :copy_frames, :, :]
+-                )
++                if temporal_output_sink is None:
++                    dec[:, :, write_pos : write_pos + copy_frames, :, :].copy_(
++                        part[:, :, :copy_frames, :, :]
++                    )
++                else:
++                    temporal_output_sink.write(
++                        part[:, :, :copy_frames, :, :], write_pos
++                    )
+                 write_pos += copy_frames
+             dropped_frames += part_frames - copy_frames
+ 
+@@ -663,6 +679,10 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
+ 
+             del clip_dec, clip_z
+ 
++        if temporal_output_sink is not None:
++            if not sink_started:
++                raise RuntimeError("decode_temporal output sink was never started")
++            dec = temporal_output_sink.finish()
+         if dec is None:
+             raise RuntimeError("decode_temporal streaming produced no output tensor")
+         if logical_frames != total_frames or dropped_frames != pad_frames or write_pos != output_frames:

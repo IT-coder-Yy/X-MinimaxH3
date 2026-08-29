@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "anchor": "ref2va_multiref_8s_enhanced_v1.json",
+  "purpose": "Numerically exact hybrid residency sweep; 2/18 is timing-only and not a quality candidate.",
+  "candidates": [
+    {
+      "version": "r00_resident0_probe",
+      "actual_steps": [0, 1],
+      "resident_block_count": 0,
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": true
+    },
+    {
+      "version": "r16_resident16_probe",
+      "actual_steps": [0, 1],
+      "resident_block_count": 16,
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": true
+    },
+    {
+      "version": "r32_resident32_probe",
+      "actual_steps": [0, 1],
+      "resident_block_count": 32,
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": true
+    },
+    {
+      "version": "r40_resident40_probe",
+      "actual_steps": [0, 1],
+      "resident_block_count": 40,
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": true
+    }
+  ]
+}

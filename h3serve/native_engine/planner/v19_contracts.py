@@ -90,6 +90,68 @@ class V19TrajectoryDebt:
             and self.audio_debt <= limits.audio_debt
         )
 
+    def as_pareto_tuple(self) -> tuple[float, ...]:
+        """Return monotone debt dimensions; absolute refresh position is metadata."""
+
+        return (
+            float(self.consecutive_forecasts),
+            self.forecast_debt,
+            self.sparse_mass_deficit,
+            self.audio_debt,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class V19ParetoObjectiveVector:
+    """Complete non-compensating objective for one executed trajectory.
+
+    Peak VRAM and both terminal/maximum trajectory debt matter when several
+    approximate techniques are coupled.  Omitting them would allow a plan to
+    remain on the reported frontier merely because its Human-risk UCB and
+    latency match another plan, even when it consumes more memory or carries
+    strictly more unresolved approximation debt.
+    """
+
+    cost_p90_ms: float
+    peak_vram_gib: float
+    human_risk: V19HumanRiskVector
+    terminal_debt: V19TrajectoryDebt
+    maximum_debt: V19TrajectoryDebt
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.cost_p90_ms)
+            or self.cost_p90_ms < 0.0
+            or not math.isfinite(self.peak_vram_gib)
+            or self.peak_vram_gib < 0.0
+        ):
+            raise V19ContractError(
+                "V19 Pareto cost and peak VRAM must be finite and non-negative"
+            )
+
+    def approximation_risk_tuple(self) -> tuple[float, ...]:
+        """Human risk and trajectory debt; no dimension compensates another."""
+
+        return (
+            *self.human_risk.as_tuple(),
+            *self.terminal_debt.as_pareto_tuple(),
+            *self.maximum_debt.as_pareto_tuple(),
+        )
+
+    def as_tuple(self) -> tuple[float, ...]:
+        return (
+            self.cost_p90_ms,
+            self.peak_vram_gib,
+            *self.approximation_risk_tuple(),
+        )
+
+    def dominates(self, other: "V19ParetoObjectiveVector") -> bool:
+        left = self.as_tuple()
+        right = other.as_tuple()
+        return all(a <= b for a, b in zip(left, right)) and any(
+            a < b for a, b in zip(left, right)
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class V19InputCapabilityContract:
@@ -141,5 +203,6 @@ __all__ = [
     "V19ContractError",
     "V19HumanRiskVector",
     "V19InputCapabilityContract",
+    "V19ParetoObjectiveVector",
     "V19TrajectoryDebt",
 ]

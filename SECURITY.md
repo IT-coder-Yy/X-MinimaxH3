@@ -1,22 +1,13 @@
-# Security policy
+# Security
 
-## Supported version
+Please report security issues privately to the repository owner instead of
+opening a public issue with exploit details.
 
-Security fixes are applied to the current `0.7.x` release line. Research
-calibration folders and older extracted prototypes are not supported products.
+The built-in HTTP server is intended for localhost or a trusted LAN. Binding
+to a non-loopback address requires `H3_SERVE_API_KEY`, but the service does not
+provide TLS, per-user authorization, billing, or tenant isolation. Internet
+deployments must use a TLS reverse proxy, rate limiting, authentication, and
+network-level access control.
 
-## Reporting a vulnerability
-
-Do not publish credentials, private prompts, reference media or an exploit in a
-public issue. Use the repository's private GitHub Security Advisory channel and
-include the affected version, operating system, reproduction steps and impact.
-
-## Deployment boundary
-
-The default listener is `127.0.0.1:8090`. When binding to a non-loopback
-address, X-MinimaxH3 refuses to start unless `H3_SERVE_API_KEY` is configured.
-Operators remain responsible for host firewalling, TLS termination, user access
-control and the safeguards required by the MiniMax H3 Community License.
-
-MiMo and service API keys are local secrets. They are excluded from Git and
-must never be included in issue reports, workspaces or example workflows.
+Never commit `.env.local`, API keys, generated media, user uploads, latent
+checkpoints, model weights, or runtime caches. They are excluded by `.gitignore`.

@@ -8,8 +8,13 @@ from types import SimpleNamespace
 
 from ...pipeline import GenerationInput, PipelineState, SamplingConfig
 from .mux import AtomicPyAVMuxer, MuxConfig, normalize_h3_audio_loudness, probe_media
-from .samplers import AVPrediction, ResMultistepAVSampler, TurboAVSampler
-from .scheduler import H3SimpleScheduler, SamplingPlan
+from .samplers import (
+    AVPrediction,
+    ResMultistepAVSampler,
+    SASolverAVSampler,
+    TurboAVSampler,
+)
+from .scheduler import H3SimpleScheduler, SamplingPlan, refinement_sigma_schedule
 
 
 def run() -> None:
@@ -104,6 +109,64 @@ def run() -> None:
     TurboAVSampler().sample(
         first["video_latents"], first["audio_latents"], plan, predict
     )
+
+    # Strength owns the same start sigma at every solver length; steps only
+    # refine the numerical path from that point to zero.
+    one_sigma = refinement_sigma_schedule(1, 0.30, 6.0)
+    eight_sigmas = refinement_sigma_schedule(8, 0.30, 6.0)
+    assert abs(one_sigma[0] - 0.72) < 1e-12
+    assert abs(eight_sigmas[0] - one_sigma[0]) < 1e-12
+
+    one_step_sa = SamplingPlan(
+        sampler="sa_solver",
+        video_sigmas=refinement_sigma_schedule(1, 0.20, 6.0),
+        audio_sigmas=refinement_sigma_schedule(1, 0.20, 6.0),
+        actual_step_indices=(0,),
+        video_shift=6.0,
+        audio_shift=3.0,
+        seed=82303,
+    )
+
+    def constant_predict(video, audio, clock, *, step_index, is_actual_step):
+        assert is_actual_step
+        return AVPrediction(
+            torch.full_like(video, 0.25), torch.full_like(audio, -0.125)
+        )
+
+    sa_video, sa_audio = SASolverAVSampler().sample(
+        first["video_latents"].clone(),
+        first["audio_latents"].clone(),
+        one_step_sa,
+        constant_predict,
+    )
+    assert torch.equal(sa_video, torch.full_like(sa_video, 0.25))
+    assert torch.equal(sa_audio, torch.full_like(sa_audio, -0.125))
+
+    strong_sigmas = refinement_sigma_schedule(4, 0.30, 6.0)
+    multi_step_sa = SamplingPlan(
+        sampler="sa_solver",
+        video_sigmas=strong_sigmas,
+        audio_sigmas=strong_sigmas,
+        actual_step_indices=(0, 1, 2, 3),
+        video_shift=6.0,
+        audio_shift=3.0,
+        seed=82303,
+    )
+    first_sa = SASolverAVSampler().sample(
+        first["video_latents"].clone(),
+        first["audio_latents"].clone(),
+        multi_step_sa,
+        constant_predict,
+    )
+    second_sa = SASolverAVSampler().sample(
+        first["video_latents"].clone(),
+        first["audio_latents"].clone(),
+        multi_step_sa,
+        constant_predict,
+    )
+    assert torch.equal(first_sa[0], second_sa[0])
+    assert torch.equal(first_sa[1], second_sa[1])
+    assert torch.isfinite(first_sa[0]).all() and torch.isfinite(first_sa[1]).all()
 
     # A persisted prefix followed by the untouched sigma suffix must be
     # numerically identical to one uninterrupted RES run.  The predictor uses

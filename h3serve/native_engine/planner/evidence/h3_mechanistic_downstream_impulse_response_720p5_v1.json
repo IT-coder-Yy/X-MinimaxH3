@@ -1,0 +1,655 @@
+{
+  "schema_version": "h3_mechanistic_downstream_impulse_response_v1",
+  "claim_scope": "phase-conditioned final-latent response to isolated approximations; not a Human quality threshold and not a release schedule",
+  "identification_contract": {
+    "intervention": "one approximation mechanism at one phase",
+    "counterfactual_control": "same seed/prompt/geometry, all Dense",
+    "downstream_response": "final AV latent delta to Dense control",
+    "historical_schedule_used": false,
+    "human_acceptance_used": false
+  },
+  "workload": {
+    "total_steps": 20,
+    "packed_tokens": 34871,
+    "video_tokens": 34040,
+    "condition_count": 0,
+    "frames": 124,
+    "fps": 24,
+    "width": 1280,
+    "height": 736,
+    "engine": "original",
+    "seed": 82303
+  },
+  "mechanism_model_digest": "b365e82df2c6cb16014b3eccf597d8e48156ce129d05acb26671991810836268",
+  "provenance": {
+    "probe_set_path": "/root/x-minimaxh3-runtime/worktree/runtime/calibration/h3_mechanistic_impulse_20260825/720p5_seed82303/probe_set.json",
+    "probe_set_sha256": "075bc66692e6236b501ad9216ef633bc2121e57d95ded8170a14763bc88c6db5",
+    "hot_session_report_path": "/root/x-minimaxh3-runtime/results/h3_mechanistic_impulse_20260825/720p5_seed82303/h3_mechanistic_impulse_720p5_hot_session.json",
+    "hot_session_report_sha256": "646f8535fb19ad6a204b444d3cf15ff5c5d4b00c95aa0636f89f537ba8f11172",
+    "dense_latent_path": "/root/x-minimaxh3-runtime/results/h3_mechanistic_impulse_20260825/720p5_seed82303/latents/dense_control_torch213_cu130_cuda133_720p5_seed82303.pt",
+    "dense_latent_sha256": "5df3163d1829bcde2a361ea6de8aae3f16c14e54213bbdda1f7197be96a38d12"
+  },
+  "continuous_phase_gain_fits": {
+    "single_forecast": {
+      "audio": {
+        "theoretical_form": "log G(p) is polynomial because Gronwall propagation gives G(p)=exp(integral_p^1 L(s) ds), with a low-order phase model for the local trajectory Lipschitz rate L",
+        "probe_type": "single_forecast",
+        "modality": "audio",
+        "degree": 2,
+        "feature_order": [
+          "p^0",
+          "p^1",
+          "p^2"
+        ],
+        "coefficients": [
+          2.3014029338573487,
+          -1.3492927960070613,
+          -3.5090641767128163
+        ],
+        "sample_count": 5,
+        "phase_steps": [
+          2,
+          6,
+          10,
+          14,
+          18
+        ],
+        "log_residuals": [
+          0.01281620244670334,
+          0.08390963993113498,
+          -0.3286261344736209,
+          0.35425853936702545,
+          -0.1223582472712419
+        ],
+        "absolute_log_residual_max": 0.35425853936702545,
+        "log_rmse": 0.2261286679602348,
+        "r_squared": 0.9784539309131193,
+        "monotone_nonincreasing_on_unit_interval": true,
+        "maximum_log_derivative": -1.3492927960070613
+      },
+      "video": {
+        "theoretical_form": "log G(p) is polynomial because Gronwall propagation gives G(p)=exp(integral_p^1 L(s) ds), with a low-order phase model for the local trajectory Lipschitz rate L",
+        "probe_type": "single_forecast",
+        "modality": "video",
+        "degree": 2,
+        "feature_order": [
+          "p^0",
+          "p^1",
+          "p^2"
+        ],
+        "coefficients": [
+          2.3793858933738052,
+          -3.828363035742954,
+          -2.054293403538807
+        ],
+        "sample_count": 5,
+        "phase_steps": [
+          2,
+          6,
+          10,
+          14,
+          18
+        ],
+        "log_residuals": [
+          -0.05143089663812472,
+          0.07351497653099648,
+          0.0880404502357614,
+          -0.19090224351201246,
+          0.08077771338338113
+        ],
+        "absolute_log_residual_max": 0.19090224351201246,
+        "log_rmse": 0.10841532671946101,
+        "r_squared": 0.9963455247897183,
+        "monotone_nonincreasing_on_unit_interval": true,
+        "maximum_log_derivative": -3.828363035742954
+      }
+    },
+    "single_attention": {
+      "audio": {
+        "theoretical_form": "log G(p) is polynomial because Gronwall propagation gives G(p)=exp(integral_p^1 L(s) ds), with a low-order phase model for the local trajectory Lipschitz rate L",
+        "probe_type": "single_attention",
+        "modality": "audio",
+        "degree": 1,
+        "feature_order": [
+          "p^0",
+          "p^1"
+        ],
+        "coefficients": [
+          -0.8235281909085748,
+          -2.109193945105489
+        ],
+        "sample_count": 3,
+        "phase_steps": [
+          2,
+          10,
+          18
+        ],
+        "log_residuals": [
+          -0.12860343594088164,
+          0.2572068718817633,
+          -0.12860343594088164
+        ],
+        "absolute_log_residual_max": 0.2572068718817633,
+        "log_rmse": 0.18187272327537435,
+        "r_squared": 0.9408133106801326,
+        "monotone_nonincreasing_on_unit_interval": true,
+        "maximum_log_derivative": -2.109193945105489
+      },
+      "video": {
+        "theoretical_form": "log G(p) is polynomial because Gronwall propagation gives G(p)=exp(integral_p^1 L(s) ds), with a low-order phase model for the local trajectory Lipschitz rate L",
+        "probe_type": "single_attention",
+        "modality": "video",
+        "degree": 1,
+        "feature_order": [
+          "p^0",
+          "p^1"
+        ],
+        "coefficients": [
+          -0.4940325740945767,
+          -2.6422777678999947
+        ],
+        "sample_count": 3,
+        "phase_steps": [
+          2,
+          10,
+          18
+        ],
+        "log_residuals": [
+          0.08475036795439772,
+          -0.16950073590879455,
+          0.08475036795439728
+        ],
+        "absolute_log_residual_max": 0.16950073590879455,
+        "log_rmse": 0.11985511977721887,
+        "r_squared": 0.9828888524703764,
+        "monotone_nonincreasing_on_unit_interval": true,
+        "maximum_log_derivative": -2.6422777678999947
+      }
+    }
+  },
+  "fit_limitations": [
+    "one 720p5 prompt/seed identifies phase shape but not production UCB",
+    "the Forecast local denominator comes from the separate secant-tail model",
+    "the Attention local denominator comes from Round218 local output probes",
+    "a long-video and held-out-seed replication is required before admission"
+  ],
+  "responses": [
+    {
+      "name": "dense_control",
+      "probe_type": "dense_control",
+      "phase_step": null,
+      "normalized_phase": null,
+      "blueprint": "blueprints/dense_control.json",
+      "execution_digest": "6924c9f5fa90c71988a3355df616331bed89e218313c2747e678bffbbee64f9a",
+      "latent_path": "/root/x-minimaxh3-runtime/results/h3_mechanistic_impulse_20260825/720p5_seed82303/latents/dense_control_torch213_cu130_cuda133_720p5_seed82303.pt",
+      "latent_sha256": "5df3163d1829bcde2a361ea6de8aae3f16c14e54213bbdda1f7197be96a38d12",
+      "denoise_seconds": 143.61560228600865,
+      "wall_seconds": 159.1757498359948,
+      "actual_evaluations": 20,
+      "forecast_evaluations": 0,
+      "modalities": {
+        "audio": {
+          "shape": [
+            1,
+            32,
+            2,
+            207
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 0.44596946868101517,
+          "candidate_rms": 0.44596946868101517,
+          "delta_rms": 0.0,
+          "relative_rms": 0.0,
+          "relative_l1": 0.0,
+          "relative_max_abs": 0.0,
+          "cosine_distance": 0.0,
+          "declared_local_ucb_amplitude": null,
+          "downstream_gain": null
+        },
+        "video": {
+          "shape": [
+            1,
+            24,
+            37,
+            46,
+            80
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 1.0379545775317784,
+          "candidate_rms": 1.0379545775317784,
+          "delta_rms": 0.0,
+          "relative_rms": 0.0,
+          "relative_l1": 0.0,
+          "relative_max_abs": 0.0,
+          "cosine_distance": 0.0,
+          "declared_local_ucb_amplitude": null,
+          "downstream_gain": null
+        }
+      }
+    },
+    {
+      "name": "forecast_impulse_step02",
+      "probe_type": "single_forecast",
+      "phase_step": 2,
+      "normalized_phase": 0.10526315789473684,
+      "blueprint": "blueprints/forecast_impulse_step02.json",
+      "execution_digest": "892d779e7cdf550bc9ca8e7485f0ba55d76e3d8c44a8a7e524dda4d3e50d6404",
+      "latent_path": "/root/x-minimaxh3-runtime/results/h3_mechanistic_impulse_20260825/720p5_seed82303/latents/forecast_impulse_step02_torch213_cu130_cuda133_720p5_seed82303.pt",
+      "latent_sha256": "a253f962b47e654299d9bea66d12e3427b4df88ba59001437efc8cabd86fa4e1",
+      "denoise_seconds": 138.68755549300113,
+      "wall_seconds": 152.15060587099288,
+      "actual_evaluations": 19,
+      "forecast_evaluations": 1,
+      "modalities": {
+        "audio": {
+          "shape": [
+            1,
+            32,
+            2,
+            207
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 0.44596946868101517,
+          "candidate_rms": 0.4459826484414562,
+          "delta_rms": 0.10340246901053211,
+          "relative_rms": 0.23185997309715373,
+          "relative_l1": 0.1327009272388293,
+          "relative_max_abs": 2.141089881964895,
+          "cosine_distance": 0.02687872877705244,
+          "declared_local_ucb_amplitude": 0.027462650202576048,
+          "downstream_gain": 8.442738460667748
+        },
+        "video": {
+          "shape": [
+            1,
+            24,
+            37,
+            46,
+            80
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 1.0379545775317784,
+          "candidate_rms": 1.037304092963157,
+          "delta_rms": 0.5639406093306296,
+          "relative_rms": 0.5433191601425004,
+          "relative_l1": 0.3913204455194222,
+          "relative_max_abs": 5.024731340644436,
+          "cosine_distance": 0.14769021574898578,
+          "declared_local_ucb_amplitude": 0.08108433281483028,
+          "downstream_gain": 6.7006675800522535
+        }
+      }
+    },
+    {
+      "name": "forecast_impulse_step06",
+      "probe_type": "single_forecast",
+      "phase_step": 6,
+      "normalized_phase": 0.3157894736842105,
+      "blueprint": "blueprints/forecast_impulse_step06.json",
+      "execution_digest": "8558a345af595020e55244079efa9aa9f1e5ffee2f022132b56192eb8512474f",
+      "latent_path": "/root/x-minimaxh3-runtime/results/h3_mechanistic_impulse_20260825/720p5_seed82303/latents/forecast_impulse_step06_torch213_cu130_cuda133_720p5_seed82303.pt",
+      "latent_sha256": "2e6056d09a3775ff679bdd46e74ddba1acff676540d267213c35ada196570074",
+      "denoise_seconds": 138.72795760302688,
+      "wall_seconds": 152.2006278349727,
+      "actual_evaluations": 19,
+      "forecast_evaluations": 1,
+      "modalities": {
+        "audio": {
+          "shape": [
+            1,
+            32,
+            2,
+            207
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 0.44596946868101517,
+          "candidate_rms": 0.44356407180667884,
+          "delta_rms": 0.07988409290446363,
+          "relative_rms": 0.17912457805850754,
+          "relative_l1": 0.08099864765076518,
+          "relative_max_abs": 2.1237410030272414,
+          "cosine_distance": 0.01611518099546405,
+          "declared_local_ucb_amplitude": 0.035830367800428836,
+          "downstream_gain": 4.999239166514045
+        },
+        "video": {
+          "shape": [
+            1,
+            24,
+            37,
+            46,
+            80
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 1.0379545775317784,
+          "candidate_rms": 1.0377190508735452,
+          "delta_rms": 0.24590432922947883,
+          "relative_rms": 0.2369124184742565,
+          "relative_l1": 0.14430471207438025,
+          "relative_max_abs": 3.9210150730395554,
+          "cosine_distance": 0.02807009077151268,
+          "declared_local_ucb_amplitude": 0.08381455609058025,
+          "downstream_gain": 2.826626179565039
+        }
+      }
+    },
+    {
+      "name": "forecast_impulse_step10",
+      "probe_type": "single_forecast",
+      "phase_step": 10,
+      "normalized_phase": 0.5263157894736842,
+      "blueprint": "blueprints/forecast_impulse_step10.json",
+      "execution_digest": "ee25d7f96c01e91f5cc2c7198cb30798c8cb817bec665ea5b8b5cb40fcfc28e7",
+      "latent_path": "/root/x-minimaxh3-runtime/results/h3_mechanistic_impulse_20260825/720p5_seed82303/latents/forecast_impulse_step10_torch213_cu130_cuda133_720p5_seed82303.pt",
+      "latent_sha256": "bb806cf47f73e8961054aba2af201a041957a58c2a17ad24097b03d98d423442",
+      "denoise_seconds": 138.7685985310236,
+      "wall_seconds": 152.21453739400022,
+      "actual_evaluations": 19,
+      "forecast_evaluations": 1,
+      "modalities": {
+        "audio": {
+          "shape": [
+            1,
+            32,
+            2,
+            207
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 0.44596946868101517,
+          "candidate_rms": 0.4455765436444017,
+          "delta_rms": 0.03791281805467839,
+          "relative_rms": 0.08501213808830481,
+          "relative_l1": 0.043095225825443804,
+          "relative_max_abs": 1.2573954070523201,
+          "cosine_distance": 0.0036163298763610685,
+          "declared_local_ucb_amplitude": 0.06357442642584724,
+          "downstream_gain": 1.3372065289092678
+        },
+        "video": {
+          "shape": [
+            1,
+            24,
+            37,
+            46,
+            80
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 1.0379545775317784,
+          "candidate_rms": 1.037434506522675,
+          "delta_rms": 0.1056628666342265,
+          "relative_rms": 0.10179912389373463,
+          "relative_l1": 0.050370137495621116,
+          "relative_max_abs": 3.302212079147423,
+          "cosine_distance": 0.005184002749243577,
+          "declared_local_ucb_amplitude": 0.11438379448792897,
+          "downstream_gain": 0.8899785529013692
+        }
+      }
+    },
+    {
+      "name": "forecast_impulse_step14",
+      "probe_type": "single_forecast",
+      "phase_step": 14,
+      "normalized_phase": 0.7368421052631579,
+      "blueprint": "blueprints/forecast_impulse_step14.json",
+      "execution_digest": "e604185e9340e2f49dbf4aede677579d4d7220c0e12e3494ce8ef5ddd254c4a8",
+      "latent_path": "/root/x-minimaxh3-runtime/results/h3_mechanistic_impulse_20260825/720p5_seed82303/latents/forecast_impulse_step14_torch213_cu130_cuda133_720p5_seed82303.pt",
+      "latent_sha256": "5edea6a947b2afb222415216accbe102b8363512feb25d4cc4aa6d8518b8ccbe",
+      "denoise_seconds": 138.75909652700648,
+      "wall_seconds": 152.216678546014,
+      "actual_evaluations": 19,
+      "forecast_evaluations": 1,
+      "modalities": {
+        "audio": {
+          "shape": [
+            1,
+            32,
+            2,
+            207
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 0.44596946868101517,
+          "candidate_rms": 0.4443529464519456,
+          "delta_rms": 0.060870692999211023,
+          "relative_rms": 0.13649071802883775,
+          "relative_l1": 0.0511407746419237,
+          "relative_max_abs": 2.075195710568909,
+          "cosine_distance": 0.00934215153970075,
+          "declared_local_ucb_amplitude": 0.17416605139343716,
+          "downstream_gain": 0.7836815322895982
+        },
+        "video": {
+          "shape": [
+            1,
+            24,
+            37,
+            46,
+            80
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 1.0379545775317784,
+          "candidate_rms": 1.03808769991217,
+          "delta_rms": 0.04229927110907588,
+          "relative_rms": 0.04075252619402878,
+          "relative_l1": 0.0223069054866852,
+          "relative_max_abs": 2.31639476627094,
+          "cosine_distance": 0.0008302694851591852,
+          "declared_local_ucb_amplitude": 0.23399124368920862,
+          "downstream_gain": 0.17416261203413672
+        }
+      }
+    },
+    {
+      "name": "forecast_impulse_step18",
+      "probe_type": "single_forecast",
+      "phase_step": 18,
+      "normalized_phase": 0.9473684210526315,
+      "blueprint": "blueprints/forecast_impulse_step18.json",
+      "execution_digest": "e80f0eec3e27524726dd068239c780683130e2ab9d3f0d570c15bd46cc6b1c02",
+      "latent_path": "/root/x-minimaxh3-runtime/results/h3_mechanistic_impulse_20260825/720p5_seed82303/latents/forecast_impulse_step18_torch213_cu130_cuda133_720p5_seed82303.pt",
+      "latent_sha256": "922607d9bebb3eb640bc900266bacb6681955543d18756a14897b1fc5cc80f15",
+      "denoise_seconds": 138.8405788129894,
+      "wall_seconds": 152.32558461400913,
+      "actual_evaluations": 19,
+      "forecast_evaluations": 1,
+      "modalities": {
+        "audio": {
+          "shape": [
+            1,
+            32,
+            2,
+            207
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 0.44596946868101517,
+          "candidate_rms": 0.4213303121191039,
+          "delta_rms": 0.05474705669000699,
+          "relative_rms": 0.12275965180290281,
+          "relative_l1": 0.09444482713122611,
+          "relative_max_abs": 0.6422848174783995,
+          "cosine_distance": 0.006360155366849973,
+          "declared_local_ucb_amplitude": 1.1631306582084435,
+          "downstream_gain": 0.105542443522199
+        },
+        "video": {
+          "shape": [
+            1,
+            24,
+            37,
+            46,
+            80
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 1.0379545775317784,
+          "candidate_rms": 1.0245438355089815,
+          "delta_rms": 0.057931625574188246,
+          "relative_rms": 0.05581325698466279,
+          "relative_l1": 0.039557190582376354,
+          "relative_max_abs": 1.2750866323413208,
+          "cosine_distance": 0.0014933871283224764,
+          "declared_local_ucb_amplitude": 1.132814604509628,
+          "downstream_gain": 0.04926954222030285
+        }
+      }
+    },
+    {
+      "name": "attention_impulse_step02",
+      "probe_type": "single_attention",
+      "phase_step": 2,
+      "normalized_phase": 0.10526315789473684,
+      "blueprint": "blueprints/attention_impulse_step02.json",
+      "execution_digest": "7c9251bbee144172b1e26227fa19cadb88939c23c725c4470f5951e0a529a4b0",
+      "latent_path": "/root/x-minimaxh3-runtime/results/h3_mechanistic_impulse_20260825/720p5_seed82303/latents/attention_impulse_step02_torch213_cu130_cuda133_720p5_seed82303.pt",
+      "latent_sha256": "13482cc82dcd871923840bcb801bc2c4a82551af1cd07768bbaec68e4f73dc2c",
+      "denoise_seconds": 142.83121174600092,
+      "wall_seconds": 156.33952741799294,
+      "actual_evaluations": 20,
+      "forecast_evaluations": 0,
+      "modalities": {
+        "audio": {
+          "shape": [
+            1,
+            32,
+            2,
+            207
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 0.44596946868101517,
+          "candidate_rms": 0.45246189507792633,
+          "delta_rms": 0.11760684906663939,
+          "relative_rms": 0.2637105392314626,
+          "relative_l1": 0.15394095252491122,
+          "relative_max_abs": 2.4776732894752316,
+          "cosine_distance": 0.03416823508867728,
+          "declared_local_ucb_amplitude": 0.853208630021014,
+          "downstream_gain": 0.3090809562310306
+        },
+        "video": {
+          "shape": [
+            1,
+            24,
+            37,
+            46,
+            80
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 1.0379545775317784,
+          "candidate_rms": 1.0384070287903917,
+          "delta_rms": 0.44534061555587007,
+          "relative_rms": 0.4290559772036222,
+          "relative_l1": 0.29565505390777663,
+          "relative_max_abs": 4.643560299033363,
+          "cosine_distance": 0.09200431549075305,
+          "declared_local_ucb_amplitude": 0.853208630021014,
+          "downstream_gain": 0.5028734615507287
+        }
+      }
+    },
+    {
+      "name": "attention_impulse_step10",
+      "probe_type": "single_attention",
+      "phase_step": 10,
+      "normalized_phase": 0.5263157894736842,
+      "blueprint": "blueprints/attention_impulse_step10.json",
+      "execution_digest": "101171d42771f8194b2c264e5e93f1e35af181262373637e859a3d7d78e2037d",
+      "latent_path": "/root/x-minimaxh3-runtime/results/h3_mechanistic_impulse_20260825/720p5_seed82303/latents/attention_impulse_step10_torch213_cu130_cuda133_720p5_seed82303.pt",
+      "latent_sha256": "d171cf7a65d1a8138022856f3cda2a17d81b45c6abdcbcb4c397e62257a1dc17",
+      "denoise_seconds": 142.74373722699238,
+      "wall_seconds": 156.12718917400343,
+      "actual_evaluations": 20,
+      "forecast_evaluations": 0,
+      "modalities": {
+        "audio": {
+          "shape": [
+            1,
+            32,
+            2,
+            207
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 0.44596946868101517,
+          "candidate_rms": 0.44582676644969693,
+          "delta_rms": 0.06397190328446146,
+          "relative_rms": 0.14344458035134713,
+          "relative_l1": 0.05977953563183559,
+          "relative_max_abs": 2.1348395863482748,
+          "cosine_distance": 0.010291415690265704,
+          "declared_local_ucb_amplitude": 0.7669120723207847,
+          "downstream_gain": 0.18704175553954117
+        },
+        "video": {
+          "shape": [
+            1,
+            24,
+            37,
+            46,
+            80
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 1.0379545775317784,
+          "candidate_rms": 1.038208235619026,
+          "delta_rms": 0.10204545600488726,
+          "relative_rms": 0.09831399004718297,
+          "relative_l1": 0.050736750420420564,
+          "relative_max_abs": 3.2013267457403196,
+          "cosine_distance": 0.004831609696492212,
+          "declared_local_ucb_amplitude": 0.7669120723207847,
+          "downstream_gain": 0.12819460482564957
+        }
+      }
+    },
+    {
+      "name": "attention_impulse_step18",
+      "probe_type": "single_attention",
+      "phase_step": 18,
+      "normalized_phase": 0.9473684210526315,
+      "blueprint": "blueprints/attention_impulse_step18.json",
+      "execution_digest": "a74812d81fc675a36baf1006d53508dc9d89fb40281e3faaae3b8000d04723ed",
+      "latent_path": "/root/x-minimaxh3-runtime/results/h3_mechanistic_impulse_20260825/720p5_seed82303/latents/attention_impulse_step18_torch213_cu130_cuda133_720p5_seed82303.pt",
+      "latent_sha256": "3dae64ce69b233d2afb9e4a3413f6cb1bcd41305617875cad522b2f0f6befc27",
+      "denoise_seconds": 143.04741576500237,
+      "wall_seconds": 156.47447708199616,
+      "actual_evaluations": 20,
+      "forecast_evaluations": 0,
+      "modalities": {
+        "audio": {
+          "shape": [
+            1,
+            32,
+            2,
+            207
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 0.44596946868101517,
+          "candidate_rms": 0.4463860702143739,
+          "delta_rms": 0.014453661607320171,
+          "relative_rms": 0.03240953164365232,
+          "relative_l1": 0.02228735929868483,
+          "relative_max_abs": 0.44896536795145353,
+          "cosine_distance": 0.0005242628152262174,
+          "declared_local_ucb_amplitude": 0.6194103210522445,
+          "downstream_gain": 0.05232320247521145
+        },
+        "video": {
+          "shape": [
+            1,
+            24,
+            37,
+            46,
+            80
+          ],
+          "dtype": "torch.float64",
+          "reference_rms": 1.0379545775317784,
+          "candidate_rms": 1.0370491468356045,
+          "delta_rms": 0.03493632893397307,
+          "relative_rms": 0.03365882254409485,
+          "relative_l1": 0.02222436401212649,
+          "relative_max_abs": 1.8546573438697536,
+          "cosine_distance": 0.0005665719278242776,
+          "declared_local_ucb_amplitude": 0.6194103210522445,
+          "downstream_gain": 0.05434010606558149
+        }
+      }
+    }
+  ]
+}

@@ -190,7 +190,13 @@ class PackedQwen3VLT2AVConditioner:
 
     def _load_tokenizer(self):
         if self._tokenizer is None:
-            from transformers import Qwen2TokenizerFast
+            try:
+                # Transformers 5 no longer re-exports every model class from
+                # the package root.  Keep the old import as a compatibility
+                # fallback for the Transformers 4 release environment.
+                from transformers.models.qwen2 import Qwen2TokenizerFast
+            except ImportError:  # pragma: no cover - Transformers 4 fallback
+                from transformers import Qwen2TokenizerFast
 
             self._tokenizer = Qwen2TokenizerFast.from_pretrained(
                 self.tokenizer_path,
@@ -202,7 +208,12 @@ class PackedQwen3VLT2AVConditioner:
         if self._processor is None:
             if not self.processor_path.is_dir():
                 raise FileNotFoundError(self.processor_path)
-            from transformers import Qwen3VLProcessor
+            try:
+                # Transformers 5 exposes Qwen3-VL through its model package,
+                # while Transformers 4 also exported it at the package root.
+                from transformers.models.qwen3_vl import Qwen3VLProcessor
+            except ImportError:  # pragma: no cover - Transformers 4 fallback
+                from transformers import Qwen3VLProcessor
 
             self._processor = Qwen3VLProcessor.from_pretrained(
                 self.processor_path,

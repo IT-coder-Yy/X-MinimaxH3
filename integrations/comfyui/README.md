@@ -1,5 +1,7 @@
 # H3 Serve Connector for ComfyUI
 
+[English](README.en.md) · **简体中文**
+
 这是 H3 Video Service 正式发行包内的可选 ComfyUI 客户端集成，源码位于
 `integrations/comfyui/`。它不会在 ComfyUI 内加载 H3 权重，而是调用
 独立运行的 H3 Serve HTTP API，因此服务端模型热态、任务队列、4090优化和超分策略均会保留。
@@ -23,16 +25,23 @@ ComfyUI不负责切换FL2VA/Ref2VA服务族；但每个生成节点可以选择�
 重启 ComfyUI 后搜索 `H3 Serve`。最简单的工作流是：
 
 1. `H3 Serve · 连接服务`：默认地址 `http://127.0.0.1:8090`；如服务设置了密钥则填写。
-2. `H3 Serve · 简单生成`：连接提示词与可选首/尾帧，选择分辨率、时长和质量档。
-3. 运行生成节点；它会直接保存并预览服务端成片。`视频` 输出仍可连接其他后处理节点。
+2. `H3 Serve · 简单生成`：连接提示词与可选首/尾帧，选择分辨率、时长、步数和加速力度。
+3. 运行生成节点；它会直接保存并预览服务端成片。
+4. 如需放大细化，把生成节点的`最终视频`接到`H3 Serve · H3二次采样`。该小节点与控制台一致，只暴露目标分辨率、1–8步、四档重绘强度和加速力度。
 
 示例按输入协议拆成两套，避免把互斥端口放在同一个初学者模板里：
 
-- `example_workflows/H3_Serve_FL2VA_First_Last.json`：文本、首帧、尾帧或首尾帧生成。
-- `example_workflows/H3_Serve_Ref2VA_Multi_Reference.json`：多图、参考视频与参考音频生成。
+- 中文 `example_workflows/H3_Serve_FL2VA_First_Last.json`：文本、首帧、尾帧或首尾帧生成。
+- 中文 `example_workflows/H3_Serve_Ref2VA_Multi_Reference.json`：多图、参考视频与参考音频生成。
+- English `example_workflows/H3_Serve_FL2VA_First_Last_EN.json`：英文节点与选项的 FL2VA 工作流。
+- English `example_workflows/H3_Serve_Ref2VA_Multi_Reference_EN.json`：英文节点与选项的 Ref2VA 工作流。
 
-生成节点会把服务端成片下载到 ComfyUI 的 `output/h3_serve/` 并直接显示预览，
-无需再连接 ComfyUI 的 `SaveVideo` 节点。视频输出仍可继续连接到其他后处理节点。
+中英文工作流调用完全相同的H3 Serve API、推理后端和数值参数；差别仅限节点标题、
+输入/输出名称、枚举选项和默认提示词语言，不会改变生成结果或性能。
+
+生成和二采节点都会把服务端成片下载到 ComfyUI 的 `output/h3_serve/` 并直接显示预览，
+无需再连接 ComfyUI 的 `SaveVideo` 节点。H3二采要求源任务保留干净AV latent，普通外部MP4不能替代它。
+二采固定使用Base权重、Simple调度和SA Solver；不会提供LoRA二采选项。
 
 原始权重与LoRA共用对应服务族的工作流和热会话，在生成节点的`推理路线`中选择。
 FL2VA生成节点只暴露`first_frame`/`last_frame`；Ref2VA生成节点直接暴露编号明确的
@@ -41,13 +50,9 @@ FL2VA生成节点只暴露`first_frame`/`last_frame`；Ref2VA生成节点直接�
 如果这个ComfyUI只用于调用H3服务，推荐使用随包启动器，使ComfyUI保持CPU模式、不占用
 4090显存：
 
-在 X-MinimaxH3 项目根目录执行：
-
 ```bash
-./integrations/comfyui/start_comfyui.sh /path/to/ComfyUI
+./start_comfyui.sh /path/to/ComfyUI
 ```
-
-注意开头是 `./integrations`，不是从系统根目录开始的 `/integrations`。
 
 Ref2VA不再使用素材集合串联节点。将ComfyUI的`Load Image`输出直接接到生成节点的
 `Picture N`，将`Load Audio`输出直接接到`Audio N`。编号同时决定提示词中对应的
@@ -65,15 +70,15 @@ FL2VA与Ref2VA都不在ComfyUI里调用MiMo，也不做分镜编译、模板包�
 H3结构、声音字段或引用标签，由用户全部写在这一个字符串中。MiMo润色只属于Web创作台
 的模块化编辑器，不属于ComfyUI或公共生成API。
 
-高级节点只暴露两个推理控制量：`sampling_steps` 是总采样轨迹长度（原始权重8–20，
-LoRA 4–8），`acceleration` 是0–100连续加速档位。0表示全部真实步和Dense
+高级节点只暴露两个推理控制量：`sampling_steps` 是总采样轨迹长度（原始权重5–30，
+LoRA 4–10），`acceleration` 是0–100连续加速档位。0表示全部真实步和Dense
 Attention；越高表示越小的计算预算。服务自动安排真实/预测位置和逐步逐层Attention，
 构图、因果交互、声音与末端细节保护不能在ComfyUI里关闭。LoRA当前只自动调度
 Attention，不插入未经人工验收的预测步。连接器轮询服务进度并同步到ComfyUI进度条；中断ComfyUI任务时，
 它也会请求服务端取消对应任务。成片下载到 `ComfyUI/output/h3_serve/`。
 
-FL2VA与Ref2VA生成节点的预览都只有`关闭`/`开启`两个状态。开启后才显示`预览位置`、
-`预览分辨率`与`LoRA预览步数`三个参数。正式轨迹运行到预览位置后会保存断点并停止，
+FL2VA与Ref2VA生成节点的预览都只有`关闭`/`开启`两个状态。开启后只需设置`预览位置`；
+预览分辨率与预览步数使用8090控制台设置里的全局默认。正式轨迹运行到预览位置后会保存断点并停止，
 不会继续计算剩余正式步；此时任务释放GPU执行权，快速预览显示在生成节点下方和
 `预览视频`输出端口。节点随后显示两个按钮：
 
@@ -99,6 +104,7 @@ FL2VA与Ref2VA生成节点的预览都只有`关闭`/`开启`两个状态。开�
 - `GET /api/v1/jobs/{id}/preview`
 - `POST /api/v1/jobs/{id}/preview/{continue|discard}`
 - `POST /api/v1/jobs/{id}/resume`
+- `POST /api/v1/jobs/{id}/second-sampling`
 - `GET /api/v1/jobs/{id}/video`
 
 H3 Serve 的机器可读契约位于 `http://服务地址/openapi.json`。

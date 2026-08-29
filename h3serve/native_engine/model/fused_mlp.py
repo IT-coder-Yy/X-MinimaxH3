@@ -219,6 +219,53 @@ def _fused_down_gated_residual(
     )
 
 
+def _chunked_module_gated_mlp(
+    residual: torch.Tensor,
+    hidden: torch.Tensor,
+    mlp: "SwiGLUMLP",
+    gate: torch.Tensor,
+    segments: tuple["ModulationSegment", ...],
+    *,
+    chunk_tokens: int,
+) -> None:
+    """Bound W4A8 MLP activations while preserving the module-level math.
+
+    Unlike the tensorwise INT8 route, grouped W4A8 currently has no fused
+    ``input_act='swiglu'`` entry point.  Running the two existing W4 linears on
+    row chunks still avoids the sequence-long ``[tokens, 2*ffn]`` allocation
+    and keeps both RuntimeLoRALinear calls in the exact same order.
+    """
+
+    if chunk_tokens <= 0:
+        raise ValueError("MLP chunk_tokens must be positive")
+    from .layers import _profile_region
+
+    for start in range(0, hidden.shape[0], chunk_tokens):
+        stop = min(start + chunk_tokens, hidden.shape[0])
+        with _profile_region("h3_mlp_fc1_projection"):
+            raw = mlp.fc1(hidden[start:stop])
+        gate_value, up_value = raw.chunk(2, dim=-1)
+        activated = torch.nn.functional.silu(gate_value).mul_(up_value)
+        del raw, gate_value, up_value
+        with _profile_region("h3_mlp_swiglu_fc2_projection"):
+            projected = mlp.fc2(activated)
+        del activated
+        with _profile_region("h3_mlp_gated_residual"):
+            chunk_residual = residual[start:stop]
+            for segment_start, segment_stop, row in segments:
+                overlap_start = max(start, segment_start)
+                overlap_stop = min(stop, segment_stop)
+                if overlap_start >= overlap_stop:
+                    continue
+                local_start = overlap_start - start
+                local_stop = overlap_stop - start
+                chunk_residual[local_start:local_stop].addcmul_(
+                    projected[local_start:local_stop],
+                    gate[row].to(hidden.dtype),
+                )
+        del projected
+
+
 def try_fused_gated_mlp(
     residual: torch.Tensor,
     hidden: torch.Tensor,
@@ -240,7 +287,7 @@ def try_fused_gated_mlp(
         return False
     # Base and Larry paths are handled separately; silently dropping a LoRA
     # contribution is forbidden.
-    from .quantization import ConvRotInt8Linear
+    from .quantization import ConvRotInt8Linear, ConvRotW4A8Linear
     from .lora import RuntimeLoRALinear
 
     fc1, fc2 = mlp.fc1, mlp.fc2
@@ -249,9 +296,13 @@ def try_fused_gated_mlp(
     )
     base_fc1 = fc1.base if lora_path else fc1
     base_fc2 = fc2.base if lora_path else fc2
-    if not isinstance(base_fc1, ConvRotInt8Linear) or not isinstance(
+    int8_path = isinstance(base_fc1, ConvRotInt8Linear) and isinstance(
         base_fc2, ConvRotInt8Linear
-    ):
+    )
+    w4a8_path = isinstance(base_fc1, ConvRotW4A8Linear) and isinstance(
+        base_fc2, ConvRotW4A8Linear
+    )
+    if not int8_path and not w4a8_path:
         return False
     if (
         base_fc1.kernel is None
@@ -260,7 +311,6 @@ def try_fused_gated_mlp(
         or base_fc2.spec.convrot_groupsize != 256
     ):
         return False
-    row_map = _segment_row_map(hidden.shape[0], segments, hidden.device)
     if chunk_tokens is None:
         # Backward-compatible process default. Production routing passes an
         # explicit immutable request-level value and never mutates env vars.
@@ -273,9 +323,27 @@ def try_fused_gated_mlp(
         chunk_tokens = int(os.environ.get(chunk_env, chunk_default))
     if chunk_tokens <= 0:
         raise ValueError("MLP chunk_tokens must be positive")
+    if w4a8_path:
+        _chunked_module_gated_mlp(
+            residual,
+            hidden,
+            mlp,
+            gate,
+            segments,
+            chunk_tokens=chunk_tokens,
+        )
+        return True
+
+    row_map = _segment_row_map(hidden.shape[0], segments, hidden.device)
+    # Imported lazily to avoid a module cycle during layer construction. The
+    # helper is a null context unless the profiling process opted in before
+    # importing the model, so production execution retains no Kineto events.
+    from .layers import _profile_region
+
     for start in range(0, hidden.shape[0], chunk_tokens):
         stop = min(start + chunk_tokens, hidden.shape[0])
-        raw = fc1(hidden[start:stop])
+        with _profile_region("h3_mlp_fc1_projection"):
+            raw = fc1(hidden[start:stop])
         from .research_capture import (
             capture_kind,
             capture_quantized_fc2_chunk,
@@ -319,21 +387,22 @@ def try_fused_gated_mlp(
             continue
 
         # Current Comfy-Kitchen's fused input-activation kernel is faster on
-        # the installed CUDA 12.6/SM89 stack than the older project epilogue,
+        # the installed CUDA 13/SM89 stack than the older project epilogue,
         # and exactly matches the optimized Comfy execution boundary.  The
         # release package vendors this low-level kernel library, not ComfyUI.
         from comfy_kitchen import int8_linear
 
-        projected = int8_linear(
-            raw,
-            base_fc2.qweight,
-            base_fc2.scale,
-            base_fc2.bias,
-            hidden.dtype,
-            convrot=True,
-            convrot_groupsize=256,
-            input_act="swiglu",
-        )
+        with _profile_region("h3_mlp_swiglu_fc2_projection"):
+            projected = int8_linear(
+                raw,
+                base_fc2.qweight,
+                base_fc2.scale,
+                base_fc2.bias,
+                hidden.dtype,
+                convrot=True,
+                convrot_groupsize=256,
+                input_act="swiglu",
+            )
         if lora_path:
             # The distilled fc2 LoRA consumes the exact BF16 SwiGLU
             # activation.  Its rank-64 update is accumulated into the fresh
@@ -342,17 +411,18 @@ def try_fused_gated_mlp(
             gate_value, up_value = raw.chunk(2, dim=-1)
             activated = torch.nn.functional.silu(gate_value).mul_(up_value)
             projected = fc2.update.apply(activated, projected)
-        chunk_residual = residual[start:stop]
-        for segment_start, segment_stop, row in segments:
-            overlap_start = max(start, segment_start)
-            overlap_stop = min(stop, segment_stop)
-            if overlap_start >= overlap_stop:
-                continue
-            local_start = overlap_start - start
-            local_stop = overlap_stop - start
-            chunk_residual[local_start:local_stop].addcmul_(
-                projected[local_start:local_stop], gate[row].to(hidden.dtype)
-            )
+        with _profile_region("h3_mlp_gated_residual"):
+            chunk_residual = residual[start:stop]
+            for segment_start, segment_stop, row in segments:
+                overlap_start = max(start, segment_start)
+                overlap_stop = min(stop, segment_stop)
+                if overlap_start >= overlap_stop:
+                    continue
+                local_start = overlap_start - start
+                local_stop = overlap_stop - start
+                chunk_residual[local_start:local_stop].addcmul_(
+                    projected[local_start:local_stop], gate[row].to(hidden.dtype)
+                )
     return True
 
 

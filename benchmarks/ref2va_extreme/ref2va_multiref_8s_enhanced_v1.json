@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "description": "H3-rule-enhanced stable multi-image/multi-audio Ref2VA anchor",
+  "enhancement": {
+    "method": "deterministic_local_h3_rules",
+    "source": "ref2va_multiref_8s.json",
+    "rules": [
+      "stable global speaker IDs",
+      "explicit reference voice binding",
+      "exact dialogue inside d language tags",
+      "first shot without timestamp; later shots use explicit start time",
+      "action and diegetic sound are colocated",
+      "no narration, invented dialogue, singing or non-diegetic music"
+    ]
+  },
+  "expected_dialogue": [
+    {
+      "order": 1,
+      "speaker": "S1-young-man",
+      "reference_audio": "Audio 2",
+      "text": "准备好了吗？今天上学别忘带东西。",
+      "window_seconds": [2.2, 5.2]
+    },
+    {
+      "order": 2,
+      "speaker": "S2-girl",
+      "reference_audio": "Audio 1",
+      "text": "都带好了，我自己可以背。",
+      "window_seconds": [5.2, 7.9]
+    }
+  ],
+  "scenarios": [
+    {
+      "name": "campus_bag_dialogue_enhanced_v1",
+      "seed": 82416,
+      "width": 864,
+      "height": 480,
+      "frames": 192,
+      "reference_images": [
+        "ref-test/bag.png",
+        "ref-test/girl.png",
+        "ref-test/young-man.png"
+      ],
+      "reference_audios": [
+        "ref-test/girl.wav",
+        "ref-test/young-man.wav"
+      ],
+      "prompt": "integrated_multimodal_description: Reference identity contract — <Picture 1> is the same dark-blue school backpack in every shot; preserve its fabric, zipper, shoulder straps, back padding, color and proportions. <Picture 2> is the same young girl (S2) in every shot; preserve her face, hairstyle, age and clothing. <Picture 3> is the same young man (S1) in every shot; preserve his face, hairstyle, age and clothing. <Audio 1> is the sole voice reference for (S2). <Audio 2> is the sole voice reference for (S1). Do not swap, blend or invent their voices.\n\n[Shot 1]\nOne continuous cinematic take at a quiet school entrance in soft morning sunlight. Start with an extreme close-up of <Picture 1>; show the dark-blue fabric weave, zipper teeth, shoulder straps and back padding with the exact reference design. The camera slowly and smoothly pulls backward, revealing (S2), matching <Picture 2>, already wearing the backpack. Trees and the teaching building remain stable in the background. No person speaks; both mouths remain closed. The zipper makes a brief metallic sound and the fabric softly rubs as (S2) adjusts one strap. No cut, no narration, no subtitles.\n\n[Shot 2] At 00:02.20,\nContinue the same take without a cut. (S1), matching <Picture 3>, walks naturally along the campus path toward (S2); synchronized footsteps approach. He smiles, stops beside her and gently pats her shoulder, producing a soft clothing-contact sound. Facing (S2), with clearly visible synchronized lip movement and the voice identity of <Audio 2>, (S1) speaks in a calm, caring tone: <d>[Chinese] 准备好了吗？今天上学别忘带东西。</d> (S2) listens silently with her lips completely closed. Preserve the backpack and both identities exactly.\n\n[Shot 3] At 00:05.20,\nContinue the same take without a cut. Facing (S1), with clearly visible synchronized lip movement and the voice identity of <Audio 1>, (S2) answers naturally and confidently: <d>[Chinese] 都带好了，我自己可以背。</d> (S1) listens silently with his lips completely closed. He then adjusts one shoulder strap of <Picture 1>; the strap and fabric make a soft rubbing sound. They turn and walk side by side toward the teaching building as the camera smoothly eases backward into a medium-wide view. Natural synchronized footsteps and quiet morning campus ambience continue. Do not add any other speech, voiceover, singing, subtitles or cuts.\n\noverall_soundscape: Quiet morning campus ambience, light breeze through leaves, synchronized footsteps, one soft shoulder pat, backpack zipper and fabric/strap friction. Dialogue is clean, dry and foregrounded; use <Audio 2> only for (S1) and <Audio 1> only for (S2). No narration, no extra voices, no singing.\n\nnon_diegetic_music: N/A"
+    }
+  ]
+}

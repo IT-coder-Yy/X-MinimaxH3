@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import ServicePaths
-from .contract import GenerationSpec
+from .contract import GenerationSpec, SecondSamplingSpec
 
 
 class BackendError(RuntimeError):
@@ -26,6 +26,7 @@ class GenerationResult:
     elapsed_seconds: float
     output_path: Path
     inference_plan: dict[str, Any] | None = None
+    final_latents_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,9 @@ class NativeBackendManager:
         if not safe_name:
             raise BackendError("job id does not contain a safe output name")
         output_path = self.engine.output_root / f"{safe_name[:128]}.mp4"
+        latent_root = self.engine.output_root / ".h3-latents"
+        latent_root.mkdir(parents=True, exist_ok=True)
+        final_latents_path = latent_root / f"{safe_name[:128]}.pt"
         try:
             result = await self.engine.generate(
                 spec, first_frame, last_frame, reference_images, reference_videos, reference_audios, cancel_event, output_path,
@@ -94,6 +98,7 @@ class NativeBackendManager:
                 preview_decision_wait=preview_decision_wait,
                 checkpoint_path=checkpoint_path,
                 resume_checkpoint_path=resume_checkpoint_path,
+                final_latents_path=final_latents_path,
             )
         except NativeGenerationCancelled as error:
             raise JobCancelled(str(error)) from error
@@ -113,6 +118,60 @@ class NativeBackendManager:
             elapsed_seconds=result.elapsed_seconds,
             output_path=result.output_path,
             inference_plan=getattr(result, "inference_plan", None),
+            final_latents_path=getattr(result, "final_latents_path", None),
+        )
+
+    async def second_sample(
+        self,
+        spec: GenerationSpec,
+        second_sampling: SecondSamplingSpec,
+        source_latents_path: Path,
+        job_id: str,
+        first_frame: Path | None,
+        last_frame: Path | None,
+        reference_images: tuple[Path, ...],
+        reference_videos: tuple[Path, ...],
+        reference_audios: tuple[Path, ...],
+        cancel_event: asyncio.Event,
+        progress_callback: Any | None = None,
+    ) -> GenerationResult:
+        from .native_engine.engine import NativeGenerationCancelled
+
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", job_id).strip("._")
+        if not safe_name:
+            raise BackendError("job id does not contain a safe output name")
+        source_latents_path = source_latents_path.resolve()
+        latent_root = (self.engine.output_root / ".h3-latents").resolve()
+        if not source_latents_path.is_relative_to(latent_root):
+            raise BackendError("second-sampling source is outside the latent store")
+        if not source_latents_path.is_file():
+            raise BackendError("second-sampling source latent is missing")
+        output_path = self.engine.output_root / f"{safe_name[:128]}.mp4"
+        final_latents_path = latent_root / f"{safe_name[:128]}.pt"
+        try:
+            result = await self.engine.generate(
+                spec,
+                first_frame,
+                last_frame,
+                reference_images,
+                reference_videos,
+                reference_audios,
+                cancel_event,
+                output_path,
+                progress_callback=progress_callback,
+                final_latents_path=final_latents_path,
+                second_sampling=second_sampling,
+                refinement_latents_path=source_latents_path,
+            )
+        except NativeGenerationCancelled as error:
+            raise JobCancelled(str(error)) from error
+        self.key = result.runtime_key
+        return GenerationResult(
+            runtime_key=result.runtime_key,
+            elapsed_seconds=result.elapsed_seconds,
+            output_path=result.output_path,
+            inference_plan=getattr(result, "inference_plan", None),
+            final_latents_path=getattr(result, "final_latents_path", None),
         )
 
     async def stop(self) -> None:
@@ -125,6 +184,13 @@ class NativeBackendManager:
         if not callable(configure):
             raise BackendError("native backend does not support memory-profile changes")
         configure(profile)
+
+    def configure_lora_checkpoint(self, checkpoint: Path) -> None:
+        factory = getattr(self.engine, "_factory", None)
+        configure = getattr(factory, "set_lora_checkpoint", None)
+        if not callable(configure):
+            raise BackendError("native backend does not support LoRA changes")
+        configure(checkpoint)
 
     def configure_output_root(self, output_root: Path) -> None:
         configure = getattr(self.engine, "set_output_root", None)

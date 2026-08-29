@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "purpose": "Same-process V22 exact execution A/B. All variants share the same prompt, seed, V22 blueprint and numerical attention schedule.",
+  "anchor": "720p10_seed82341_radio_console_quality20.json",
+  "candidates": [
+    {
+      "version": "v22_exec_control",
+      "actual_steps": [0, 1, 2, 3, 4, 8, 12, 15, 18, 19],
+      "long_sequence_query_chunk_tokens": null,
+      "long_sequence_projection_chunk_tokens": 8192,
+      "long_sequence_split_qkv_outputs": false,
+      "long_sequence_single_qknorm_rope": false,
+      "long_sequence_parallel_sparse_lut": false
+    },
+    {
+      "version": "v22_exec_split_single",
+      "actual_steps": [0, 1, 2, 3, 4, 8, 12, 15, 18, 19],
+      "long_sequence_query_chunk_tokens": 32768,
+      "long_sequence_projection_chunk_tokens": 8192,
+      "long_sequence_split_qkv_outputs": true,
+      "long_sequence_single_qknorm_rope": true,
+      "long_sequence_parallel_sparse_lut": false
+    },
+    {
+      "version": "v22_exec_split_single_parallel_lut",
+      "actual_steps": [0, 1, 2, 3, 4, 8, 12, 15, 18, 19],
+      "long_sequence_query_chunk_tokens": 32768,
+      "long_sequence_projection_chunk_tokens": 8192,
+      "long_sequence_split_qkv_outputs": true,
+      "long_sequence_single_qknorm_rope": true,
+      "long_sequence_parallel_sparse_lut": true
+    }
+  ]
+}

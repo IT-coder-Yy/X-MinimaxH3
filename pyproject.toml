@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "x-minimaxh3"
-version = "0.7.0"
-description = "MiniMax H3 local inference acceleration service and studio"
+version = "1.0.0"
+description = "Resource-tiered MiniMax H3 video generation service for NVIDIA SM89"
 requires-python = "==3.10.*"
 dependencies = [
   "aiohttp>=3.13,<4",
@@ -13,10 +13,12 @@ dependencies = [
   "huggingface-hub>=0.34,<2",
   "safetensors>=0.7,<1",
   "numpy>=2.2,<3",
+  "scipy>=1.15,<1.16",
   "av>=17,<18",
-  "diffusers==0.32.2",
+  "diffusers==0.35.2",
   "einops>=0.8,<1",
   "transformers==5.6.2",
+  "loguru>=0.7,<0.8",
   "tqdm>=4.67,<5",
   "imageio==2.37.0",
   "imageio-ffmpeg==0.6.0",

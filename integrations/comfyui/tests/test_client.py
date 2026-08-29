@@ -12,18 +12,24 @@ from h3serve_connector.client import H3ServeClient
 from h3serve_connector.nodes import (
     H3ServeAdvancedGenerate,
     H3ServeConnection,
+    H3ServeConnectionEnglish,
     H3ServeFL2VAPresetGenerate,
+    H3ServeFL2VAPresetGenerateEnglish,
     H3ServeRef2VAPresetGenerate,
+    H3ServeRef2VAPresetGenerateEnglish,
     H3ServeFL2VACheckpointSubmit,
     H3ServeRef2VACheckpointSubmit,
     H3ServeCheckpointPreview,
     H3ServeCheckpointResume,
+    H3ServeSecondSampling,
+    H3ServeSecondSamplingEnglish,
     QUALITY,
     _acceleration_value,
     _add_reference_resolution_fields,
     _max_native_duration,
     _preset_geometry,
     _require_ready_engine,
+    _source_job_id_from_video,
 )
 
 
@@ -114,13 +120,19 @@ class ClientTest(unittest.TestCase):
             output = self.client.download("job-1", Path(directory) / "result.mp4")
             self.assertEqual(output.read_bytes(), b"fake-mp4")
 
-    def test_generation_nodes_publish_1080p_and_2k_limits(self):
+    def test_generation_and_second_sampling_match_the_console_surface(self):
         preset = H3ServeFL2VAPresetGenerate.INPUT_TYPES()["required"]
         self.assertIn("1080p", preset["resolution"][0])
-        self.assertIn("2K", preset["upscale"][0])
+        self.assertNotIn("upscale", preset)
+        self.assertEqual(preset["sampling_steps"][1]["max"], 30)
         advanced = H3ServeAdvancedGenerate.INPUT_TYPES()["required"]
         self.assertEqual(advanced["width"][1]["max"], 1920)
         self.assertEqual(advanced["height"][1]["max"], 1920)
+        second = H3ServeSecondSampling.INPUT_TYPES()["required"]
+        self.assertEqual(second["目标分辨率"][0], ["720P", "1080P", "1440P"])
+        self.assertEqual(second["二次采样步数"][1]["min"], 1)
+        self.assertEqual(second["二次采样步数"][1]["max"], 8)
+        self.assertEqual(second["加速力度"][1]["default"], 75.0)
 
     def test_reference_resolution_controls_map_to_shared_api_fields(self):
         fields = {}
@@ -161,6 +173,58 @@ class ClientTest(unittest.TestCase):
         finally:
             Handler.engine = "original"
 
+    def test_second_sampling_video_wire_recovers_the_source_job(self):
+        class Video:
+            def get_stream_source(self):
+                return "/tmp/output/h3_serve/source-job-123.mp4"
+
+        self.assertEqual(_source_job_id_from_video(Video()), "source-job-123")
+
+        class ForeignVideo:
+            def get_stream_source(self):
+                return "/tmp/output/foreign.mp4"
+
+        with self.assertRaisesRegex(RuntimeError, "H3 Serve生成节点"):
+            _source_job_id_from_video(ForeignVideo())
+
+    def test_second_sampling_node_projects_console_controls_to_the_api(self):
+        source_video = object()
+        connection = {"server_url": "http://127.0.0.1:8090"}
+        with patch(
+            "h3serve_connector.nodes._run_second_sampling",
+            return_value=("second-video",),
+        ) as run:
+            result = H3ServeSecondSampling().sample(
+                connection, source_video, "1080P", 4,
+                "增强 · Denoise 0.25", 75.0,
+            )
+        self.assertEqual(result, ("second-video",))
+        run.assert_called_once_with(connection, source_video, {
+            "resolution": "1080p",
+            "steps": 4,
+            "strength": "enhance",
+            "acceleration": 75.0,
+        })
+
+    def test_english_second_sampling_projects_the_same_api_contract(self):
+        source_video = object()
+        connection = {"server_url": "http://127.0.0.1:8090"}
+        with patch(
+            "h3serve_connector.nodes._run_second_sampling",
+            return_value=("second-video",),
+        ) as run:
+            result = H3ServeSecondSamplingEnglish().sample_english(
+                connection, source_video, "1080p", 4,
+                "Enhance · Denoise 0.25", 75.0,
+            )
+        self.assertEqual(result, ("second-video",))
+        run.assert_called_once_with(connection, source_video, {
+            "resolution": "1080p",
+            "steps": 4,
+            "strength": "enhance",
+            "acceleration": 75.0,
+        })
+
     def test_conditioning_workflows_expose_disjoint_inputs(self):
         fl2va = H3ServeFL2VAPresetGenerate.INPUT_TYPES()["optional"]
         ref2va = H3ServeRef2VAPresetGenerate.INPUT_TYPES()["optional"]
@@ -194,20 +258,49 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(fl2va["预览位置"][1]["default"], 6)
         self.assertEqual(fl2va["预览位置"][1]["min"], 1)
         self.assertEqual(fl2va["预览位置"][1]["max"], 19)
-        self.assertEqual(
-            fl2va["预览分辨率"][0],
-            ["原分辨率", "360p", "480p", "720p"],
-        )
-        self.assertEqual(fl2va["LoRA预览步数"][1]["default"], 4)
-        self.assertEqual(fl2va["LoRA预览步数"][1]["min"], 1)
-        self.assertEqual(fl2va["LoRA预览步数"][1]["max"], 8)
+        self.assertNotIn("预览分辨率", fl2va)
+        self.assertNotIn("LoRA预览步数", fl2va)
+        self.assertNotIn("upscale", fl2va)
         self.assertEqual(fl2va["断点任务ID"][1]["default"], "")
         self.assertEqual(fl2va["断点动作"][1]["default"], "新建任务")
-        for name in (
-            "prompt", "preview_mode", "预览位置", "预览分辨率",
-            "LoRA预览步数",
-        ):
+        for name in ("prompt", "preview_mode", "预览位置"):
             self.assertEqual(schema[name], fl2va[name])
+
+    def test_english_creator_surface_is_fully_english_and_equivalent(self):
+        fl2va = H3ServeFL2VAPresetGenerateEnglish.INPUT_TYPES()
+        ref2va = H3ServeRef2VAPresetGenerateEnglish.INPUT_TYPES()
+        required = fl2va["required"]
+        self.assertEqual(required["model_variant"][0], ["Base weights", "LoRA Turbo"])
+        self.assertEqual(required["preview_mode"][0], ["Off", "On"])
+        self.assertEqual(required["checkpoint_action"][1]["default"], "New task")
+        self.assertIn("preview_step", required)
+        self.assertNotIn("预览位置", required)
+        self.assertEqual(set(fl2va["optional"]), {"first_frame", "last_frame"})
+        self.assertIn("Picture 1", ref2va["optional"])
+        self.assertEqual(H3ServeConnectionEnglish.RETURN_NAMES, ("connection",))
+
+        prompt = "integrated_multimodal_description: one shot"
+        with patch("h3serve_connector.nodes._run", return_value=("ok",)) as run:
+            result = H3ServeFL2VAPresetGenerateEnglish().generate_english(
+                connection={"server_url": "http://127.0.0.1:8090"},
+                prompt=prompt,
+                resolution="480p",
+                aspect_ratio="16:9",
+                duration_seconds=5.0,
+                sampling_steps=8,
+                acceleration=25.0,
+                model_variant="Base weights",
+                preview_mode="Off",
+                preview_step=6,
+                seed=4404,
+                checkpoint_job_id="",
+                checkpoint_action="New task",
+            )
+        self.assertEqual(result, ("ok",))
+        fields = run.call_args.args[1]
+        self.assertEqual(fields["prompt"], prompt)
+        self.assertEqual(fields["model_variant"], "base")
+        self.assertEqual(fields["preview_mode"], "off")
 
     def test_creator_preview_stops_at_formal_checkpoint(self):
         with patch(
@@ -216,21 +309,10 @@ class ClientTest(unittest.TestCase):
         ) as run_checkpoint, patch("h3serve_connector.nodes._run") as run_complete:
             result = H3ServeFL2VAPresetGenerate().generate(
                 连接={"server_url": "http://127.0.0.1:8090"},
-                prompt="one continuous shot",
-                resolution="720p",
-                aspect_ratio="16:9",
-                duration_seconds=5.0,
-                sampling_steps=12,
-                acceleration=50.0,
-                model_variant="原始权重",
-                preview_mode="开启",
-                seed=4404,
-                upscale="关闭",
-                预览位置=6,
-                预览分辨率="480p",
-                LoRA预览步数=4,
-                断点任务ID="",
-                断点动作="新建任务",
+                prompt="one continuous shot", resolution="720p", aspect_ratio="16:9",
+                duration_seconds=5.0, sampling_steps=12, acceleration=50.0,
+                model_variant="原始权重", preview_mode="开启", seed=4404,
+                预览位置=6, 断点任务ID="", 断点动作="新建任务",
             )
         self.assertEqual(result, (None, "preview"))
         run_complete.assert_not_called()
@@ -239,8 +321,25 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(fields["checkpoint_step"], 6)
         self.assertTrue(fields["checkpoint_retain"])
         self.assertTrue(fields["checkpoint_preview"])
-        self.assertEqual(fields["checkpoint_preview_resolution"], "480p")
+        self.assertNotIn("checkpoint_preview_resolution", fields)
+        self.assertNotIn("checkpoint_preview_steps", fields)
         self.assertEqual(fields["preview_mode"], "off")
+
+    def test_creator_preview_repairs_shifted_new_task_sentinel(self):
+        with patch(
+            "h3serve_connector.nodes._run_interactive_checkpoint",
+            return_value=(None, "preview"),
+        ) as run_checkpoint:
+            result = H3ServeFL2VAPresetGenerate().generate(
+                连接={"server_url": "http://127.0.0.1:8090"},
+                prompt="one continuous shot", resolution="720p",
+                aspect_ratio="16:9", duration_seconds=5.0,
+                sampling_steps=12, acceleration=50.0,
+                model_variant="原始权重", preview_mode="开启", seed=4404,
+                预览位置=6, 断点任务ID="新建任务", 断点动作="新建任务",
+            )
+        self.assertEqual(result, (None, "preview"))
+        run_checkpoint.assert_called_once()
 
     def test_creator_preview_resumes_existing_checkpoint_without_resubmitting(self):
         with patch(
@@ -249,18 +348,10 @@ class ClientTest(unittest.TestCase):
         ) as resume, patch("h3serve_connector.nodes._run_interactive_checkpoint") as submit:
             result = H3ServeFL2VAPresetGenerate().generate(
                 连接={"server_url": "http://127.0.0.1:8090"},
-                prompt="unchanged",
-                resolution="720p",
-                aspect_ratio="16:9",
-                duration_seconds=5.0,
-                sampling_steps=12,
-                acceleration=50.0,
-                model_variant="原始权重",
-                preview_mode="开启",
-                seed=4404,
-                upscale="关闭",
-                断点任务ID="job-checkpoint",
-                断点动作="继续生成",
+                prompt="unchanged", resolution="720p", aspect_ratio="16:9",
+                duration_seconds=5.0, sampling_steps=12, acceleration=50.0,
+                model_variant="原始权重", preview_mode="开启", seed=4404,
+                断点任务ID="job-checkpoint", 断点动作="继续生成",
             )
         self.assertEqual(result, ("final", "preview"))
         resume.assert_called_once_with(
@@ -288,7 +379,6 @@ class ClientTest(unittest.TestCase):
                 model_variant="原始权重",
                 preview_mode="关闭",
                 seed=4404,
-                upscale="关闭",
             )
         fields = run.call_args.args[1]
         self.assertEqual(fields["prompt"], prompt)
@@ -308,7 +398,6 @@ class ClientTest(unittest.TestCase):
                 model_variant="原始权重",
                 preview_mode="关闭",
                 seed=4404,
-                upscale="关闭",
             )
         fields = run.call_args.args[1]
         self.assertEqual(fields["prompt"], prompt)
@@ -378,7 +467,44 @@ class ClientTest(unittest.TestCase):
         workflow_dir = Path(__file__).parents[1] / "example_workflows"
         for workflow_path in workflow_dir.glob("H3_Serve_*.json"):
             workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
-            self.assertNotIn("SaveVideo", {node["type"] for node in workflow["nodes"]})
+            node_types = {node["type"] for node in workflow["nodes"]}
+            self.assertNotIn("SaveVideo", node_types)
+            english = workflow_path.stem.endswith("_EN")
+            second_type = (
+                "H3ServeSecondSamplingEnglish" if english
+                else "H3ServeSecondSampling"
+            )
+            creator_types = (
+                {
+                    "H3ServeFL2VAPresetGenerateEnglish",
+                    "H3ServeRef2VAPresetGenerateEnglish",
+                }
+                if english else
+                {
+                    "H3ServeFL2VAPresetGenerate",
+                    "H3ServeRef2VAPresetGenerate",
+                }
+            )
+            self.assertIn(second_type, node_types)
+            second = next(
+                node for node in workflow["nodes"]
+                if node["type"] == second_type
+            )
+            self.assertIsNotNone(second["inputs"][0]["link"])
+            self.assertIsNotNone(second["inputs"][1]["link"])
+            creator = next(
+                node for node in workflow["nodes"]
+                if node["type"] in creator_types
+            )
+            # OUTPUT_NODE inserts control_after_generate at index 9. Keep an
+            # explicit placeholder before the two hidden checkpoint widgets.
+            sentinel = "New task" if english else "新建任务"
+            self.assertEqual(creator["widgets_values"][9:], ["", "", sentinel])
+            if english:
+                self.assertEqual(creator["widgets_values"][5:7], ["Base weights", "Off"])
+                self.assertEqual(
+                    second["widgets_values"][2], "Standard · Denoise 0.20",
+                )
 
 
 if __name__ == "__main__":

@@ -1,4 +1,7 @@
 #settingsDialog {
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   font-size: 10px;
 }
 #settingsDialog .dialog-heading h3 { font-size: 14px; }
@@ -22,7 +25,10 @@
 #settingsDialog .submit-button.small { height: 38px; font-size: 10px; }
 
 .memory-settings,
+.lora-settings,
 .reference-media-settings,
+.checkpoint-preview-settings,
+.second-sampling-settings,
 .generation-limit-settings {
   margin: 20px 0 16px;
   padding: 16px;
@@ -30,7 +36,10 @@
   border-radius: 14px;
   background: rgba(3, 5, 9, .42);
 }
+.lora-settings,
 .reference-media-settings,
+.checkpoint-preview-settings,
+.second-sampling-settings,
 .generation-limit-settings { margin-bottom: 0; }
 .settings-inline-grid {
   display: grid;
@@ -38,12 +47,47 @@
   gap: 9px;
 }
 .settings-inline-grid .field { margin: 0; }
+.lora-settings > p,
 .reference-media-settings > p,
+.checkpoint-preview-settings > p,
+.second-sampling-settings > p,
 .generation-limit-settings > p {
   margin: 10px 0 0 !important;
   color: var(--muted);
   font-size: 8px;
   line-height: 1.55;
+}
+.second-sampling-settings .field { margin: 0; }
+.second-sampling-settings input[type="range"] { accent-color: #ff8258; }
+
+.compact-second-sampling-dialog {
+  width: min(390px, calc(100% - 30px));
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  padding: 18px;
+  font-size: 10px;
+}
+.compact-second-sampling-dialog .dialog-heading { margin-bottom: 10px; }
+.compact-second-sampling-dialog .dialog-heading h3 { font-size: 14px; }
+.compact-second-sampling-dialog .dialog-heading button { font-size: 18px; }
+.compact-second-sampling-dialog .field > span {
+  margin-bottom: 6px;
+  font-size: 9px;
+}
+.compact-second-sampling-dialog .field input,
+.compact-second-sampling-dialog .field select {
+  height: 36px;
+  font-size: 10px;
+}
+.compact-second-sampling-dialog .field > small,
+.compact-second-sampling-dialog p {
+  font-size: 8px;
+  line-height: 1.45;
+}
+.compact-second-sampling-dialog .settings-inline-grid { gap: 8px; }
+.compact-second-sampling-dialog .submit-button.small {
+  height: 38px;
+  font-size: 10px;
 }
 .memory-settings-head {
   display: flex;
@@ -53,6 +97,10 @@
 }
 .memory-settings-head span { font-size: 9px; font-weight: 800; }
 .memory-settings-head b { color: #91c7ff; font-size: 8px; font-weight: 650; }
+.lora-settings-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:9px; align-items:end; }
+.lora-settings-row .field { margin:0; min-width:0; }
+.lora-settings-row button { height:36px; white-space:nowrap; }
+.lora-settings select option:disabled { color:#777; }
 .generation-limit-editor { display:grid; gap:7px; overflow-x:auto; }
 .generation-limit-head,
 .generation-limit-editor section { display:grid; grid-template-columns:52px repeat(5,minmax(92px,1fr)); gap:7px; align-items:center; }
@@ -105,6 +153,7 @@
 }
 @media (max-width: 620px) {
   .settings-inline-grid { grid-template-columns: 1fr; }
+  .lora-settings-row { grid-template-columns:1fr; }
   .generation-limit-head,
   .generation-limit-editor section { grid-template-columns:44px repeat(5,92px); }
 }

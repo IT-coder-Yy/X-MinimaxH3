@@ -6,8 +6,11 @@ generator; the remaining graph and pipeline boundaries are documented.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+import json
 from collections.abc import Mapping
-from typing import Protocol
+from typing import Callable, Iterator, Protocol
 
 import torch
 import torch.nn as nn
@@ -27,21 +30,68 @@ from .lora import (
     LowRankUpdate,
     PrunedCurveAdaLN,
     RuntimeLoRALinear,
+    SlicedLowRankUpdate,
     interpolate_curve,
 )
-from .quantization import ConvRotInt8Linear, Int8Kernel
+
+
+_block_cancel_check: ContextVar[Callable[[], None] | None] = ContextVar(
+    "h3_block_cancel_check", default=None
+)
+
+
+@contextmanager
+def block_cancellation(check: Callable[[], None]) -> Iterator[None]:
+    """Expose cancellation inside long DiT calls at safe layer boundaries."""
+
+    token = _block_cancel_check.set(check)
+    try:
+        yield
+    finally:
+        _block_cancel_check.reset(token)
+
+
+def _raise_if_block_cancelled() -> None:
+    check = _block_cancel_check.get()
+    if check is not None:
+        check()
+
+
+from .quantization import (
+    ConvRotInt8Linear,
+    ConvRotW4A8Linear,
+    Int8Kernel,
+    W4A8Kernel,
+    W4A8QuantSpec,
+)
 
 
 class TensorSource(Protocol):
     def tensor(self, key: str) -> torch.Tensor: ...
 
+    def has_tensor(self, key: str) -> bool: ...
+
+    def quantization_spec(self, prefix: str) -> Mapping[str, object] | None: ...
+
 
 class MappingTensorSource:
-    def __init__(self, state: Mapping[str, torch.Tensor]) -> None:
+    def __init__(
+        self,
+        state: Mapping[str, torch.Tensor],
+        *,
+        quantization_metadata: Mapping[str, Mapping[str, object]] | None = None,
+    ) -> None:
         self.state = state
+        self._quantization_metadata = dict(quantization_metadata or {})
 
     def tensor(self, key: str) -> torch.Tensor:
         return self.state[key]
+
+    def has_tensor(self, key: str) -> bool:
+        return key in self.state
+
+    def quantization_spec(self, prefix: str) -> Mapping[str, object] | None:
+        return self._quantization_metadata.get(prefix)
 
 
 class SafeTensorSource:
@@ -50,6 +100,8 @@ class SafeTensorSource:
     def __init__(self, path: str) -> None:
         self.path = path
         self._reader = None
+        self._keys: set[str] = set()
+        self._quantization_metadata: dict[str, Mapping[str, object]] = {}
 
     def __enter__(self) -> "SafeTensorSource":
         try:
@@ -58,17 +110,47 @@ class SafeTensorSource:
             raise RuntimeError("safetensors is required to load H3 weights") from error
         self._reader = safe_open(self.path, framework="pt", device="cpu")
         self._reader.__enter__()
+        self._keys = set(self._reader.keys())
+        metadata = self._reader.metadata() or {}
+        raw_quantization = metadata.get("_quantization_metadata")
+        if raw_quantization:
+            try:
+                decoded = json.loads(raw_quantization)
+                layers = decoded.get("layers", {})
+                if not isinstance(layers, Mapping):
+                    raise TypeError("layers must be a mapping")
+                self._quantization_metadata = {
+                    str(name): dict(spec)
+                    for name, spec in layers.items()
+                    if isinstance(spec, Mapping)
+                }
+            except (json.JSONDecodeError, TypeError, ValueError) as error:
+                raise ValueError(
+                    "invalid safetensors _quantization_metadata"
+                ) from error
         return self
 
     def __exit__(self, *args) -> None:
         assert self._reader is not None
         self._reader.__exit__(*args)
         self._reader = None
+        self._keys.clear()
+        self._quantization_metadata.clear()
 
     def tensor(self, key: str) -> torch.Tensor:
         if self._reader is None:
             raise RuntimeError("SafeTensorSource must be used as a context manager")
         return self._reader.get_tensor(key)
+
+    def has_tensor(self, key: str) -> bool:
+        if self._reader is None:
+            raise RuntimeError("SafeTensorSource must be used as a context manager")
+        return key in self._keys
+
+    def quantization_spec(self, prefix: str) -> Mapping[str, object] | None:
+        if self._reader is None:
+            raise RuntimeError("SafeTensorSource must be used as a context manager")
+        return self._quantization_metadata.get(prefix)
 
 
 class FrozenLinear(nn.Module):
@@ -86,16 +168,63 @@ def _quant_linear(
     prefix: str,
     *,
     device: torch.device | str,
-    kernel: Int8Kernel | None,
+    int8_kernel: Int8Kernel | None,
+    w4a8_kernel: W4A8Kernel | None,
     output_dtype: torch.dtype,
-) -> ConvRotInt8Linear:
-    state = {
-        f"{prefix}.weight": source.tensor(f"{prefix}.weight").to(device),
-        f"{prefix}.weight_scale": source.tensor(f"{prefix}.weight_scale").to(device),
-        f"{prefix}.comfy_quant": source.tensor(f"{prefix}.comfy_quant"),
-    }
-    return ConvRotInt8Linear.from_state_dict(
-        state, prefix, kernel=kernel, output_dtype=output_dtype
+) -> nn.Module:
+    if source.has_tensor(f"{prefix}.weight_scale"):
+        state = {
+            f"{prefix}.weight": source.tensor(f"{prefix}.weight").to(device),
+            f"{prefix}.weight_scale": source.tensor(
+                f"{prefix}.weight_scale"
+            ).to(device),
+            f"{prefix}.comfy_quant": source.tensor(f"{prefix}.comfy_quant"),
+        }
+        return ConvRotInt8Linear.from_state_dict(
+            state, prefix, kernel=int8_kernel, output_dtype=output_dtype
+        )
+
+    required = (
+        f"{prefix}.weight_s_rel",
+        f"{prefix}.weight_s_channel",
+    )
+    if not all(source.has_tensor(key) for key in required):
+        raise KeyError(
+            f"quantized layer {prefix!r} is neither ConvRot INT8 nor W4A8"
+        )
+    raw_spec = source.quantization_spec(prefix)
+    if raw_spec is None:
+        # Mapping-backed unit tests can omit file-level safetensors metadata;
+        # physical W4 tensor names still have one unambiguous H3 layout.
+        raw_spec = {
+            "format": "asym_w4a8_int8",
+            "group_size": 16,
+            "convrot": True,
+            "convrot_groupsize": 256,
+        }
+    spec = W4A8QuantSpec.from_mapping(raw_spec)
+    return ConvRotW4A8Linear(
+        source.tensor(f"{prefix}.weight").to(device),
+        source.tensor(f"{prefix}.weight_s_rel").to(device),
+        source.tensor(f"{prefix}.weight_s_channel").to(device),
+        codebook=(
+            source.tensor(f"{prefix}.weight_codebook").to(device)
+            if source.has_tensor(f"{prefix}.weight_codebook")
+            else None
+        ),
+        correction=(
+            source.tensor(f"{prefix}.weight_correction").to(device)
+            if source.has_tensor(f"{prefix}.weight_correction")
+            else None
+        ),
+        bias=(
+            source.tensor(f"{prefix}.bias").to(device)
+            if source.has_tensor(f"{prefix}.bias")
+            else None
+        ),
+        spec=spec,
+        kernel=w4a8_kernel,
+        output_dtype=output_dtype,
     )
 
 
@@ -135,8 +264,9 @@ def assemble_pruned_block(
     device: torch.device | str = "cpu",
     compute_dtype: torch.dtype = torch.bfloat16,
     int8_kernel: Int8Kernel | None = None,
+    w4a8_kernel: W4A8Kernel | None = None,
     attention_backend: AttentionBackend = torch_sdpa,
-    lora_updates: Mapping[str, LowRankUpdate] | None = None,
+    lora_updates: Mapping[str, LowRankUpdate | SlicedLowRankUpdate] | None = None,
 ) -> H3TransformerBlock:
     """Load one block, which is the seam needed by block-wise offload."""
 
@@ -151,7 +281,8 @@ def assemble_pruned_block(
             source,
             module_name,
             device=device,
-            kernel=int8_kernel,
+            int8_kernel=int8_kernel,
+            w4a8_kernel=w4a8_kernel,
             output_dtype=compute_dtype,
         )
         update = updates.get(module_name)
@@ -278,6 +409,7 @@ class H3BlockStack(nn.Module):
             from .kernels import attention_layer
 
             for layer_index, block in enumerate(self.blocks[start:stop], start=start):
+                _raise_if_block_cancelled()
                 with attention_layer(layer_index):
                     value = block(
                         value,
@@ -297,6 +429,7 @@ class H3BlockStack(nn.Module):
         for layer_index, block in enumerate(
             self.blocks[start:resident_stop], start=start
         ):
+            _raise_if_block_cancelled()
             with attention_layer(layer_index):
                 value = block(
                     value,
@@ -318,6 +451,7 @@ class H3BlockStack(nn.Module):
         }
 
         def run_block(index, buffer, hidden, inputs):
+            _raise_if_block_cancelled()
             with attention_layer(index):
                 return buffer.module(hidden, **inputs)
 
@@ -369,6 +503,7 @@ class H3BlockStack(nn.Module):
         )
 
         def run_one(layer_index, block, hidden):
+            _raise_if_block_cancelled()
             with attention_layer(layer_index):
                 layer_active = (
                     active_video_indices is not None
@@ -420,6 +555,7 @@ class H3BlockStack(nn.Module):
         }
 
         def run_block(index, buffer, hidden, inputs):
+            _raise_if_block_cancelled()
             with attention_layer(index):
                 active = inputs["active_video_indices"]
                 layer_active = (
@@ -465,8 +601,9 @@ def assemble_pruned_block_stack(
     device: torch.device | str = "cpu",
     compute_dtype: torch.dtype = torch.bfloat16,
     int8_kernel: Int8Kernel | None = None,
+    w4a8_kernel: W4A8Kernel | None = None,
     attention_backend: AttentionBackend = torch_sdpa,
-    lora_updates: Mapping[str, LowRankUpdate] | None = None,
+    lora_updates: Mapping[str, LowRankUpdate | SlicedLowRankUpdate] | None = None,
     full_silu_curve: torch.Tensor | None = None,
 ) -> H3BlockStack:
     """Assemble on CPU for 24 GB plans; direct all-CUDA assembly will OOM."""
@@ -483,6 +620,7 @@ def assemble_pruned_block_stack(
             device=device,
             compute_dtype=compute_dtype,
             int8_kernel=int8_kernel,
+            w4a8_kernel=w4a8_kernel,
             attention_backend=attention_backend,
             lora_updates=lora_updates,
         )
@@ -502,7 +640,7 @@ def assemble_token_refiner(
     device: torch.device | str = "cpu",
     compute_dtype: torch.dtype = torch.bfloat16,
     attention_backend: AttentionBackend = torch_sdpa,
-    lora_updates: Mapping[str, LowRankUpdate] | None = None,
+    lora_updates: Mapping[str, LowRankUpdate | SlicedLowRankUpdate] | None = None,
 ):
     from .dit import H3TokenRefiner, H3TokenRefinerBlock
     from .layers import RMSNorm
@@ -565,8 +703,9 @@ def assemble_full_pruned_dit(
     device: torch.device | str = "cpu",
     compute_dtype: torch.dtype = torch.bfloat16,
     int8_kernel: Int8Kernel | None = None,
+    w4a8_kernel: W4A8Kernel | None = None,
     attention_backend: AttentionBackend = torch_sdpa,
-    lora_updates: Mapping[str, LowRankUpdate] | None = None,
+    lora_updates: Mapping[str, LowRankUpdate | SlicedLowRankUpdate] | None = None,
     full_silu_curve: torch.Tensor | None = None,
 ):
     """Assemble the complete pruned DiT graph, but no encoder/VAE/scheduler."""
@@ -581,6 +720,7 @@ def assemble_full_pruned_dit(
         device=device,
         compute_dtype=compute_dtype,
         int8_kernel=int8_kernel,
+        w4a8_kernel=w4a8_kernel,
         attention_backend=attention_backend,
         lora_updates=updates,
         full_silu_curve=full_silu_curve,

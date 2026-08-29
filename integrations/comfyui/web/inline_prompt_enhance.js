@@ -55,6 +55,17 @@ function bindPreviewControls(node) {
     const controlled = ["预览位置", "预览分辨率", "LoRA预览步数"];
     const jobId = widget(node, "断点任务ID");
     const action = widget(node, "断点动作");
+    const stateSentinels = new Set([
+        "新建任务", "等待选择", "继续生成", "放弃生成",
+    ]);
+    if (jobId && stateSentinels.has(String(jobId.value || ""))) {
+        // Repair workflows saved before the OUTPUT_NODE
+        // control_after_generate placeholder was represented explicitly.
+        jobId.value = "";
+    }
+    if (action && !stateSentinels.has(String(action.value || ""))) {
+        action.value = "新建任务";
+    }
     if (jobId) setWidgetVisible(node, "断点任务ID", false);
     if (action) setWidgetVisible(node, "断点动作", false);
 

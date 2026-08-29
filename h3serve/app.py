@@ -28,8 +28,12 @@ from .config import ServicePaths
 from .contract import (
     ContractError, DEFAULT_REFERENCE_IMAGE_RESOLUTION,
     DEFAULT_REFERENCE_VIDEO_RESOLUTION, ENGINES, REFERENCE_MEDIA_RESOLUTIONS,
-    SERVICE_FAMILIES, GenerationSpec, default_quality, engine_family,
-    engine_variant, resolve_engine, public_options,
+    SERVICE_FAMILIES, MODEL_LAUNCHERS, LEGACY_MODEL_LAUNCHERS,
+    GenerationSpec, SecondSamplingSpec,
+    default_quality, engine_family, engine_variant, launcher_family,
+    launcher_vram_profile, launcher_weight_tier, normalize_launcher,
+    resolve_engine, resolve_launcher,
+    public_options,
 )
 from .models import model_status
 from .openapi import document as openapi_document
@@ -44,7 +48,7 @@ from .memory_policy import (
 )
 from .prompt_enhancer import MiMoPromptEnhancer, parse_enhancement_request
 from .resources import ResourceMonitor
-from .upscaler import FlashVSRUpscaler
+from .upscaler import RetiredFlashVSRUpscaler
 from .workspace import WorkspaceController, WorkspaceLayout
 from .generation_limits import (
     GenerationLimitPolicy,
@@ -52,6 +56,8 @@ from .generation_limits import (
     load_generation_limit_policy,
     persist_generation_limit_policy,
 )
+from .deployment_profiles import LAUNCHER_DEFINITIONS
+from .lora_registry import resolve_lora_profile
 
 
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
@@ -72,6 +78,7 @@ AUDIO_MIME_BY_SUFFIX = {
     ".wav": "audio/wav", ".mp3": "audio/mpeg", ".flac": "audio/flac",
     ".m4a": "audio/mp4", ".ogg": "audio/ogg", ".opus": "audio/ogg",
 }
+CHECKPOINT_PREVIEW_SETTING_RESOLUTIONS = ("360p", "480p", "720p")
 
 
 def _mimo_key_path(data_dir: Path) -> Path:
@@ -157,6 +164,138 @@ def _persist_reference_media_settings(
     try:
         temporary.write_text(
             json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _checkpoint_preview_settings_path(data_dir: Path) -> Path:
+    return data_dir / "settings" / "checkpoint_preview.json"
+
+
+def _default_checkpoint_preview_settings() -> dict[str, Any]:
+    return {"steps": 4, "resolution": "360p"}
+
+
+def _load_checkpoint_preview_settings(data_dir: Path) -> dict[str, Any]:
+    defaults = _default_checkpoint_preview_settings()
+    try:
+        document = json.loads(
+            _checkpoint_preview_settings_path(data_dir).read_text(encoding="utf-8")
+        )
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return defaults
+    if not isinstance(document, dict):
+        return defaults
+    try:
+        steps = int(document.get("steps", defaults["steps"]))
+    except (TypeError, ValueError):
+        steps = int(defaults["steps"])
+    if not 1 <= steps <= 8:
+        steps = int(defaults["steps"])
+    resolution = str(
+        document.get("resolution", defaults["resolution"])
+    ).strip().lower()
+    if resolution not in CHECKPOINT_PREVIEW_SETTING_RESOLUTIONS:
+        resolution = str(defaults["resolution"])
+    return {"steps": steps, "resolution": resolution}
+
+
+def _persist_checkpoint_preview_settings(
+    data_dir: Path,
+    settings: dict[str, Any],
+) -> None:
+    path = _checkpoint_preview_settings_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+DEFAULT_LORA_CHECKPOINT = "minimax_h3_turbo_v4_step600_ema.safetensors"
+
+
+def _lora_settings_path(data_dir: Path) -> Path:
+    return data_dir / "settings" / "lora.json"
+
+
+def _discover_lora_checkpoints(model_dir: Path) -> list[dict[str, Any]]:
+    """Return safe, header-validated H3 LoRAs installed under models/loras."""
+
+    root = (model_dir / "loras").absolute()
+    if not root.is_dir():
+        return []
+    discovered: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*.safetensors")):
+        if not path.is_file():
+            continue
+        relative = path.absolute().relative_to(root).as_posix()
+        compatible = False
+        pair_count = 0
+        base_model = None
+        try:
+            from safetensors import safe_open
+
+            with safe_open(str(path), framework="pt", device="cpu") as checkpoint:
+                keys = set(checkpoint.keys())
+                suffix = ".lora_A.weight"
+                native = [
+                    key for key in keys
+                    if key.startswith("blocks.")
+                    and key.endswith(suffix)
+                    and f"{key[:-len(suffix)]}.lora_B.weight" in keys
+                ]
+                metadata = checkpoint.metadata() or {}
+                base_model = metadata.get("base_model")
+                diffusers_suffix = ".lora_A.default.weight"
+                diffusers = [
+                    key for key in keys
+                    if key.endswith(diffusers_suffix)
+                    and f"{key[:-len(diffusers_suffix)]}.lora_B.default.weight" in keys
+                ]
+                pair_count = len(native) if native else len(diffusers)
+                compatible = bool(native) or len(diffusers) == 312
+        except Exception:
+            compatible = False
+        profile = resolve_lora_profile(path)
+        discovered.append({
+            "id": relative,
+            "filename": path.name,
+            "bytes": path.stat().st_size,
+            "compatible": compatible,
+            "pair_count": pair_count,
+            "base_model": base_model,
+            "profile": profile.public_dict(),
+        })
+    return discovered
+
+
+def _load_lora_selection(data_dir: Path) -> str:
+    try:
+        document = json.loads(
+            _lora_settings_path(data_dir).read_text(encoding="utf-8")
+        )
+        return str(document.get("checkpoint", "")).strip()
+    except (FileNotFoundError, OSError, AttributeError, json.JSONDecodeError):
+        return ""
+
+
+def _persist_lora_selection(data_dir: Path, checkpoint: str) -> None:
+    path = _lora_settings_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps({"checkpoint": checkpoint}, ensure_ascii=False, indent=2)
+            + "\n",
             encoding="utf-8",
         )
         os.replace(temporary, path)
@@ -281,6 +420,10 @@ class JobRecord:
     upscale_peak_allocated_mib: float | None = None
     upscale_peak_reserved_mib: float | None = None
     output_path: Path | None = None
+    final_latents_path: Path | None = None
+    source_job_id: str | None = None
+    source_latents_path: Path | None = None
+    second_sampling: SecondSamplingSpec | None = None
     preview_path: Path | None = None
     preview_decision: str | None = None
     checkpoint_path: Path | None = None
@@ -354,6 +497,27 @@ class JobRecord:
         if self.output_path is not None:
             result["video_url"] = f"/api/v1/jobs/{self.id}/video"
             result["download_name"] = self.output_path.name
+        launcher = LAUNCHER_DEFINITIONS.get(self.spec.runtime_launcher)
+        latent_ready = bool(
+            self.status == "succeeded"
+            and self.final_latents_path is not None
+            and self.final_latents_path.is_file()
+            and launcher is not None
+            and launcher.backend.second_sampling_levels
+        )
+        result["second_sampling_available"] = latent_ready
+        if self.second_sampling is not None:
+            public_second_sampling = self.second_sampling.to_dict()
+            if public_second_sampling["resolution"] == "2k":
+                public_second_sampling["resolution"] = "1440p"
+            result["second_sampling"] = {
+                **public_second_sampling,
+                "source_job_id": self.source_job_id,
+                "source_latent_available": bool(
+                    self.source_latents_path is not None
+                    and self.source_latents_path.is_file()
+                ),
+            }
         if self.preview_path is not None:
             result["preview"] = {
                 "ready": self.preview_path.is_file(),
@@ -367,7 +531,7 @@ class JobRecord:
                 "total_steps": self.checkpoint_total_steps,
                 "retained": self.checkpoint_retained,
                 "resume_available": bool(
-                    self.status == "checkpointed"
+                    self.status in {"checkpointed", "failed"}
                     and self.checkpoint_retained
                     and self.checkpoint_path is not None
                     and self.checkpoint_path.is_file()
@@ -433,9 +597,14 @@ class JobService:
         for path in sorted((self.data_dir / "jobs").glob("*.json")):
             try:
                 document = json.loads(path.read_text(encoding="utf-8"))
-                request = document.get("_internal", {}).get("spec", document["request"])
-                spec = GenerationSpec.from_mapping(request)
                 internal = document.get("_internal", {})
+                request = internal.get("spec", document["request"])
+                spec = GenerationSpec.from_mapping(
+                    request,
+                    allow_second_sampling_target=isinstance(
+                        internal.get("second_sampling"), dict
+                    ),
+                )
 
                 def optional_path(name: str) -> Path | None:
                     value = internal.get(name)
@@ -483,6 +652,14 @@ class JobService:
                         "upscale_peak_reserved_mib"
                     ),
                     output_path=optional_path("output_path"),
+                    final_latents_path=optional_path("final_latents_path"),
+                    source_job_id=internal.get("source_job_id"),
+                    source_latents_path=optional_path("source_latents_path"),
+                    second_sampling=(
+                        SecondSamplingSpec(**internal["second_sampling"])
+                        if isinstance(internal.get("second_sampling"), dict)
+                        else None
+                    ),
                     preview_path=optional_path("preview_path"),
                     preview_decision=internal.get("preview_decision"),
                     checkpoint_path=optional_path("checkpoint_path"),
@@ -616,6 +793,16 @@ class JobService:
             "backend_prompt_id": job.backend_prompt_id,
             "runtime_key": job.runtime_key,
             "output_path": str(job.output_path) if job.output_path else None,
+            "final_latents_path": (
+                str(job.final_latents_path) if job.final_latents_path else None
+            ),
+            "source_job_id": job.source_job_id,
+            "source_latents_path": (
+                str(job.source_latents_path) if job.source_latents_path else None
+            ),
+            "second_sampling": (
+                job.second_sampling.to_dict() if job.second_sampling else None
+            ),
             "preview_path": str(job.preview_path) if job.preview_path else None,
             "preview_decision": job.preview_decision,
             "checkpoint_path": str(job.checkpoint_path) if job.checkpoint_path else None,
@@ -686,6 +873,116 @@ class JobService:
             ),
         )
         job.estimated_total_seconds = self._estimate_total(spec, job.condition_mode)
+        job.estimated_remaining_seconds = job.estimated_total_seconds
+        self.jobs[job_id] = job
+        self.cancel_events[job_id] = asyncio.Event()
+        self.preview_controls[job_id] = PreviewControl()
+        async with self.queue_changed:
+            self.pending.append(job_id)
+            self.queue_changed.notify()
+        self.persist(job)
+        return job
+
+    async def submit_second_sampling(
+        self,
+        source: JobRecord,
+        second_sampling: SecondSamplingSpec,
+    ) -> JobRecord:
+        """Queue a new H3 low-noise pass from one completed card latent."""
+
+        if len(self.pending) >= self.max_queued_jobs:
+            raise ContractError("generation queue is full; try again later")
+        if source.status != "succeeded":
+            raise ContractError("second sampling requires a completed source job")
+        if (
+            source.final_latents_path is None
+            or not source.final_latents_path.is_file()
+        ):
+            raise ContractError(
+                "this card has no retained H3 latent; generate a new card first"
+            )
+
+        job_id = str(uuid.uuid4())
+        upload_dir = self.data_dir / "uploads" / job_id
+        upload_dir.mkdir(parents=True, exist_ok=True)
+
+        def clone(path: Path | None, role: str) -> Path | None:
+            if path is None:
+                return None
+            if not path.is_file():
+                raise ContractError(f"source conditioning file is missing: {role}")
+            target = upload_dir / f"{role}{path.suffix.lower()}"
+            shutil.copy2(path, target)
+            return target
+
+        first_frame = clone(source.first_frame, "first_frame")
+        last_frame = clone(source.last_frame, "last_frame")
+        reference_images = tuple(
+            clone(path, f"reference_image_{index}")
+            for index, path in enumerate(source.reference_images, start=1)
+        )
+        reference_videos = tuple(
+            clone(path, f"reference_video_{index}")
+            for index, path in enumerate(source.reference_videos, start=1)
+        )
+        reference_audios = tuple(
+            clone(path, f"reference_audio_{index}")
+            for index, path in enumerate(source.reference_audios, start=1)
+        )
+
+        target_spec = dataclasses.replace(
+            source.spec,
+            engine=resolve_engine(
+                source.spec.service_family,
+                "base",
+            ),
+            resolution=second_sampling.resolution,
+            width=second_sampling.width,
+            height=second_sampling.height,
+            advanced=True,
+            # Keep the persisted GenerationSpec independently valid.  The
+            # second-pass solver still takes its real one-to-eight step count
+            # exclusively from SecondSamplingSpec below.
+            custom_actual_steps=20,
+            custom_lora_steps=None,
+            sampling_steps=None,
+            acceleration=None,
+            memory_mode=second_sampling.memory_mode,
+            upscale_enabled=False,
+            upscale_resolution=None,
+            upscale_target_width=None,
+            upscale_target_height=None,
+            preview_mode="off",
+            preview_step_index=None,
+            preview_fast_finish=False,
+            execution_mode="complete",
+            checkpoint_step=None,
+            checkpoint_preview=False,
+        )
+        job = JobRecord(
+            id=job_id,
+            spec=target_spec,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            reference_images=reference_images,
+            reference_videos=reference_videos,
+            reference_audios=reference_audios,
+            source_job_id=source.id,
+            source_latents_path=source.final_latents_path.resolve(),
+            second_sampling=second_sampling,
+            pending_action="second_sampling",
+            progress_detail="H3二次采样已加入队列",
+        )
+        megapixel_frames = (
+            second_sampling.width
+            * second_sampling.height
+            * source.spec.frames
+            / 1_000_000
+        )
+        job.estimated_total_seconds = round(
+            max(8.0, 10.0 + 0.14 * megapixel_frames * second_sampling.steps),
+            1,
+        )
         job.estimated_remaining_seconds = job.estimated_total_seconds
         self.jobs[job_id] = job
         self.cancel_events[job_id] = asyncio.Event()
@@ -794,6 +1091,15 @@ class JobService:
                     self.pending.remove(job_id)
                 self.queue_changed.notify()
             self.persist(job)
+        else:
+            # CUDA kernels are not safely pre-emptible, but the native DiT
+            # checks this event at every layer boundary. Reflect acceptance
+            # immediately instead of leaving the UI looking unresponsive.
+            job.updated_at = time.time()
+            job.progress_stage = "cancelling"
+            job.progress_detail = "正在取消；等待当前 GPU 算子结束"
+            job.estimated_remaining_seconds = None
+            self.persist(job)
         return job
 
     async def reorder(self, ordered_ids: list[str]) -> None:
@@ -807,7 +1113,10 @@ class JobService:
 
     async def resume(self, job_id: str) -> JobRecord:
         job = self.jobs[job_id]
-        if job.status != "checkpointed":
+        # A failed resume does not mutate or consume the retained formal
+        # checkpoint.  Keep it retryable after a backend fix/restart instead
+        # of forcing the user to recompute the expensive prefix.
+        if job.status not in {"checkpointed", "failed"}:
             raise ContractError("job is not stopped at a checkpoint")
         if (
             not job.checkpoint_retained
@@ -830,6 +1139,68 @@ class JobService:
         self.persist(job)
         return job
 
+    async def clear_latent_cache(self) -> dict[str, int]:
+        """Remove only reproducible AV latent artifacts from this workspace.
+
+        Videos, uploads and job history remain untouched.  Refuse while work
+        is active so a queued or running second pass can never lose its source
+        tensor mid-flight.  Formal checkpoint tensors are included because
+        they back the console's disposable checkpoint-preview/resume path.
+        """
+
+        if any(
+            job.status in {
+                "queued", "starting_backend", "running", "awaiting_preview"
+            }
+            for job in self.jobs.values()
+        ):
+            raise ContractError(
+                "wait for or cancel active jobs before clearing latent cache"
+            )
+        if self.output_root is None:
+            raise ContractError("this workspace has no managed output root")
+        latent_root = (self.output_root / ".h3-latents").resolve()
+        latent_root.mkdir(parents=True, exist_ok=True)
+        checkpoint_root = (self.data_dir / "checkpoints").resolve()
+        checkpoint_root.mkdir(parents=True, exist_ok=True)
+        removed_files = 0
+        removed_bytes = 0
+        removed_checkpoint_files = 0
+        for root, is_checkpoint in (
+            (latent_root, False),
+            (checkpoint_root, True),
+        ):
+            for path in tuple(root.glob("*.pt")):
+                candidate = path.resolve()
+                if not candidate.is_relative_to(root) or not candidate.is_file():
+                    continue
+                removed_bytes += candidate.stat().st_size
+                candidate.unlink()
+                removed_files += 1
+                removed_checkpoint_files += int(is_checkpoint)
+        affected_jobs = 0
+        for job in self.jobs.values():
+            changed = False
+            if job.final_latents_path is not None:
+                job.final_latents_path = None
+                changed = True
+            if job.source_latents_path is not None:
+                job.source_latents_path = None
+                changed = True
+            if job.checkpoint_path is not None:
+                job.checkpoint_path = None
+                job.checkpoint_retained = False
+                changed = True
+            if changed:
+                affected_jobs += 1
+                self.persist(job)
+        return {
+            "removed_files": removed_files,
+            "removed_checkpoint_files": removed_checkpoint_files,
+            "removed_bytes": removed_bytes,
+            "affected_jobs": affected_jobs,
+        }
+
     async def delete(self, job_id: str) -> dict[str, bool]:
         """Delete a job and any output owned by the configured output root.
 
@@ -844,9 +1215,18 @@ class JobService:
             raise ContractError("cancel the running job before deleting it")
         if job.status == "queued":
             await self.cancel(job_id)
+        if any(
+            child.source_job_id == job.id
+            and child.status in {"queued", "starting_backend", "running"}
+            for child in self.jobs.values()
+        ):
+            raise ContractError(
+                "wait for the active second-sampling child before deleting its source"
+            )
         resolved_output = None
         resolved_preview = None
         resolved_checkpoint = None
+        resolved_latents = None
         output_retained = False
         if job.output_path is not None and job.output_path.is_file():
             candidate = job.output_path.resolve()
@@ -867,6 +1247,12 @@ class JobService:
             checkpoint_root = (self.data_dir / "checkpoints").resolve()
             if candidate_checkpoint.is_relative_to(checkpoint_root):
                 resolved_checkpoint = candidate_checkpoint
+        if job.final_latents_path is not None and job.final_latents_path.is_file():
+            candidate_latents = job.final_latents_path.resolve()
+            if self.output_root is not None and candidate_latents.is_relative_to(
+                (self.output_root / ".h3-latents").resolve()
+            ):
+                resolved_latents = candidate_latents
         async with self.queue_changed:
             if job_id in self.pending:
                 self.pending.remove(job_id)
@@ -881,11 +1267,14 @@ class JobService:
             resolved_preview.unlink()
         if resolved_checkpoint is not None:
             resolved_checkpoint.unlink()
+        if resolved_latents is not None:
+            resolved_latents.unlink()
         return {
             "output_deleted": resolved_output is not None,
             "preview_deleted": resolved_preview is not None,
             "output_retained": output_retained,
             "checkpoint_deleted": resolved_checkpoint is not None,
+            "latents_deleted": resolved_latents is not None,
         }
 
     async def decide_preview(self, job_id: str, decision: str) -> JobRecord:
@@ -1004,36 +1393,60 @@ class JobService:
                         return "discard"
                 return preview_control.decision or "discard"
 
-            generate_args = (
-                job.spec,
-                job.id,
-                job.first_frame,
-                job.last_frame,
-                job.reference_images,
-                job.reference_videos,
-                job.reference_audios,
-                cancel_event,
-                self._progress_callback(
-                    job, scale=0.84 if job.spec.upscale_enabled else 1.0
-                ),
+            progress_callback = self._progress_callback(
+                job, scale=0.84 if job.spec.upscale_enabled else 1.0
             )
-            # Do not force legacy/testing backend adapters to understand the
-            # preview callbacks when the feature is disabled.
-            preview_kwargs: dict[str, Any] = {}
-            if job.spec.preview_mode != "off":
-                preview_kwargs["preview_ready_callback"] = preview_ready
-                preview_kwargs["preview_decision_wait"] = (
-                    wait_preview_decision
-                    if job.spec.preview_mode == "pause" else None
+            if action == "second_sampling":
+                if job.second_sampling is None or job.source_latents_path is None:
+                    raise RuntimeError("second-sampling job is missing its source contract")
+                second_sample = getattr(self.backend, "second_sample", None)
+                if not callable(second_sample):
+                    raise RuntimeError("the active backend does not support H3 second sampling")
+                job.progress_stage = "second_sampling"
+                job.progress_detail = "正在执行H3高分辨率二次采样"
+                self.persist(job)
+                result = await second_sample(
+                    job.spec,
+                    job.second_sampling,
+                    job.source_latents_path,
+                    job.id,
+                    job.first_frame,
+                    job.last_frame,
+                    job.reference_images,
+                    job.reference_videos,
+                    job.reference_audios,
+                    cancel_event,
+                    progress_callback,
                 )
-            if job.spec.execution_mode == "checkpoint":
-                if action == "resume":
-                    preview_kwargs["resume_checkpoint_path"] = job.checkpoint_path
-                else:
-                    preview_kwargs["checkpoint_path"] = (
-                        self.data_dir / "checkpoints" / f"{job.id}.pt"
+            else:
+                generate_args = (
+                    job.spec,
+                    job.id,
+                    job.first_frame,
+                    job.last_frame,
+                    job.reference_images,
+                    job.reference_videos,
+                    job.reference_audios,
+                    cancel_event,
+                    progress_callback,
+                )
+                # Do not force legacy/testing backend adapters to understand the
+                # preview callbacks when the feature is disabled.
+                preview_kwargs: dict[str, Any] = {}
+                if job.spec.preview_mode != "off":
+                    preview_kwargs["preview_ready_callback"] = preview_ready
+                    preview_kwargs["preview_decision_wait"] = (
+                        wait_preview_decision
+                        if job.spec.preview_mode == "pause" else None
                     )
-            result = await self.backend.generate(*generate_args, **preview_kwargs)
+                if job.spec.execution_mode == "checkpoint":
+                    if action == "resume":
+                        preview_kwargs["resume_checkpoint_path"] = job.checkpoint_path
+                    else:
+                        preview_kwargs["checkpoint_path"] = (
+                            self.data_dir / "checkpoints" / f"{job.id}.pt"
+                        )
+                result = await self.backend.generate(*generate_args, **preview_kwargs)
             if isinstance(result, CheckpointResult):
                 job.inference_plan = result.inference_plan
                 job.runtime_key = result.runtime_key
@@ -1077,6 +1490,7 @@ class JobService:
                 3,
             )
             job.output_path = result.output_path
+            job.final_latents_path = getattr(result, "final_latents_path", None)
             if job.spec.upscale_enabled:
                 if self.upscaler is None:
                     raise RuntimeError("FlashVSR upscaler is not configured")
@@ -1112,7 +1526,7 @@ class JobService:
                         job.progress_detail = "超分完成，正在恢复H3热态"
                         self.persist(job)
                         await self.upscaler.stop()
-                        await self.backend.preload(job.spec.engine)
+                        await self.backend.preload(job.spec.runtime_launcher)
                         if self.backend.warm_state.get("status") != "ready":
                             raise RuntimeError("H3 failed to recover after exclusive upscaling")
                 job.upscale_elapsed_seconds = (
@@ -1230,13 +1644,15 @@ def create_app(
     upscaler: Any | None = None,
     memory_profile: HostMemoryProfile | None = None,
 ) -> web.Application:
+    fixed_launcher = (
+        None if fixed_engine is None else normalize_launcher(str(fixed_engine))
+    )
     default_variant = (
         engine_variant(str(fixed_engine)) if fixed_engine in ENGINES else "base"
     )
-    if fixed_engine in ENGINES:
-        fixed_engine = engine_family(str(fixed_engine))
-    if fixed_engine is not None and fixed_engine not in SERVICE_FAMILIES:
-        raise ValueError(f"unsupported fixed service family: {fixed_engine}")
+    fixed_engine = (
+        None if fixed_launcher is None else launcher_family(fixed_launcher)
+    )
     workspace_controller = (
         WorkspaceController(paths.release_root) if fixed_engine is None else None
     )
@@ -1262,15 +1678,36 @@ def create_app(
             expected = f"{request.scheme}://{request.host}"
             if origin and origin.rstrip("/") != expected.rstrip("/"):
                 raise web.HTTPForbidden(text="cross-origin state changes are not allowed")
-        return await handler(request)
+        response = await handler(request)
+        if request.path == "/" or request.path.startswith("/static/"):
+            # index.html and its assets are one protocol surface.  A stale
+            # app.js can silently submit the retired preview contract even
+            # while the Python service has already been upgraded.
+            response.headers["Cache-Control"] = (
+                "no-store, no-cache, must-revalidate, max-age=0"
+            )
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
 
     app = web.Application(middlewares=[api_auth], client_max_size=640 * 1024 * 1024)
     memory_profile = memory_profile or HOST_MEMORY_PROFILES["fullspeed"]
     memory_state = {"profile": memory_profile, "changing": False}
     engine_state: dict[str, Any] = {
         "active": fixed_engine,
+        "launcher": fixed_launcher,
+        "weight_tier": (
+            None
+            if fixed_launcher is None
+            else launcher_weight_tier(fixed_launcher)
+        ),
+        "vram_profile": (
+            None
+            if fixed_launcher is None
+            else launcher_vram_profile(fixed_launcher)
+        ),
         "switching": False,
-        "switchable": fixed_engine is None,
+        "switchable": fixed_launcher is None,
         "default_variant": default_variant,
         "error": None,
     }
@@ -1278,7 +1715,42 @@ def create_app(
     manager = backend if backend is not None else build_native_backend(
         runtime_paths, memory_profile=memory_profile
     )
-    video_upscaler = upscaler if upscaler is not None else FlashVSRUpscaler(runtime_paths)
+    lora_catalog = _discover_lora_checkpoints(runtime_paths.model_dir)
+    initial_family = (
+        None if fixed_launcher is None else launcher_family(fixed_launcher)
+    )
+    compatible_loras = {
+        item["id"]
+        for item in lora_catalog
+        if item["compatible"]
+        and (
+            initial_family is None
+            or initial_family in item["profile"]["task_families"]
+        )
+    }
+    saved_lora = _load_lora_selection(paths.data_dir)
+    selected_lora = (
+        saved_lora
+        if saved_lora in compatible_loras
+        else DEFAULT_LORA_CHECKPOINT
+        if DEFAULT_LORA_CHECKPOINT in compatible_loras
+        else next(iter(sorted(compatible_loras)), None)
+    )
+    lora_state: dict[str, Any] = {
+        "selected": selected_lora,
+        "changing": False,
+    }
+    configure_lora = getattr(manager, "configure_lora_checkpoint", None)
+    if selected_lora is not None and callable(configure_lora):
+        configure_lora(runtime_paths.model_dir / "loras" / selected_lora)
+    # Native H3 second sampling supersedes both FlashVSR post-processing and
+    # the disposable LoRA preview path.  Keep an inert compatibility object so
+    # old persisted job records remain readable without starting a second
+    # model daemon or competing with H3 for disk/RAM bandwidth.
+    legacy_upscaler_injected = upscaler is not None
+    video_upscaler = (
+        upscaler if upscaler is not None else RetiredFlashVSRUpscaler()
+    )
     service = JobService(
         runtime_paths.data_dir,
         manager,
@@ -1297,6 +1769,7 @@ def create_app(
         or _load_persisted_mimo_key(paths.data_dir)
     )}
     reference_media_state = _load_reference_media_settings(paths.data_dir)
+    checkpoint_preview_state = _load_checkpoint_preview_settings(paths.data_dir)
     generation_limit_state = {
         "policy": load_generation_limit_policy(paths.data_dir),
         "detected_vram_gib": detect_gpu_vram_gib(),
@@ -1309,10 +1782,16 @@ def create_app(
             raise ContractError("select an engine before submitting a generation")
         return engine
 
+    def active_launcher(*, required: bool = False) -> str | None:
+        launcher = engine_state["launcher"]
+        if required and launcher is None:
+            raise ContractError("select a model weight before submitting a generation")
+        return launcher
+
     def engine_options() -> dict[str, Any]:
         engine = active_engine()
         document = public_options(
-            fixed_engine if fixed_engine is not None else None,
+            fixed_launcher if fixed_launcher is not None else None,
             max_duration_by_preset=(
                 generation_limit_state["policy"].preset_limits
             ),
@@ -1321,12 +1800,20 @@ def create_app(
             "fixed_engine" if fixed_engine is not None else "unified_console"
         )
         document["current_engine"] = engine
+        document["current_launcher"] = active_launcher()
         document["active_service_family"] = engine
+        document["active_weight_tier"] = engine_state["weight_tier"]
+        document["active_vram_profile"] = engine_state["vram_profile"]
         document["current_model_variant"] = engine_state["default_variant"]
         document["current_engine_options"] = (
             document["service_families"].get(engine) if engine is not None else None
         )
         document["defaults"]["service_family"] = engine
+        document["defaults"]["runtime_launcher"] = active_launcher()
+        document["defaults"]["weight_tier"] = engine_state["weight_tier"]
+        document["defaults"]["vram_profile"] = engine_state["vram_profile"]
+        document["device_memory_backend"]["weight_tier"] = engine_state["weight_tier"]
+        document["device_memory_backend"]["vram_profile"] = engine_state["vram_profile"]
         document["defaults"]["model_variant"] = engine_state["default_variant"]
         document["defaults"]["engine"] = (
             resolve_engine(engine, engine_state["default_variant"])
@@ -1354,12 +1841,58 @@ def create_app(
         document["generation_limits"] = generation_limit_state["policy"].public(
             generation_limit_state["detected_vram_gib"]
         )
+        document["checkpoint_preview"] = dict(checkpoint_preview_state)
         document["engine_control"] = {
             "switchable": engine_state["switchable"],
             "switching": engine_state["switching"],
             "active": engine,
+            "launcher": active_launcher(),
+            "weight_tier": engine_state["weight_tier"],
+            "vram_profile": engine_state["vram_profile"],
             "error": engine_state["error"],
         }
+        vram_profile = engine_state["vram_profile"]
+        if vram_profile == "8gb":
+            document["resolutions"] = ["360p", "480p", "720p"]
+            document["advanced_limits"]["dimension_max"] = 1280
+            document["advanced_limits"]["short_edge_max"] = 736
+            document["advanced_limits"]["max_pixels"] = 1280 * 736
+            document["advanced_limits"]["second_sampling"]["available"] = True
+            document["advanced_limits"]["second_sampling"]["levels"] = [
+                "720p", "1080p"
+            ]
+            document["advanced_limits"]["second_sampling"]["reason"] = None
+        elif vram_profile == "16gb":
+            # The compact full-context graph admits the complete
+            # 1920x1088x362 INT8 boundary inside the 15.25-GiB planner budget.
+            # Native 1080p first generation remains an experimental edge;
+            # 1440p second sampling is separately admitted by the physical
+            # Ref2VA image+audio 362-frame release gate from 2026-08-29.
+            document["resolutions"] = ["360p", "480p", "720p", "1080p"]
+            document["advanced_limits"]["dimension_max"] = 1920
+            document["advanced_limits"]["short_edge_max"] = 1088
+            document["advanced_limits"]["max_pixels"] = 1920 * 1088
+            document["advanced_limits"]["second_sampling"]["available"] = True
+            document["advanced_limits"]["second_sampling"]["levels"] = [
+                "720p", "1080p", "1440p"
+            ]
+        else:
+            # A single 2K15 Actual-step gate proved memory admission, not a
+            # usable full clip.  Keep first-pass creation at the reviewed
+            # 1080p boundary; 2K remains available through second sampling.
+            document["resolutions"] = ["360p", "480p", "720p", "1080p"]
+            document["advanced_limits"]["dimension_max"] = 1920
+            document["advanced_limits"]["short_edge_max"] = 1088
+            document["advanced_limits"]["max_pixels"] = 1920 * 1088
+            document["advanced_limits"]["second_sampling"]["available"] = True
+            document["advanced_limits"]["second_sampling"]["levels"] = [
+                "720p", "1080p", "1440p"
+            ]
+        # The operator duration editor describes first-pass generation only.
+        # Do not leak the independent 2K second-sampling target into it.
+        document["generation_limits"]["resolutions"] = list(
+            document["resolutions"]
+        )
         if workspace_controller is not None:
             document["workspace"] = workspace_controller.public(
                 switchable=engine is None and not engine_state["switching"] and not service_busy()
@@ -1388,19 +1921,43 @@ def create_app(
             raise web.HTTPConflict(text="this process uses a fixed engine launcher")
         try:
             document = await request.json()
-            requested = str(document.get("service_family", document.get("engine", "")))
             requested_variant = str(document.get("model_variant", "") or "base")
-            if requested in ENGINES:
-                requested_variant = engine_variant(requested)
-                requested = engine_family(requested)
-            if requested not in SERVICE_FAMILIES:
-                raise ContractError(f"unsupported service family: {requested}")
+            raw_launcher = document.get(
+                "launcher", document.get("runtime_launcher")
+            )
+            if raw_launcher not in (None, ""):
+                requested_launcher = normalize_launcher(str(raw_launcher))
+                requested = launcher_family(requested_launcher)
+            else:
+                requested = str(
+                    document.get("service_family", document.get("engine", ""))
+                )
+                if requested in ENGINES:
+                    requested_variant = engine_variant(requested)
+                    requested = engine_family(requested)
+                if requested not in SERVICE_FAMILIES:
+                    raise ContractError(
+                        f"unsupported service family: {requested}"
+                    )
+                requested_launcher = resolve_launcher(requested, "int8")
+            requested_weight_tier = launcher_weight_tier(requested_launcher)
+            requested_vram_profile = launcher_vram_profile(requested_launcher)
             if requested_variant not in {"base", "lora"}:
                 raise ContractError(f"unsupported model variant: {requested_variant}")
         except (ContractError, json.JSONDecodeError) as error:
             raise web.HTTPBadRequest(text=str(error)) from error
         if memory_state["changing"]:
             raise web.HTTPConflict(text="host-memory profile is changing")
+        selected_checkpoint = lora_state.get("selected")
+        if selected_checkpoint:
+            selected_profile = resolve_lora_profile(selected_checkpoint)
+            if requested not in selected_profile.task_families:
+                raise web.HTTPConflict(
+                    text=(
+                        f"selected LoRA {selected_profile.display_name!r} does not "
+                        f"support {requested}; choose a compatible LoRA in settings first"
+                    )
+                )
         async with engine_lock:
             if service_busy():
                 raise web.HTTPConflict(
@@ -1408,22 +1965,33 @@ def create_app(
                 )
             if engine_state["switching"]:
                 raise web.HTTPConflict(text="engine is already switching")
-            if active_engine() == requested and manager.warm_state.get("status") == "ready":
+            if (
+                active_launcher() == requested_launcher
+                and manager.warm_state.get("status") == "ready"
+            ):
                 engine_state["default_variant"] = requested_variant
                 return web.json_response({
                     "changed": False, "active_engine": requested,
+                    "active_launcher": requested_launcher,
                     "warm_state": manager.warm_state,
                 })
             engine_state.update({"switching": True, "error": None})
             previous = active_engine()
+            previous_launcher = active_launcher()
             try:
                 await video_upscaler.stop()
                 await manager.stop()
                 engine_state["active"] = None
-                await manager.preload(requested)
+                engine_state["launcher"] = None
+                engine_state["weight_tier"] = None
+                engine_state["vram_profile"] = None
+                await manager.preload(requested_launcher)
                 if manager.warm_state.get("status") != "ready":
                     raise RuntimeError("the selected engine failed to load")
                 engine_state["active"] = requested
+                engine_state["launcher"] = requested_launcher
+                engine_state["weight_tier"] = requested_weight_tier
+                engine_state["vram_profile"] = requested_vram_profile
                 engine_state["default_variant"] = requested_variant
                 if memory_state["profile"].preload_upscaler:
                     try:
@@ -1435,7 +2003,13 @@ def create_app(
             except Exception as error:
                 engine_state.update({
                     "active": None,
-                    "error": f"failed to enter {requested}; the service remains idle",
+                    "launcher": None,
+                    "weight_tier": None,
+                    "vram_profile": None,
+                    "error": (
+                        f"failed to enter {requested_launcher}; "
+                        "the service remains idle"
+                    ),
                 })
                 raise web.HTTPInternalServerError(
                     text=engine_state["error"]
@@ -1443,8 +2017,12 @@ def create_app(
             finally:
                 engine_state["switching"] = False
             return web.json_response({
-                "changed": previous != requested,
+                "changed": (
+                    previous != requested
+                    or previous_launcher != requested_launcher
+                ),
                 "active_engine": requested,
+                "active_launcher": requested_launcher,
                 "warm_state": manager.warm_state,
             })
 
@@ -1467,6 +2045,9 @@ def create_app(
                 await video_upscaler.stop()
                 await manager.stop()
                 engine_state["active"] = None
+                engine_state["launcher"] = None
+                engine_state["weight_tier"] = None
+                engine_state["vram_profile"] = None
             finally:
                 engine_state["switching"] = False
             return web.json_response({
@@ -1514,7 +2095,17 @@ def create_app(
         )
 
     async def index(_: web.Request) -> web.StreamResponse:
-        return web.FileResponse(serve_dir / "static/index.html")
+        # The console and the Python backend form one protocol surface.  Never
+        # let a browser reuse an index document from an older service build:
+        # it can otherwise submit retired fields to a freshly updated backend
+        # (or hide settings that the backend already supports).
+        return web.FileResponse(
+            serve_dir / "static/index.html",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+            },
+        )
 
     async def openapi(_: web.Request) -> web.Response:
         return web.json_response(openapi_document(__version__))
@@ -1523,21 +2114,39 @@ def create_app(
         active_memory_profile = memory_state["profile"]
         document = engine_options()
         engine = active_engine()
-        runtime = manager.preflight(engine) if engine is not None else {"capabilities": {}}
+        launcher = active_launcher()
+        runtime = (
+            manager.preflight(launcher)
+            if launcher is not None
+            else {"capabilities": {}}
+        )
         capabilities = runtime.get("capabilities", {})
         document["advanced_limits"]["sparse_attention_available"] = bool(
             capabilities.get("sparse_attention", False)
         )
         base_scheduler = (
-            "v19_certified_frontier"
-            if capabilities.get("v19_certified_frontier", False)
-            else "h3_int8_frozen_round229"
+            (
+                capabilities.get("pareto_v24_policy_id")
+                or "h3_pareto_v24_human_knee_continuous_deployment_v3"
+            )
+            if capabilities.get("pareto_v24", False)
+            else (
+                "v19_certified_frontier"
+                if capabilities.get("v19_certified_frontier", False)
+                else "h3_int8_frozen_round229"
+            )
         )
         document["advanced_limits"]["acceleration"]["scheduler"] = base_scheduler
         document["advanced_limits"]["acceleration"]["scheduler_by_variant"] = {
             "base": base_scheduler,
             "lora": "h3_lora_v1_no_forecast_round229",
         }
+        document["advanced_limits"]["acceleration"]["quality_knee"] = (
+            capabilities.get("pareto_v24_quality_knee")
+        )
+        document["advanced_limits"]["acceleration"]["release_candidate"] = (
+            capabilities.get("pareto_v24_candidate_id")
+        )
         document["advanced_limits"]["upscaler"]["available"] = bool(
             video_upscaler.status().get("ready", False)
         )
@@ -1550,21 +2159,27 @@ def create_app(
             ],
             "selection_scope": "service_startup",
         }
+        document["warm_state"] = manager.warm_state
         return web.json_response(document)
 
     async def models(_: web.Request) -> web.Response:
         state = model_status(paths.model_dir)
         engine = active_engine()
-        if engine is None:
+        launcher = active_launcher()
+        if engine is None or launcher is None:
             return web.json_response({
                 "engine": None, "ready": state["any_engine_ready"],
-                "models": state["engines"],
+                "models": state["launchers"],
             })
+        launcher_state = state["launchers"][launcher]
         return web.json_response({
             "engine": engine,
-            "ready": state["engines"][resolve_engine(engine, "base")]["ready"],
+            "launcher": launcher,
+            "weight_tier": engine_state["weight_tier"],
+            "vram_profile": engine_state["vram_profile"],
+            "ready": launcher_state["ready"],
             "models": {
-                variant: state["engines"][resolve_engine(engine, variant)]
+                variant: launcher_state
                 for variant in ("base", "lora")
             },
         })
@@ -1580,7 +2195,9 @@ def create_app(
             "version": __version__,
             "queue_length": len(service.pending),
             "configured_engine": fixed_engine,
+            "configured_launcher": fixed_launcher,
             "active_engine": active_engine(),
+            "active_launcher": active_launcher(),
             "active_service_family": active_engine(),
             "last_model_variant": (
                 engine_variant(active_route) if active_route in ENGINES else None
@@ -1605,6 +2222,7 @@ def create_app(
 
         document = await resource_monitor.snapshot()
         document["active_engine"] = active_engine()
+        document["active_launcher"] = active_launcher()
         document["warm_state"] = getattr(
             service.backend, "warm_state", {"status": "unsupported"}
         )
@@ -1620,26 +2238,24 @@ def create_app(
     async def readiness(_: web.Request) -> web.Response:
         models_state = model_status(paths.model_dir)
         engine = active_engine()
-        if engine is None:
+        launcher = active_launcher()
+        if engine is None or launcher is None:
             return web.json_response({
-                "status": "idle", "engines": models_state["engines"],
+                "status": "idle", "engines": models_state["launchers"],
                 "message": "select an engine in the control console",
             })
-        runtimes = {engine: manager.preflight(engine)}
+        runtimes = {launcher: manager.preflight(launcher)}
         engines = {
-            engine: {
-                "ready": all(
-                    models_state["engines"][resolve_engine(engine, variant)]["ready"]
-                    for variant in ("base", "lora")
-                )
-                and runtimes[engine]["ready"],
+            launcher: {
+                "ready": models_state["launchers"][launcher]["ready"]
+                and runtimes[launcher]["ready"],
                 "models": {
-                    variant: models_state["engines"][resolve_engine(engine, variant)]
+                    variant: models_state["launchers"][launcher]
                     for variant in ("base", "lora")
                 },
-                "runtime": runtimes[engine],
+                "runtime": runtimes[launcher],
             }
-            for engine in (engine,)
+            for launcher in (launcher,)
         }
         ready = any(value["ready"] for value in engines.values())
         return web.json_response(
@@ -1675,7 +2291,7 @@ def create_app(
             )
         if service_busy():
             raise web.HTTPConflict(
-                text="wait for the running and queued jobs before changing memory mode"
+                text="wait for the running and queued jobs before changing host memory profile"
             )
         if profile.key == memory_state["profile"].key:
             return web.json_response({
@@ -1689,11 +2305,11 @@ def create_app(
             await video_upscaler.stop()
             await manager.stop()
             manager.configure_memory_profile(profile)
-            engine = active_engine()
-            if engine is not None:
-                await manager.preload(engine)
-            if engine is not None and manager.warm_state.get("status") != "ready":
-                raise RuntimeError("H3 failed to preload under the selected memory mode")
+            launcher = active_launcher()
+            if launcher is not None:
+                await manager.preload(launcher)
+            if launcher is not None and manager.warm_state.get("status") != "ready":
+                raise RuntimeError("H3 failed to preload under the selected host memory profile")
             if profile.preload_upscaler:
                 await video_upscaler.start()
             memory_state["profile"] = profile
@@ -1703,8 +2319,8 @@ def create_app(
                 await video_upscaler.stop()
                 await manager.stop()
                 manager.configure_memory_profile(previous)
-                if engine is not None:
-                    await manager.preload(engine)
+                if launcher is not None:
+                    await manager.preload(launcher)
                 if previous.preload_upscaler:
                     await video_upscaler.start()
             finally:
@@ -1737,6 +2353,9 @@ def create_app(
                     raise ContractError(f"the active engine is {engine}")
                 payload.pop("engine", None)
                 payload["service_family"] = engine
+                payload["runtime_launcher"] = active_launcher(required=True)
+                payload["weight_tier"] = engine_state["weight_tier"]
+                payload["vram_profile"] = engine_state["vram_profile"]
                 payload.setdefault("model_variant", engine_state["default_variant"])
                 if payload.get("quality") in (None, ""):
                     payload["quality"] = default_quality(
@@ -1753,12 +2372,62 @@ def create_app(
                     "reference_video_resolution",
                     reference_media_state["video_resolution"],
                 )
+                payload.setdefault(
+                    "checkpoint_preview_steps",
+                    checkpoint_preview_state["steps"],
+                )
+                payload.setdefault(
+                    "checkpoint_preview_resolution",
+                    checkpoint_preview_state["resolution"],
+                )
+                # Compatibility for a console page kept open across the
+                # checkpoint-preview upgrade.  The immediately preceding Web
+                # build either omitted the preview flag or submitted its old
+                # hidden ``false`` value.  Browser FormData is always
+                # multipart, even when an embedded browser strips Origin and
+                # Referer (VS Code's forwarded-port webview can do that).  A
+                # multipart checkpoint is therefore unambiguously a product
+                # console submission and always includes its disposable
+                # preview.  JSON API clients may still explicitly request a
+                # checkpoint without one.
+                request_origin = request.headers.get("Origin", "").rstrip("/")
+                request_referer = request.headers.get("Referer", "").rstrip("/")
+                expected_origin = f"{request.scheme}://{request.host}".rstrip("/")
+                same_origin_console = (
+                    request_origin == expected_origin
+                    or request_referer == expected_origin
+                    or request_referer.startswith(f"{expected_origin}/")
+                )
+                console_form_submission = request.content_type.startswith(
+                    "multipart/"
+                )
+                if (
+                    str(payload.get("execution_mode", "complete")).strip().lower()
+                    == "checkpoint"
+                    and (
+                        console_form_submission
+                        or same_origin_console
+                        or "checkpoint_preview" not in payload
+                    )
+                ):
+                    payload["checkpoint_preview"] = True
                 spec = GenerationSpec.from_mapping(
                     payload,
                     max_duration_by_preset=(
                         generation_limit_state["policy"].preset_limits
                     ),
                 )
+                if spec.upscale_enabled:
+                    raise ContractError(
+                        "the legacy FlashVSR output upscaler was removed; "
+                        "finish the source video, then submit native H3 second sampling "
+                        "from its completed job"
+                    )
+                if spec.preview_mode != "off":
+                    raise ContractError(
+                        "the legacy fork-preview mode was removed; use a resumable "
+                        "checkpoint task or native H3 second sampling"
+                    )
                 reference_image_roles = sorted(
                     role for role in uploads if role.startswith("reference_image_")
                 )
@@ -1927,6 +2596,108 @@ def create_app(
         mimo_key_state["value"] = value
         return web.json_response({"configured": bool(value)})
 
+    def lora_settings_payload() -> dict[str, Any]:
+        available = _discover_lora_checkpoints(runtime_paths.model_dir)
+        return {
+            "selected": lora_state["selected"],
+            "changing": lora_state["changing"],
+            "available": available,
+            "loaded": manager.warm_state.get("lora_checkpoint"),
+        }
+
+    async def get_lora_settings(_request: web.Request) -> web.Response:
+        return web.json_response(lora_settings_payload())
+
+    async def configure_lora_settings(request: web.Request) -> web.Response:
+        try:
+            document = await request.json()
+        except (json.JSONDecodeError, ValueError) as error:
+            raise web.HTTPBadRequest(text="request body must be JSON") from error
+        if not isinstance(document, dict):
+            raise web.HTTPBadRequest(text="request body must be an object")
+        requested = str(document.get("checkpoint", "")).strip()
+        available = {
+            item["id"]: item
+            for item in _discover_lora_checkpoints(runtime_paths.model_dir)
+        }
+        selected = available.get(requested)
+        if selected is None:
+            raise web.HTTPBadRequest(text="selected LoRA checkpoint is not installed")
+        if not selected["compatible"]:
+            raise web.HTTPBadRequest(
+                text="selected file is not a supported MiniMax H3 LoRA"
+            )
+        launcher = active_launcher()
+        if (
+            launcher is not None
+            and launcher_family(launcher)
+            not in selected["profile"]["task_families"]
+        ):
+            raise web.HTTPBadRequest(
+                text="selected LoRA is incompatible with the active FL2VA/Ref2VA family"
+            )
+        warm = manager.warm_state
+        if (
+            requested == lora_state["selected"]
+            and (
+                launcher is None
+                or (
+                    warm.get("status") == "ready"
+                    and warm.get("lora_checkpoint") == Path(requested).name
+                )
+            )
+        ):
+            response_data = lora_settings_payload()
+            response_data["changed"] = False
+            return web.json_response(response_data)
+        if service_busy():
+            raise web.HTTPConflict(
+                text="wait for the running and queued jobs before changing LoRA"
+            )
+        if memory_state["changing"] or engine_state["switching"]:
+            raise web.HTTPConflict(text="the model engine is already changing")
+        configure = getattr(manager, "configure_lora_checkpoint", None)
+        if not callable(configure):
+            raise web.HTTPNotImplemented(text="this backend cannot switch LoRA weights")
+
+        previous = lora_state["selected"]
+        previous_path = (
+            None
+            if previous is None
+            else runtime_paths.model_dir / "loras" / previous
+        )
+        selected_path = runtime_paths.model_dir / "loras" / requested
+        lora_state["changing"] = True
+        engine_state["switching"] = True
+        async with engine_lock:
+            try:
+                await manager.stop()
+                configure(selected_path)
+                if launcher is not None:
+                    await manager.preload(launcher)
+                    if manager.warm_state.get("status") != "ready":
+                        raise RuntimeError("selected LoRA failed to build")
+                _persist_lora_selection(paths.data_dir, requested)
+                lora_state["selected"] = requested
+            except Exception as error:
+                try:
+                    await manager.stop()
+                    if previous_path is not None:
+                        configure(previous_path)
+                    if launcher is not None:
+                        await manager.preload(launcher)
+                finally:
+                    lora_state["selected"] = previous
+                raise web.HTTPInternalServerError(
+                    text="LoRA change failed; the previous checkpoint was restored"
+                ) from error
+            finally:
+                engine_state["switching"] = False
+                lora_state["changing"] = False
+        response_data = lora_settings_payload()
+        response_data["changed"] = True
+        return web.json_response(response_data)
+
     async def get_reference_media_settings(_request: web.Request) -> web.Response:
         return web.json_response({
             **reference_media_state,
@@ -1976,6 +2747,47 @@ def create_app(
             ) from error
         reference_media_state.update(updated)
         return await get_reference_media_settings(request)
+
+    async def get_checkpoint_preview_settings(
+        _request: web.Request,
+    ) -> web.Response:
+        return web.json_response({
+            **checkpoint_preview_state,
+            "step_range": {"min": 1, "max": 8},
+            "resolutions": list(CHECKPOINT_PREVIEW_SETTING_RESOLUTIONS),
+        })
+
+    async def configure_checkpoint_preview_settings(
+        request: web.Request,
+    ) -> web.Response:
+        try:
+            document = await request.json()
+        except (json.JSONDecodeError, ValueError) as error:
+            raise web.HTTPBadRequest(text="request body must be JSON") from error
+        if not isinstance(document, dict):
+            raise web.HTTPBadRequest(text="request body must be an object")
+        try:
+            steps = int(document.get("steps", checkpoint_preview_state["steps"]))
+        except (TypeError, ValueError) as error:
+            raise web.HTTPBadRequest(text="steps must be an integer") from error
+        resolution = str(
+            document.get("resolution", checkpoint_preview_state["resolution"])
+        ).strip().lower()
+        if not 1 <= steps <= 8:
+            raise web.HTTPBadRequest(text="steps must be between 1 and 8")
+        if resolution not in CHECKPOINT_PREVIEW_SETTING_RESOLUTIONS:
+            raise web.HTTPBadRequest(
+                text="resolution must be 360p, 480p or 720p"
+            )
+        updated = {"steps": steps, "resolution": resolution}
+        try:
+            _persist_checkpoint_preview_settings(paths.data_dir, updated)
+        except OSError as error:
+            raise web.HTTPInternalServerError(
+                text="failed to save checkpoint-preview settings"
+            ) from error
+        checkpoint_preview_state.update(updated)
+        return await get_checkpoint_preview_settings(request)
 
     async def get_generation_limit_settings(_request: web.Request) -> web.Response:
         document = generation_limit_state["policy"].public(
@@ -2077,10 +2889,57 @@ def create_app(
                     f"{job.spec.service_family} service family; switch back before resuming"
                 )
             )
+        if job.spec.runtime_launcher != active_launcher():
+            raise web.HTTPConflict(
+                text=(
+                    "the checkpoint belongs to the "
+                    f"{job.spec.runtime_launcher} weight launcher; switch back first"
+                )
+            )
         try:
             await service.resume(job.id)
         except ContractError as error:
             raise web.HTTPConflict(text=str(error)) from error
+        return web.json_response(service.serialize(job), status=202)
+
+    async def second_sample_job(request: web.Request) -> web.Response:
+        source = require_job(request)
+        engine = active_engine()
+        if engine is None:
+            raise web.HTTPConflict(
+                text="select and finish loading a service family before second sampling"
+            )
+        if source.spec.service_family != engine:
+            raise web.HTTPConflict(
+                text=(
+                    "the source card belongs to the "
+                    f"{source.spec.service_family} service family; switch back first"
+                )
+            )
+        if source.spec.weight_tier != engine_state["weight_tier"]:
+            raise web.HTTPConflict(
+                text="the source card weight tier does not match the active launcher"
+            )
+        try:
+            document = await request.json()
+            if not isinstance(document, dict):
+                raise ContractError("request body must be a JSON object")
+            second_sampling = SecondSamplingSpec.from_mapping(
+                document, source=source.spec
+            )
+            allowed_levels = {
+                "24gb": {"720p", "1080p", "2k"},
+                "16gb": {"720p", "1080p", "2k"},
+                "8gb": {"720p", "1080p"},
+            }[str(engine_state["vram_profile"])]
+            if second_sampling.resolution not in allowed_levels:
+                raise ContractError(
+                    f"the {engine_state['vram_profile']} backend does not support "
+                    f"{second_sampling.resolution} second sampling"
+                )
+            job = await service.submit_second_sampling(source, second_sampling)
+        except (ContractError, json.JSONDecodeError) as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
         return web.json_response(service.serialize(job), status=202)
 
     async def decide_preview(request: web.Request) -> web.Response:
@@ -2109,6 +2968,13 @@ def create_app(
             raise web.HTTPConflict(text=str(error)) from error
         return web.json_response({"deleted": True, "id": job.id, **deletion})
 
+    async def clear_latent_cache(request: web.Request) -> web.Response:
+        try:
+            result = await service.clear_latent_cache()
+        except ContractError as error:
+            raise web.HTTPConflict(text=str(error)) from error
+        return web.json_response({"cleared": True, **result})
+
     async def get_video(request: web.Request) -> web.StreamResponse:
         job = require_job(request)
         if job.status != "succeeded" or job.output_path is None:
@@ -2119,12 +2985,12 @@ def create_app(
         )
 
     async def on_startup(_: web.Application) -> None:
-        await service.start(fixed_engine, preload=preload)
-        # FlashVSR is loaded into the isolated daemon's CPU memory only. This
-        # overlaps disk/model construction with normal service startup without
-        # taking GPU ownership away from H3.
+        await service.start(fixed_launcher, preload=preload)
+        # The default compatibility object is a no-op.  Explicitly injected
+        # legacy upscalers remain startable for isolated migration tests only.
         if (
             preload
+            and legacy_upscaler_injected
             and memory_state["profile"].preload_upscaler
             and hasattr(video_upscaler, "start")
         ):
@@ -2173,11 +3039,20 @@ def create_app(
     app.router.add_post("/studio/prompt-enhancements", enhance_prompt)
     app.router.add_get("/api/v1/settings/mimo-key", get_mimo_key_status)
     app.router.add_put("/api/v1/settings/mimo-key", configure_mimo_key)
+    app.router.add_get("/api/v1/settings/lora", get_lora_settings)
+    app.router.add_put("/api/v1/settings/lora", configure_lora_settings)
     app.router.add_get(
         "/api/v1/settings/reference-media", get_reference_media_settings
     )
     app.router.add_put(
         "/api/v1/settings/reference-media", configure_reference_media_settings
+    )
+    app.router.add_get(
+        "/api/v1/settings/checkpoint-preview", get_checkpoint_preview_settings
+    )
+    app.router.add_put(
+        "/api/v1/settings/checkpoint-preview",
+        configure_checkpoint_preview_settings,
     )
     app.router.add_get(
         "/api/v1/settings/generation-limits", get_generation_limit_settings
@@ -2186,10 +3061,14 @@ def create_app(
         "/api/v1/settings/generation-limits", configure_generation_limit_settings
     )
     app.router.add_get("/api/v1/jobs", list_jobs)
+    app.router.add_delete("/api/v1/cache/latents", clear_latent_cache)
     app.router.add_put("/api/v1/jobs/order", reorder_jobs)
     app.router.add_get("/api/v1/jobs/{job_id}", get_job)
     app.router.add_delete("/api/v1/jobs/{job_id}", cancel_job)
     app.router.add_post("/api/v1/jobs/{job_id}/resume", resume_job)
+    app.router.add_post(
+        "/api/v1/jobs/{job_id}/second-sampling", second_sample_job
+    )
     app.router.add_post("/api/v1/jobs/{job_id}/preview/{decision}", decide_preview)
     app.router.add_get("/api/v1/jobs/{job_id}/preview", get_preview)
     app.router.add_delete("/api/v1/jobs/{job_id}/record", delete_job)
@@ -2206,7 +3085,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8090)
     parser.add_argument(
         "--engine",
-        choices=(*SERVICE_FAMILIES, *ENGINES),
+        choices=(
+            *MODEL_LAUNCHERS, *LEGACY_MODEL_LAUNCHERS,
+            *SERVICE_FAMILIES, *ENGINES,
+        ),
         default=os.environ.get("H3_SERVE_ENGINE", "first_last"),
         help="fix this process to one model family (legacy route aliases are accepted)",
     )

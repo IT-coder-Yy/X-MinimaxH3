@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .contract import MAX_NATIVE_PIXEL_FRAMES
+from .contract import (
+    MAX_CUSTOM_DIMENSION,
+    MAX_CUSTOM_PIXELS,
+    MAX_CUSTOM_SHORT_EDGE,
+    MAX_NATIVE_PIXEL_FRAMES,
+)
 
 
 GIB = 1024**3
@@ -44,7 +49,7 @@ HOST_MEMORY_PROFILES: dict[str, HostMemoryProfile] = {
         key="fullspeed",
         label="128GB 火力全开",
         minimum_ram_gib=128,
-        description="Qwen、H3与FlashVSR同时保持热态；生成和首次超分均无权重冷加载。",
+        description="Qwen与H3保持热态；生成与原生H3二次采样共享同一热引擎。",
         cache_qwen_weights=True,
         pin_model_weights=True,
         copy_model_weights=True,
@@ -57,7 +62,7 @@ HOST_MEMORY_PROFILES: dict[str, HostMemoryProfile] = {
         key="generation_hot",
         label="96GB 生成优先",
         minimum_ram_gib=96,
-        description="Qwen与H3保持热态；超分时释放H3，完成后自动恢复生成热态。",
+        description="Qwen与H3保持热态；生成与原生H3二次采样共享同一热引擎。",
         cache_qwen_weights=True,
         pin_model_weights=True,
         copy_model_weights=True,
@@ -70,7 +75,7 @@ HOST_MEMORY_PROFILES: dict[str, HostMemoryProfile] = {
         key="compact",
         label="64GB 高效兼容",
         minimum_ram_gib=64,
-        description="Qwen按执行层流水读取；H3与超分互斥驻留，支持完整生成范围。",
+        description="Qwen按执行层流水读取；H3按需驻留并支持原生二次采样。",
         cache_qwen_weights=False,
         pin_model_weights=True,
         copy_model_weights=True,
@@ -264,10 +269,10 @@ def validate_workload_for_profile(
     frames = int(frames)
     pixels = width * height
     if (
-        width > 1920
-        or height > 1920
-        or min(width, height) > 1088
-        or pixels > 1920 * 1088
+        width > MAX_CUSTOM_DIMENSION
+        or height > MAX_CUSTOM_DIMENSION
+        or min(width, height) > MAX_CUSTOM_SHORT_EDGE
+        or pixels > MAX_CUSTOM_PIXELS
         or frames > 362
         or pixels * frames > MAX_NATIVE_PIXEL_FRAMES
     ):

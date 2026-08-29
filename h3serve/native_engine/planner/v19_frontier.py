@@ -553,22 +553,21 @@ class V19AccelerationDecision:
 
 
 def _dominates(left: V19CandidatePlan, right: V19CandidatePlan) -> bool:
-    left_values = (left.predicted_cost_p90_ms, *left.risk_ucb.as_tuple())
-    right_values = (right.predicted_cost_p90_ms, *right.risk_ucb.as_tuple())
-    return all(a <= b for a, b in zip(left_values, right_values)) and any(
-        a < b for a, b in zip(left_values, right_values)
-    )
+    return left.pareto_objective.dominates(right.pareto_objective)
 
 
-def _risk_not_better(
-    faster: V19HumanRiskVector,
-    slower: V19HumanRiskVector,
+def _approximation_not_better(
+    faster: V19CandidatePlan,
+    slower: V19CandidatePlan,
 ) -> bool:
-    """A faster point may be equal or riskier, never silently incomparable."""
+    """A faster point may be equal or riskier/debtier, never incomparable."""
 
     return all(
         fast >= slow
-        for fast, slow in zip(faster.as_tuple(), slower.as_tuple())
+        for fast, slow in zip(
+            faster.pareto_objective.approximation_risk_tuple(),
+            slower.pareto_objective.approximation_risk_tuple(),
+        )
     )
 
 
@@ -644,13 +643,14 @@ class V19ReleaseFrontierCatalog:
             ),
         )
         for slower, faster in zip(frontier, frontier[1:]):
-            if not _risk_not_better(
-                faster.candidate.risk_ucb,
-                slower.candidate.risk_ucb,
+            if not _approximation_not_better(
+                faster.candidate,
+                slower.candidate,
             ):
                 raise V19PlanningError(
-                    "V19 certified frontier is multi-dimensional and cannot "
-                    "be hidden behind one acceleration dial"
+                    "V19 certified frontier has an incomparable Human-risk or "
+                    "trajectory-debt trade-off that cannot be hidden behind "
+                    "one acceleration dial"
                 )
         return tuple(frontier)
 

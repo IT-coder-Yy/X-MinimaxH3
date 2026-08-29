@@ -42,6 +42,38 @@ def simple_sigma_schedule(num_steps: int, shift: float) -> tuple[float, ...]:
     return values
 
 
+def refinement_sigma_schedule(
+    num_steps: int,
+    denoise: float,
+    shift: float,
+) -> tuple[float, ...]:
+    """Build a step-invariant low-noise Simple schedule.
+
+    ``denoise`` owns the start point and ``num_steps`` owns only the numerical
+    resolution between that point and zero.  This is the continuous form of
+    ComfyUI's ``steps / denoise`` tail selection without its low-step integer
+    quantisation (most visible at denoise=0.30).
+    """
+
+    if isinstance(num_steps, bool) or not isinstance(num_steps, int) or num_steps <= 0:
+        raise ValueError("num_steps must be a positive integer")
+    if not 0.0 < float(denoise) <= 1.0:
+        raise ValueError("denoise must lie inside (0, 1]")
+    if shift <= 0.0:
+        raise ValueError("sigma shift must be positive")
+
+    def shifted(base: float) -> float:
+        return shift * base / (1.0 + (shift - 1.0) * base)
+
+    values = tuple(
+        shifted(float(denoise) * (num_steps - index) / num_steps)
+        for index in range(num_steps)
+    ) + (0.0,)
+    if any(left <= right for left, right in zip(values, values[1:])):
+        raise RuntimeError("refinement sigma schedule must be strictly decreasing")
+    return values
+
+
 @dataclass(frozen=True, slots=True)
 class H3LatentGeometry:
     video_shape: tuple[int, int, int, int, int]
@@ -75,6 +107,7 @@ class SamplingPlan:
     video_shift: float
     audio_shift: float
     step_index_offset: int = 0
+    seed: int = 0
 
     def __post_init__(self) -> None:
         if len(self.video_sigmas) != len(self.audio_sigmas):
@@ -166,7 +199,7 @@ class H3SimpleScheduler:
             actual_duration_seconds=duration,
         )
 
-    def _plan(self, sampling: Any) -> SamplingPlan:
+    def _plan(self, sampling: Any, *, seed: int = 0) -> SamplingPlan:
         video = simple_sigma_schedule(sampling.num_steps, self.video_shift)
         # Current H3 ModelSamplingAV carries both streams on the video sigma
         # schedule; the model boundary performs the audio-clock transport.
@@ -182,6 +215,7 @@ class H3SimpleScheduler:
             actual_step_indices=actual,
             video_shift=self.video_shift,
             audio_shift=self.audio_shift,
+            seed=int(seed),
         )
 
     def prepare(self, state: Any) -> dict[str, Any]:
@@ -208,7 +242,7 @@ class H3SimpleScheduler:
             video = video.pin_memory().to(self.execution_device, non_blocking=True)
             audio = audio.pin_memory().to(self.execution_device, non_blocking=True)
 
-        plan = self._plan(request.sampling)
+        plan = self._plan(request.sampling, seed=request.seed)
         state.metadata["sampling_plan"] = plan
         state.metadata["latent_geometry"] = geometry
         layout = self.layout_builder(state, geometry) if self.layout_builder else None

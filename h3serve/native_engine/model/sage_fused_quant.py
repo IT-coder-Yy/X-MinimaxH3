@@ -61,14 +61,25 @@ def _kernel():
             + rows1[:, None] * stride_in
             + columns[None, :]
         )
-        value0 = tl.load(pointers0, mask=rows0[:, None] < length)
-        value1 = tl.load(pointers1, mask=rows1[:, None] < length)
+        valid0 = rows0[:, None] < length
+        valid1 = rows1[:, None] < length
+        value0 = tl.load(pointers0, mask=valid0)
+        value1 = tl.load(pointers1, mask=valid1)
         # Reference path is ``centered = k - k.mean(...)`` where both K and
         # mean are BF16 and the centered tensor is materialized as BF16 before
         # the upstream quantizer casts to FP32.  Preserve that store boundary
         # explicitly; an FP32 subtract here is observably different.
         centered0 = (value0 - mean[None, :]).to(tl.bfloat16).to(tl.float32)
         centered1 = (value1 - mean[None, :]).to(tl.bfloat16).to(tl.float32)
+        # Upstream first materializes the valid ``K - mean(K)`` tensor and
+        # only then launches a masked quantizer.  A masked load in this fused
+        # kernel yields zero for an out-of-range row; subtracting a non-zero
+        # mean from that padding would incorrectly let ``-mean`` determine
+        # the final ragged block's scale.  Restore the upstream boundary by
+        # zeroing invalid centered rows before the reduction.  This matters
+        # for every H3 packed length that is not divisible by 64.
+        centered0 = tl.where(valid0, centered0, 0.0)
+        centered1 = tl.where(valid1, centered1, 0.0)
         scale = (
             tl.maximum(tl.max(tl.abs(centered0)), tl.max(tl.abs(centered1)))
             / 127.0
@@ -94,8 +105,8 @@ def _kernel():
             + rows1[:, None] * stride_on
             + columns[None, :]
         )
-        tl.store(output0, quantized0, mask=rows0[:, None] < length)
-        tl.store(output1, quantized1, mask=rows1[:, None] < length)
+        tl.store(output0, quantized0, mask=valid0)
+        tl.store(output1, quantized1, mask=valid1)
         tl.store(
             scale_ptr
             + batch * stride_sz
@@ -149,4 +160,139 @@ def quantize_key_sub_mean_per_thread_int8(
     )
 
 
-__all__ = ["quantize_key_sub_mean_per_thread_int8"]
+def quantize_qk_sub_mean_per_thread_int8_hnd(
+    query,
+    key,
+    key_mean,
+):
+    """Match Sage ``per_thread_int8`` in HND layout without centered BF16 K."""
+
+    import torch
+    from sageattention.triton.quant_per_thread import (
+        quant_query_per_thread_int8_kernel,
+    )
+
+    if query.ndim != 4 or key.ndim != 4:
+        raise ValueError("fused HND Q/K quantization requires rank-4 tensors")
+    if query.shape[0] != key.shape[0] or query.shape[1] != key.shape[1]:
+        raise ValueError("fused HND Q/K batch and head counts must match")
+    if query.shape[-1] != 128 or key.shape[-1] != 128:
+        raise ValueError("fused HND Q/K quantization requires head dimension 128")
+    if key_mean.shape != (key.shape[0], key.shape[1], 1, key.shape[3]):
+        raise ValueError("fused HND key mean must be [batch,head,1,channels]")
+    batch, heads, query_tokens, channels = query.shape
+    key_tokens = int(key.shape[2])
+    query_int8 = torch.empty_like(query, dtype=torch.int8)
+    key_int8 = torch.empty_like(key, dtype=torch.int8)
+    query_scale = torch.empty(
+        (batch, heads, (query_tokens + 127) // 128 * 32),
+        device=query.device,
+        dtype=torch.float32,
+    )
+    key_scale = torch.empty(
+        (batch, heads, (key_tokens + 63) // 64 * 4),
+        device=key.device,
+        dtype=torch.float32,
+    )
+    query_grid = ((query_tokens + 127) // 128 * 32, heads, batch)
+    quant_query_per_thread_int8_kernel[query_grid](
+        query,
+        query_int8,
+        query_scale,
+        query_tokens,
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
+        query_int8.stride(0),
+        query_int8.stride(1),
+        query_int8.stride(2),
+        query_scale.stride(0),
+        query_scale.stride(1),
+        C=channels,
+        BLK=32,
+    )
+    key_grid = ((key_tokens + 63) // 64 * 4, heads, batch)
+    _kernel()[key_grid](
+        key,
+        key_mean,
+        key_int8,
+        key_scale,
+        key_tokens,
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        key_mean.stride(0),
+        key_mean.stride(1),
+        key_int8.stride(0),
+        key_int8.stride(1),
+        key_int8.stride(2),
+        key_scale.stride(0),
+        key_scale.stride(1),
+        channels=channels,
+        block=64,
+    )
+    return query_int8, query_scale, key_int8, key_scale
+
+
+def quantize_qk_sub_mean_per_thread_int8_nhd(
+    query,
+    key,
+    key_mean,
+):
+    """Match Sage ``per_thread_int8`` in NHD without centered BF16 K."""
+
+    import torch
+    from sageattention.triton.quant_per_thread import (
+        quant_query_per_thread_int8_kernel,
+    )
+
+    if query.ndim != 4 or key.ndim != 4:
+        raise ValueError("fused NHD Q/K quantization requires rank-4 tensors")
+    if query.shape[0] != key.shape[0] or query.shape[2] != key.shape[2]:
+        raise ValueError("fused NHD Q/K batch and head counts must match")
+    if query.shape[-1] != 128 or key.shape[-1] != 128:
+        raise ValueError("fused NHD Q/K quantization requires head dimension 128")
+    if key_mean.shape != (key.shape[0], 1, key.shape[2], key.shape[3]):
+        raise ValueError("fused NHD key mean must be [batch,1,head,channels]")
+    batch, query_tokens, heads, channels = query.shape
+    key_tokens = int(key.shape[1])
+    query_int8 = torch.empty_like(query, dtype=torch.int8)
+    key_int8 = torch.empty_like(key, dtype=torch.int8)
+    query_scale = torch.empty(
+        (batch, heads, (query_tokens + 127) // 128 * 32),
+        device=query.device,
+        dtype=torch.float32,
+    )
+    key_scale = torch.empty(
+        (batch, heads, (key_tokens + 63) // 64 * 4),
+        device=key.device,
+        dtype=torch.float32,
+    )
+    query_grid = ((query_tokens + 127) // 128 * 32, heads, batch)
+    quant_query_per_thread_int8_kernel[query_grid](
+        query,
+        query_int8,
+        query_scale,
+        query_tokens,
+        query.stride(0),
+        query.stride(2),
+        query.stride(1),
+        query_int8.stride(0),
+        query_int8.stride(2),
+        query_int8.stride(1),
+        query_scale.stride(0),
+        query_scale.stride(1),
+        C=channels,
+        BLK=32,
+    )
+    quantize_key_sub_mean_per_thread_int8(
+        key, key_mean, key_int8, key_scale
+    )
+    return query_int8, query_scale, key_int8, key_scale
+
+
+__all__ = [
+    "quantize_key_sub_mean_per_thread_int8",
+    "quantize_qk_sub_mean_per_thread_int8_hnd",
+    "quantize_qk_sub_mean_per_thread_int8_nhd",
+]

@@ -125,11 +125,33 @@ class H3FinalLayer(nn.Module):
         shift: torch.Tensor,
         scale: torch.Tensor,
         projection: nn.Module,
+        *,
+        chunk_tokens: int | None = None,
     ) -> torch.Tensor:
-        hidden = self.norm(value[segment])
-        hidden = hidden * (1.0 + scale[timestep_row].to(hidden.dtype))
-        hidden = hidden + shift[timestep_row].to(hidden.dtype)
-        return projection(hidden.float())
+        def project(rows: torch.Tensor) -> torch.Tensor:
+            hidden = self.norm(rows)
+            hidden = hidden * (1.0 + scale[timestep_row].to(hidden.dtype))
+            hidden = hidden + shift[timestep_row].to(hidden.dtype)
+            return projection(hidden.float())
+
+        if chunk_tokens is None:
+            # Preserve the established INT8/16GB and INT8/24GB path exactly.
+            return project(value[segment])
+        if chunk_tokens <= 0:
+            raise ValueError("final projection chunk_tokens must be positive")
+        start = 0 if segment.start is None else int(segment.start)
+        stop = value.shape[0] if segment.stop is None else int(segment.stop)
+        if stop - start <= chunk_tokens:
+            return project(value[segment])
+        # Normalization, affine modulation and the output linear are all
+        # row-local.  Chunking before the BF16 -> FP32 conversion prevents a
+        # full [tokens, hidden_size] FP32 temporary on the 8GB backend without
+        # changing the sampler trajectory or dropping any computation.
+        outputs = [
+            project(value[offset : min(stop, offset + chunk_tokens)])
+            for offset in range(start, stop, chunk_tokens)
+        ]
+        return torch.cat(outputs, dim=0)
 
     def forward(
         self,
@@ -140,6 +162,7 @@ class H3FinalLayer(nn.Module):
         audio_segment: slice,
         video_timestep_row: int,
         audio_timestep_row: int,
+        final_projection_chunk_tokens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         params = self.adaln_projector(curve_rows)
         if params.shape[-1] != 2 * self.hidden_size:
@@ -153,6 +176,7 @@ class H3FinalLayer(nn.Module):
                 shift,
                 scale,
                 self.video_out,
+                chunk_tokens=final_projection_chunk_tokens,
             ),
             self._stream(
                 value,
@@ -161,6 +185,7 @@ class H3FinalLayer(nn.Module):
                 shift,
                 scale,
                 self.audio_out,
+                chunk_tokens=final_projection_chunk_tokens,
             ),
         )
 
@@ -379,8 +404,11 @@ class FullH3DiT(nn.Module):
         cache_condition_embeddings: bool = False,
         layout: PackedLayout | None = None,
         audio_transport_scale: float | None = None,
+        sigma_shift_video: float | None = None,
+        sigma_shift_audio: float | None = None,
         block_stack_runner: Callable[..., torch.Tensor] | None = None,
         mlp_chunk_tokens: int | None = None,
+        final_projection_chunk_tokens: int | None = None,
     ) -> H3DiTOutput:
         if video_latent.ndim != 5 or video_latent.shape[0] != 1:
             raise ValueError("video_latent must be batch-one [1,C,T,H,W]")
@@ -399,6 +427,16 @@ class FullH3DiT(nn.Module):
             raise ValueError("each keyframe anchor requires one condition latent")
         if audio_transport_scale is not None and audio_transport_scale <= 0.0:
             raise ValueError("audio_transport_scale must be positive")
+        active_video_shift = float(
+            self.config.sigma_shift_video
+            if sigma_shift_video is None else sigma_shift_video
+        )
+        active_audio_shift = float(
+            self.config.sigma_shift_audio
+            if sigma_shift_audio is None else sigma_shift_audio
+        )
+        if active_video_shift <= 0.0 or active_audio_shift <= 0.0:
+            raise ValueError("sigma shifts must be positive")
 
         # Current H3 runtimes carry the audio stream on the video sigma clock.
         # At a source step the carried latent is converted back to its own
@@ -409,7 +447,7 @@ class FullH3DiT(nn.Module):
         audio_source = audio_latent
         sigma = sigma_video.float().reshape(-1)[0].clamp(min=1e-6)
         sigma_audio = time_shift_sigma(
-            sigma, self.config.sigma_shift_video, self.config.sigma_shift_audio
+            sigma, active_video_shift, active_audio_shift
         )
         if audio_transport_scale is not None:
             carry = (sigma_audio / sigma).to(audio_source.dtype)
@@ -619,8 +657,8 @@ class FullH3DiT(nn.Module):
         unique_timesteps, modulation_segments, final_rows = self._timestep_plan(
             sigma_video,
             layout,
-            sigma_shift_video=self.config.sigma_shift_video,
-            sigma_shift_audio=self.config.sigma_shift_audio,
+            sigma_shift_video=active_video_shift,
+            sigma_shift_audio=active_audio_shift,
             visual_condition_timestep=visual_condition_timestep,
             audio_condition_timestep=audio_condition_timestep,
             text_token_tags=text_token_tags,
@@ -709,6 +747,7 @@ class FullH3DiT(nn.Module):
             audio_segment=slice(audio_segment.start, audio_segment.stop),
             video_timestep_row=final_rows["video"],
             audio_timestep_row=final_rows["audio"],
+            final_projection_chunk_tokens=final_projection_chunk_tokens,
         )
         patch_t, patch_h, patch_w = self.config.patch_size
         video_output = unpatchify_video(
@@ -725,7 +764,7 @@ class FullH3DiT(nn.Module):
         raw_audio_velocity = -audio_output.to(audio_latent.dtype)
         if audio_transport_scale is None:
             audio_slope = time_shift_slope(
-                sigma, self.config.sigma_shift_video, self.config.sigma_shift_audio
+                sigma, active_video_shift, active_audio_shift
             ).to(raw_audio_velocity.dtype)
             audio_velocity = audio_slope * raw_audio_velocity
         else:

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "anchor": "ref2va_multiref_8s_enhanced_v1.json",
+  "candidates": [
+    {
+      "version": "x00_warmup_2_18_not_for_review",
+      "actual_steps": [0, 1],
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": true
+    },
+    {
+      "version": "x10_forecast10_10",
+      "actual_steps": [0, 1, 2, 3, 4, 5, 7, 9, 12, 19],
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": true
+    },
+    {
+      "version": "x09_forecast9_11",
+      "actual_steps": [0, 1, 2, 3, 4, 6, 9, 13, 19],
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": true
+    },
+    {
+      "version": "x08_forecast8_12",
+      "actual_steps": [0, 1, 2, 3, 5, 8, 13, 19],
+      "cache_condition_rows": true,
+      "cache_condition_embeddings": false,
+      "cache_reference_latents": true
+    }
+  ]
+}
