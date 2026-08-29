@@ -51,7 +51,10 @@ footage for 5-, 10- and 15-second examples. Measurements were recorded on a
 14th Gen Intel Core i9, 128GB RAM and an RTX 4090 24GB using INT8 FL2VA.
 
 <p align="center">
-  <a href="https://youtu.be/43gOGaAlwnk">▶ Watch the English comparison video on YouTube</a>
+  <a href="https://youtu.be/43gOGaAlwnk">
+    <img src="assets/demos/effect-comparison-en-cover.jpg" width="860" alt="Watch the X-MinimaxH3 English effect comparison on YouTube">
+  </a><br>
+  <strong>▶ Watch the English comparison video on YouTube</strong>
 </p>
 
 ## Community and feedback

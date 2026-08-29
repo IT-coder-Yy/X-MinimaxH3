@@ -45,7 +45,10 @@ X-MinimaxH3 是面向单张 NVIDIA SM89 GPU 优化的 MiniMax H3 本地视频生
 128GB 内存、RTX 4090 24GB，使用 INT8 FL2VA。
 
 <p align="center">
-  <a href="https://www.bilibili.com/video/BV1Sm4C6VEhf/">▶ 前往哔哩哔哩观看中文效果对比视频</a>
+  <a href="https://www.bilibili.com/video/BV1Sm4C6VEhf/">
+    <img src="assets/demos/effect-comparison-zh-cover.jpg" width="860" alt="前往哔哩哔哩观看 X-MinimaxH3 中文效果对比视频">
+  </a><br>
+  <strong>▶ 前往哔哩哔哩观看中文效果对比视频</strong>
 </p>
 
 ## 交流与反馈
