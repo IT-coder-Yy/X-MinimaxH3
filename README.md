@@ -51,13 +51,7 @@ footage for 5-, 10- and 15-second examples. Measurements were recorded on a
 14th Gen Intel Core i9, 128GB RAM and an RTX 4090 24GB using INT8 FL2VA.
 
 <p align="center">
-  <video controls muted loop playsinline width="860" src="assets/demos/effect-comparison-en.mp4">
-    Your browser does not support embedded video.
-  </video>
-</p>
-
-<p align="center">
-  <a href="assets/demos/effect-comparison-en.mp4">▶ Watch or download the English comparison video</a>
+  <a href="https://youtu.be/43gOGaAlwnk">▶ Watch the English comparison video on YouTube</a>
 </p>
 
 ## Community and feedback
