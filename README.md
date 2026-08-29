@@ -61,14 +61,15 @@ footage for 5-, 10- and 15-second examples. Measurements were recorded on a
 
 Use [GitHub Discussions](https://github.com/PullMyBoots/X-MinimaxH3/discussions)
 for international installation help, hardware compatibility reports,
-benchmarks, ComfyUI/API questions and generated-video showcases. You can also
-contact the author directly on WeChat; please include `X-MinimaxH3` in your
-friend request.
+benchmarks, ComfyUI/API questions and generated-video showcases. For real-time
+community chat, join the public
+[Telegram group](https://t.me/XMinimaxH3Community). You can also contact the
+author directly on WeChat; please include `X-MinimaxH3` in your friend request.
 
-| Contact the author | Join the WeChat group |
-|:---:|:---:|
-| <img src="assets/community/wechat-contact.jpg" width="260" alt="Author WeChat QR code"> | <img src="assets/community/wechat-group.jpg" width="260" alt="X-MinimaxH3 WeChat group QR code"> |
-| Add `X-MinimaxH3` to the request | An updated QR code will be posted here after the current one expires |
+| Join the Telegram community | Contact the author | Join the WeChat group |
+|:---:|:---:|:---:|
+| <a href="https://t.me/XMinimaxH3Community"><img src="assets/community/telegram-community.png" width="260" alt="X-MinimaxH3 Telegram community QR code"></a> | <img src="assets/community/wechat-contact.jpg" width="260" alt="Author WeChat QR code"> | <img src="assets/community/wechat-group.jpg" width="260" alt="X-MinimaxH3 WeChat group QR code"> |
+| [Open the public group](https://t.me/XMinimaxH3Community) | Add `X-MinimaxH3` to the request | An updated QR code will be posted here after the current one expires |
 
 For reproducible bugs, please use
 [GitHub Issues](https://github.com/PullMyBoots/X-MinimaxH3/issues) so that the
