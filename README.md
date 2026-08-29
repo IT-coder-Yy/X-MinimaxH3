@@ -29,18 +29,18 @@ execution, checkpoint previews and native H3 second sampling.
 - Optional ComfyUI HTTP connector that does not load a second H3 model.
 - English and Simplified Chinese console and documentation.
 
-## Video tutorial
+## Product video
 
 <p align="center">
-  <a href="https://www.bilibili.com/video/BV1Fn8q6JEhX/">
-    <img src="assets/tutorial/bilibili-quick-guide.jpg" width="860" alt="Make MiniMax H3 lightning fast — X-MinimaxH3 quick guide">
+  <a href="https://www.youtube.com/watch?v=Bao1nPI0JR8">
+    <img src="assets/tutorial/bilibili-quick-guide.jpg" width="860" alt="Watch the X-MinimaxH3 product video on YouTube">
   </a>
 </p>
 
 <p align="center">
-  <strong>▶ Make MiniMax H3 lightning fast</strong><br>
-  <sub>Quick deployment and usage guide · About 20 minutes · BV1Fn8q6JEhX · Chinese narration</sub><br>
-  <a href="https://www.bilibili.com/video/BV1Fn8q6JEhX/">Watch the complete tutorial on Bilibili</a>
+  <strong>▶ X-MinimaxH3 — MiniMax H3 made local</strong><br>
+  <sub>English product overview · About 90 seconds</sub><br>
+  <a href="https://www.youtube.com/watch?v=Bao1nPI0JR8">Watch on YouTube</a>
 </p>
 
 ## Measured effect comparison
