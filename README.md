@@ -33,7 +33,7 @@ execution, checkpoint previews and native H3 second sampling.
 
 <p align="center">
   <a href="https://www.youtube.com/watch?v=Bao1nPI0JR8">
-    <img src="assets/tutorial/bilibili-quick-guide.jpg" width="860" alt="Watch the X-MinimaxH3 product video on YouTube">
+    <img src="assets/tutorial/youtube-campaign-en-cover.jpg" width="860" alt="Watch the X-MinimaxH3 product video on YouTube">
   </a>
 </p>
 
