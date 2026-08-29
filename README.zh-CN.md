@@ -38,6 +38,22 @@ X-MinimaxH3 是面向单张 NVIDIA SM89 GPU 优化的 MiniMax H3 本地视频生
   <a href="https://www.bilibili.com/video/BV1Fn8q6JEhX/">前往哔哩哔哩观看完整视频</a>
 </p>
 
+## 效果实测对比
+
+以下本机实测对比展示了同一素材的 720P 视频直出与 1440P H3 原生二次采样效果。
+分割线会在 5 秒、10 秒和 15 秒样例中横向滑动。测试配置为 Intel Core i9（14代）、
+128GB 内存、RTX 4090 24GB，使用 INT8 FL2VA。
+
+<p align="center">
+  <video controls muted loop playsinline width="860" src="assets/demos/effect-comparison-zh.mp4">
+    浏览器不支持内嵌视频播放。
+  </video>
+</p>
+
+<p align="center">
+  <a href="assets/demos/effect-comparison-zh.mp4">▶ 在线观看或下载中文效果对比视频</a>
+</p>
+
 ## 交流与反馈
 
 欢迎加入交流群讨论安装、使用和生成效果，也可以添加作者微信直接反馈问题。

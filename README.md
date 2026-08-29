@@ -43,6 +43,23 @@ execution, checkpoint previews and native H3 second sampling.
   <a href="https://www.bilibili.com/video/BV1Fn8q6JEhX/">Watch the complete tutorial on Bilibili</a>
 </p>
 
+## Measured effect comparison
+
+The following local comparison shows the 720p generation and 1440p native H3
+second-sampling result side by side. The divider sweeps across the same source
+footage for 5-, 10- and 15-second examples. Measurements were recorded on a
+14th Gen Intel Core i9, 128GB RAM and an RTX 4090 24GB using INT8 FL2VA.
+
+<p align="center">
+  <video controls muted loop playsinline width="860" src="assets/demos/effect-comparison-en.mp4">
+    Your browser does not support embedded video.
+  </video>
+</p>
+
+<p align="center">
+  <a href="assets/demos/effect-comparison-en.mp4">▶ Watch or download the English comparison video</a>
+</p>
+
 ## Community and feedback
 
 Join the community to discuss installation, usage and generation results, or
