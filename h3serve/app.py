@@ -575,6 +575,36 @@ class JobService:
             (self.data_dir / name).mkdir(parents=True, exist_ok=True)
         self._load_jobs()
 
+    def _job_log_path(self, job_id: str) -> Path:
+        log_dir = self.data_dir / "jobs" / job_id
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return log_dir / "execution.log"
+
+    def _job_log(
+        self,
+        job: JobRecord,
+        level: str,
+        message: str,
+    ) -> None:
+        try:
+            path = self._job_log_path(job.id)
+            timestamp = time.strftime(
+                "%Y-%m-%d %H:%M:%S",
+                time.localtime(),
+            )
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    f"[{timestamp}] "
+                    f"[{level}] "
+                    f"[job={job.id}] "
+                    f"[status={job.status}] "
+                    f"[stage={job.progress_stage}] "
+                    f"[progress={job.progress_percent:.1f}%] "
+                    f"{message}\n"
+                )
+        except Exception:
+            pass
+
     def switch_workspace(self, layout: WorkspaceLayout) -> None:
         """Rebind persistent job state after the API has proven the GPU idle."""
 
@@ -612,6 +642,7 @@ class JobService:
 
                 status = str(document.get("status", "failed"))
                 error = document.get("error")
+                original_status = status
                 if status in {"queued", "starting_backend", "running", "awaiting_preview"}:
                     status = "failed"
                     error = "service restarted before the task completed"
@@ -687,10 +718,23 @@ class JobService:
                         else None
                     ),
                 )
+                if original_status in {"queued", "starting_backend", "running", "awaiting_preview"}:
+                    self._job_log(
+                        job,
+                        "ERROR",
+                        f"SERVICE_RESTART_DETECTED previous_status={original_status} "
+                        f"error=service restarted before the task completed",
+                    )
                 if job.output_path is not None and not job.output_path.is_file():
+                    old_status = job.status
                     job.status = "failed"
                     job.error = "recorded output video is missing"
                     job.output_path = None
+                    self._job_log(
+                        job,
+                        "ERROR",
+                        f"STATUS_CHANGED {old_status} -> failed error=output video is missing",
+                    )
                 if job.status == "checkpointed" and (
                     not job.checkpoint_retained
                     or job.checkpoint_path is None
@@ -877,10 +921,26 @@ class JobService:
         self.jobs[job_id] = job
         self.cancel_events[job_id] = asyncio.Event()
         self.preview_controls[job_id] = PreviewControl()
+        self.persist(job)
+        self._job_log(
+            job,
+            "INFO",
+            "JOB_CREATED spec="
+            + json.dumps(
+                job.spec.to_dict(include_execution=True),
+                ensure_ascii=False,
+                default=str,
+            ),
+        )
+        self._job_log(
+            job,
+            "INFO",
+            f"JOB_QUEUED condition_mode={job.condition_mode} "
+            f"estimated_total_seconds={job.estimated_total_seconds}",
+        )
         async with self.queue_changed:
             self.pending.append(job_id)
             self.queue_changed.notify()
-        self.persist(job)
         return job
 
     async def submit_second_sampling(
@@ -987,10 +1047,16 @@ class JobService:
         self.jobs[job_id] = job
         self.cancel_events[job_id] = asyncio.Event()
         self.preview_controls[job_id] = PreviewControl()
+        self.persist(job)
+        self._job_log(
+            job,
+            "INFO",
+            f"SECOND_SAMPLING_JOB_CREATED source_job_id={source.id} "
+            f"second_sampling={json.dumps(second_sampling.to_dict(), ensure_ascii=False)}",
+        )
         async with self.queue_changed:
             self.pending.append(job_id)
             self.queue_changed.notify()
-        self.persist(job)
         return job
 
     def _estimate_total(self, spec: GenerationSpec, condition_mode: str) -> float:
@@ -1083,18 +1149,31 @@ class JobService:
             control.decision = "discard"
             control.event.set()
         if job.status == "queued":
-            job.status = "cancelled"
-            job.updated_at = time.time()
+            self._job_log(
+                job,
+                "WARNING",
+                "CANCEL_REQUESTED",
+            )
             job.error = "cancelled before execution"
+            self._job_log(
+                job,
+                "WARNING",
+                "JOB_CANCELLED_BEFORE_EXECUTION",
+            )
+            self._update(job, "cancelled")
             async with self.queue_changed:
                 if job_id in self.pending:
                     self.pending.remove(job_id)
                 self.queue_changed.notify()
-            self.persist(job)
         else:
             # CUDA kernels are not safely pre-emptible, but the native DiT
             # checks this event at every layer boundary. Reflect acceptance
             # immediately instead of leaving the UI looking unresponsive.
+            self._job_log(
+                job,
+                "WARNING",
+                "CANCEL_REQUESTED",
+            )
             job.updated_at = time.time()
             job.progress_stage = "cancelling"
             job.progress_detail = "正在取消；等待当前 GPU 算子结束"
@@ -1127,16 +1206,22 @@ class JobService:
         if len(self.pending) >= self.max_queued_jobs:
             raise ContractError("generation queue is full; try again later")
         job.pending_action = "resume"
-        job.status = "queued"
         job.error = None
         job.progress_stage = "queued_resume"
         job.progress_detail = "断点恢复已加入队列"
         job.updated_at = time.time()
         self.cancel_events[job_id] = asyncio.Event()
+        self._update(job, "queued")
+        self._job_log(
+            job,
+            "INFO",
+            f"RESUME_REQUESTED checkpoint_path={job.checkpoint_path} "
+            f"checkpoint_completed_steps={job.checkpoint_completed_steps} "
+            f"checkpoint_total_steps={job.checkpoint_total_steps}",
+        )
         async with self.queue_changed:
             self.pending.append(job_id)
             self.queue_changed.notify()
-        self.persist(job)
         return job
 
     async def clear_latent_cache(self) -> dict[str, int]:
@@ -1269,6 +1354,8 @@ class JobService:
             resolved_checkpoint.unlink()
         if resolved_latents is not None:
             resolved_latents.unlink()
+        shutil.rmtree(self.data_dir / "jobs" / job_id, ignore_errors=True)
+        (self.data_dir / "jobs" / f"{job_id}.json").unlink(missing_ok=True)
         return {
             "output_deleted": resolved_output is not None,
             "preview_deleted": resolved_preview is not None,
@@ -1288,15 +1375,27 @@ class JobService:
             raise ContractError("preview decision was already submitted")
         control.decision = decision
         job.preview_decision = decision
+        self._job_log(
+            job,
+            "INFO",
+            f"PREVIEW_DECISION decision={decision}",
+        )
         if decision == "continue":
-            job.status = "running"
             job.progress_stage = "resuming"
             job.progress_detail = "继续正式轨迹"
+            job.updated_at = time.time()
+            self.persist(job)
+            self._job_log(
+                job,
+                "INFO",
+                "RESUMING_AFTER_PREVIEW",
+            )
+            self._update(job, "running")
         else:
             self.cancel_events[job_id].set()
             job.progress_detail = "放弃当前抽卡"
-        job.updated_at = time.time()
-        self.persist(job)
+            job.updated_at = time.time()
+            self.persist(job)
         control.event.set()
         return job
 
@@ -1329,6 +1428,13 @@ class JobService:
                 job.updated_at = now
                 if now - last_persisted[0] >= 1.0:
                     self.persist(job)
+                    self._job_log(
+                        job,
+                        "INFO",
+                        f"PROGRESS stage={job.progress_stage} "
+                        f"percent={job.progress_percent:.1f} "
+                        f"detail={job.progress_detail}",
+                    )
                     last_persisted[0] = now
 
             loop.call_soon_threadsafe(apply)
@@ -1336,9 +1442,16 @@ class JobService:
         return update
 
     def _update(self, job: JobRecord, status: str) -> None:
+        old_status = job.status
         job.status = status
         job.updated_at = time.time()
         self.persist(job)
+        if old_status != status:
+            self._job_log(
+                job,
+                "INFO",
+                f"STATUS_CHANGED {old_status} -> {status}",
+            )
 
     async def worker(self) -> None:
         while True:
@@ -1358,6 +1471,11 @@ class JobService:
         cancel_event = self.cancel_events.setdefault(job.id, asyncio.Event())
         preview_control = self.preview_controls.setdefault(job.id, PreviewControl())
         action = job.pending_action
+        self._job_log(
+            job,
+            "INFO",
+            f"JOB_EXECUTION_START action={action}",
+        )
         try:
             job.progress_percent = 1.0
             job.progress_stage = "preparing"
@@ -1379,12 +1497,29 @@ class JobService:
                     job.progress_percent = max(job.progress_percent, 60.0)
                     job.progress_stage = "preview_ready"
                     if job.spec.preview_mode == "pause":
+                        old_status = job.status
                         job.status = "awaiting_preview"
                         job.progress_detail = "预览已就绪：继续正式生成或放弃本次抽卡"
                     else:
                         job.progress_detail = "分叉预览已保存，正式轨迹继续运行"
                     job.updated_at = time.time()
                     self.persist(job)
+                    self._job_log(
+                        job,
+                        "INFO",
+                        f"PREVIEW_READY preview_path={job.preview_path}",
+                    )
+                    if job.spec.preview_mode == "pause":
+                        self._job_log(
+                            job,
+                            "INFO",
+                            f"STATUS_CHANGED {old_status} -> awaiting_preview",
+                        )
+                        self._job_log(
+                            job,
+                            "INFO",
+                            "AWAITING_PREVIEW_DECISION",
+                        )
                 loop.call_soon_threadsafe(apply)
 
             def wait_preview_decision() -> str:
@@ -1477,6 +1612,13 @@ class JobService:
                     f"已在第 {result.completed_steps}/{result.total_steps} 步停止"
                 )
                 job.estimated_remaining_seconds = None
+                self._job_log(
+                    job,
+                    "INFO",
+                    f"CHECKPOINT_SAVED checkpoint_path={job.checkpoint_path} "
+                    f"checkpoint_completed_steps={job.checkpoint_completed_steps} "
+                    f"checkpoint_total_steps={job.checkpoint_total_steps}",
+                )
                 self._update(job, "checkpointed")
                 return
             job.runtime_key = result.runtime_key
@@ -1498,6 +1640,11 @@ class JobService:
                 job.progress_stage = "upscaling"
                 job.progress_detail = "H3完成，正在加载FlashVSR"
                 self.persist(job)
+                self._job_log(
+                    job,
+                    "INFO",
+                    "UPSCALE_START",
+                )
                 profile = (
                     self.memory_profile_getter()
                     if callable(self.memory_profile_getter)
@@ -1538,6 +1685,13 @@ class JobService:
                 job.output_path = upscale.output_path
                 if result.output_path != upscale.output_path:
                     result.output_path.unlink(missing_ok=True)
+                self._job_log(
+                    job,
+                    "INFO",
+                    f"UPSCALE_COMPLETED elapsed_seconds={job.upscale_elapsed_seconds:.1f} "
+                    f"peak_allocated_mib={job.upscale_peak_allocated_mib:.1f} "
+                    f"peak_reserved_mib={job.upscale_peak_reserved_mib:.1f}",
+                )
             job.elapsed_seconds = (
                 float(job.generation_elapsed_seconds or 0.0)
                 + float(job.upscale_elapsed_seconds or 0.0)
@@ -1548,14 +1702,45 @@ class JobService:
             job.estimated_remaining_seconds = 0.0
             job.pending_action = "generate"
             self._update(job, "succeeded")
+            self._job_log(
+                job,
+                "INFO",
+                f"JOB_SUCCEEDED elapsed_seconds={job.elapsed_seconds:.1f} "
+                f"generation_elapsed_seconds={job.generation_elapsed_seconds:.1f} "
+                f"upscale_elapsed_seconds={job.upscale_elapsed_seconds or 0:.1f} "
+                f"output_path={job.output_path}",
+            )
+            if job.final_latents_path is not None:
+                self._job_log(
+                    job,
+                    "INFO",
+                    f"final_latents_path={job.final_latents_path}",
+                )
         except JobCancelled as error:
             job.error = str(error)
             job.progress_stage = "cancelled"
             job.progress_detail = "任务已取消"
             self._update(job, "cancelled")
-        except Exception:
+            self._job_log(
+                job,
+                "WARNING",
+                f"JOB_CANCELLED reason={error}",
+            )
+        except Exception as error:
+            trace = traceback.format_exc()
+            self._job_log(
+                job,
+                "ERROR",
+                f"JOB_FAILED "
+                f"exception_type={type(error).__name__} "
+                f"exception={error}\n"
+                f"{trace}",
+            )
             detail = self.data_dir / "logs" / f"job_{job.id}.error.log"
-            detail.write_text(traceback.format_exc(), encoding="utf-8")
+            try:
+                detail.write_text(trace, encoding="utf-8")
+            except Exception:
+                pass
             job.error = f"generation failed (reference {job.id[:8]})"
             job.progress_stage = "failed"
             job.progress_detail = "生成失败"
