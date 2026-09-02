@@ -25,7 +25,11 @@ from .prompt_policies.ref2va import (
 )
 
 
-MIMO_ENDPOINT = "https://api.xiaomimimo.com/v1/chat/completions"
+MIMO_ENDPOINT = os.environ.get(
+    "H3_MIMO_ENDPOINT",
+    "https://api.xiaomimimo.com/v1/chat/completions",
+).strip()
+MIMO_MODEL = os.environ.get("H3_MIMO_MODEL", "mimo-v2.5").strip()
 MAX_SHOTS = 20
 MAX_SHOT_TEXT = 6_000
 CONDITION_MODES = {"T2VA", "I2VA", "FL2VA", "L2VA", "REF2VA"}
@@ -670,7 +674,7 @@ class MiMoPromptEnhancer:
         if not api_key.strip():
             raise ContractError("请先在设置中填写 MiMo API Key")
         payload = {
-            "model": "mimo-v2.5",
+            "model": MIMO_MODEL,
             "messages": messages,
             "response_format": {"type": "json_object"},
             "max_completion_tokens": max_completion_tokens,

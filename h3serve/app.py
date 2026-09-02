@@ -2001,6 +2001,8 @@ def create_app(
                         # never roll back an otherwise healthy H3 engine.
                         pass
             except Exception as error:
+                import traceback
+                traceback.print_exc()
                 engine_state.update({
                     "active": None,
                     "launcher": None,
@@ -2109,6 +2111,67 @@ def create_app(
 
     async def openapi(_: web.Request) -> web.Response:
         return web.json_response(openapi_document(__version__))
+
+    async def swagger_docs(_: web.Request) -> web.Response:
+        html = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>X-MinimaxH3 API Docs</title>
+  <link
+    rel="stylesheet"
+    href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css"
+  />
+  <style>
+    html {
+      box-sizing: border-box;
+      overflow-y: scroll;
+    }
+    *,
+    *:before,
+    *:after {
+      box-sizing: inherit;
+    }
+    body {
+      margin: 0;
+      background: #fafafa;
+    }
+  </style>
+</head>
+<body>
+  <div id="swagger-ui"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-standalone-preset.js"></script>
+
+  <script>
+    window.onload = () => {
+      window.ui = SwaggerUIBundle({
+        url: "/openapi.json",
+        dom_id: "#swagger-ui",
+        deepLinking: true,
+        persistAuthorization: true,
+        displayRequestDuration: true,
+        filter: true,
+        presets: [
+          SwaggerUIBundle.presets.apis,
+          SwaggerUIStandalonePreset
+        ],
+        layout: "StandaloneLayout"
+      });
+    };
+  </script>
+</body>
+</html>
+"""
+        return web.Response(
+            text=html,
+            content_type="text/html",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+            },
+        )
 
     async def options(_: web.Request) -> web.Response:
         active_memory_profile = memory_state["profile"]
@@ -3022,6 +3085,7 @@ def create_app(
 
     app.router.add_get("/", index)
     app.router.add_get("/openapi.json", openapi)
+    app.router.add_get("/docs", swagger_docs)
     app.router.add_static("/static", serve_dir / "static", show_index=False)
     app.router.add_get("/healthz", health)
     app.router.add_get("/readyz", readiness)

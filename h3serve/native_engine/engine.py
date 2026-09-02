@@ -298,6 +298,8 @@ class NativeHotH3Engine:
                 "progress_detail": "模型引擎已就绪",
             }
         except Exception as error:
+            import traceback
+            traceback.print_exc()
             self._warm_state = {
                 "status": "failed", "engine": family,
                 "launcher": launcher, "weight_tier": weight_tier,

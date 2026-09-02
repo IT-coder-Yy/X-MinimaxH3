@@ -2,6 +2,12 @@
 set -euo pipefail
 
 release_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "${release_root}/.env" ]]; then
+  source "${release_root}/.env"
+fi
+if [[ -f "${release_root}/.env.local" ]]; then
+  source "${release_root}/.env.local"
+fi
 source "${release_root}/scripts/_process.sh"
 serve_port="${H3_SERVE_PORT:-8090}"
 pid_file="${H3_SERVE_PID_FILE:-${release_root}/runtime/h3serve-${serve_port}.pid}"

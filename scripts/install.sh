@@ -6,7 +6,7 @@ runtime_root="${H3_SERVE_RUNTIME_DIR:-${release_root}/runtime}"
 python_bin="${PYTHON_BIN:-python3.10}"
 venv="${runtime_root}/venv"
 vendor_root="${runtime_root}/vendor"
-cuda_home="${CUDA_HOME:-/usr/local/cuda-13.3}"
+cuda_home="${CUDA_HOME:-/usr/local/cuda-12.4}"
 
 minimax_commit="8d8824efaf94586c0cc9ac7ad8d0723d4d6420ea"
 lightx_commit="205d5c872d01557935dc87d67156f4f94069ea65"
@@ -19,7 +19,7 @@ command -v "${python_bin}" >/dev/null || {
   exit 1
 }
 [[ -x "${cuda_home}/bin/nvcc" ]] || {
-  echo "CUDA 13.3 compiler is required at ${cuda_home} (override with CUDA_HOME)" >&2
+  echo "CUDA compiler is required at ${cuda_home} (override with CUDA_HOME)" >&2
   exit 1
 }
 for required_header in cublas_v2.h cusolverDn.h cusparse.h; do
@@ -35,8 +35,8 @@ mkdir -p "${runtime_root}" "${vendor_root}" "${release_root}/models" "${release_
 python="${venv}/bin/python"
 "${python}" -m pip install --upgrade pip setuptools wheel
 "${python}" -m pip install \
-  --index-url https://download.pytorch.org/whl/cu130 \
-  torch==2.13.0+cu130 torchvision==0.28.0+cu130
+  --index-url https://download.pytorch.org/whl/cu126 \
+  torch==2.13.0+cu126 torchvision==0.28.0+cu126
 
 checkout() {
   local url="$1" destination="$2" commit="$3"

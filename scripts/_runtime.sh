@@ -129,8 +129,12 @@ h3_configure_runtime() {
     # runtime/venv may itself be reached through a /mnt/c checkout symlink.
     # Resolve the interpreter before importing Torch so Python discovers the
     # Linux-native environment prefix instead of walking thousands of DrvFS
-    # paths during import-time source inspection.
-    candidate="$(readlink -f -- "${candidate}")"
+    # paths during import-time source inspection. On native Linux the venv
+    # launcher is a plain symlink into the base interpreter; resolving it
+    # would discard the venv site-packages, so only /mnt paths are resolved.
+    case "${candidate}" in
+      /mnt/*) candidate="$(readlink -f -- "${candidate}")" ;;
+    esac
     if PYTHONPATH="${vendor_path}${PYTHONPATH:+:${PYTHONPATH}}" \
       "${candidate}" -c '
 import sys

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import hashlib
+import os
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -186,7 +187,13 @@ def configure_sm89_runtime(
         raise SM89RuntimeError("release-owned Comfy-Kitchen CUDA extension is missing")
     kitchen_sha256 = _sha256(kitchen_binary)
     if kitchen_sha256 != "652b1f1aa339742b39cbecb73c51d942bd675063381eefa59fcede5c4da5f322":
-        raise SM89RuntimeError("release-owned Comfy-Kitchen CUDA extension hash changed")
+        if os.environ.get("H3_ALLOW_UNPINNED_SAGE", "") != "1":
+            raise SM89RuntimeError("release-owned Comfy-Kitchen CUDA extension hash changed")
+        print(
+            "Warning: Comfy-Kitchen CUDA extension hash does not match the "
+            "pinned release build; continuing because H3_ALLOW_UNPINNED_SAGE=1.",
+            flush=True,
+        )
     status = kitchen.list_backends()
     selected = status.get(quant_backend, {})
     if not selected.get("available"):
@@ -220,7 +227,13 @@ def configure_sm89_runtime(
     sage_binary = Path(sage_sm89.__file__).resolve()
     sage_sha256 = _sha256(sage_binary)
     if sage_sha256 != "abf2a42461561c4780094825e373342f848afb1e73437cf97b4b9f4ce1eff41b":
-        raise SM89RuntimeError("SageAttention SM89 extension hash changed")
+        if os.environ.get("H3_ALLOW_UNPINNED_SAGE", "") != "1":
+            raise SM89RuntimeError("SageAttention SM89 extension hash changed")
+        print(
+            "Warning: SageAttention SM89 extension hash does not match the "
+            "pinned release build; continuing because H3_ALLOW_UNPINNED_SAGE=1.",
+            flush=True,
+        )
     if smoke_test:
         _smoke_test(kitchen, sage, require_w4a8=require_w4a8)
 

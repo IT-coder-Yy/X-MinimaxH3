@@ -38,6 +38,8 @@ class RuntimeConfig:
     compute_stream_priority: int = -1
     clear_cache_on_phase_transition: bool = False
     retain_block_buffers_between_requests: bool = True
+    weight_tier: str | None = None
+    resource_profile: str | None = None
 
     def __post_init__(self) -> None:
         if self.batch_size != 1:
@@ -48,6 +50,32 @@ class RuntimeConfig:
             raise ValueError("max_device_bytes must be positive")
         if self.device != "cpu" and not self.device.startswith("cuda:"):
             raise ValueError("device must be 'cpu' or an explicit CUDA device such as 'cuda:0'")
+
+    @classmethod
+    def for_cuda_device(
+        cls,
+        *,
+        weight_tier: str,
+        provisioned_limit_gib: float,
+        backend_profile: str,
+    ) -> "RuntimeConfig":
+        """Build the device policy for one release resource backend.
+
+        The allocator ceiling follows the backend's planner budget, which
+        already retains headroom for the CUDA context and custom-kernel
+        workspaces on top of the provisioned VRAM profile.
+        """
+
+        from ...deployment_profiles import get_resource_backend
+
+        backend = get_resource_backend(backend_profile, weight_tier=weight_tier)
+        return cls(
+            device="cuda:0",
+            expected_compute_capability=(8, 9),
+            max_device_bytes=int(round(backend.planner_budget_gib * 1024**3)),
+            resource_profile=backend.profile_id,
+            weight_tier=backend.weight_tier,
+        )
 
     @classmethod
     def cpu_test(cls) -> "RuntimeConfig":
