@@ -638,9 +638,10 @@ class PackedQwen3VLT2AVConditioner:
                 + len(reference_audio_paths),
             )
 
-        encoder = self._load_vision_encoder().to(self.device)
-        parameter = next(encoder.parameters())
+        encoder = self._load_vision_encoder()
         try:
+            encoder.to(self.device)
+            parameter = next(encoder.parameters())
             with torch.inference_mode():
                 image_embeds = image_deepstack = video_embeds = video_deepstack = None
                 if image_vision is not None:
