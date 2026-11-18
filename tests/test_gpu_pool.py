@@ -29,6 +29,11 @@ class LayoutTest(unittest.TestCase):
             "h3serve.gpu_pool._smi", return_value=[[*row[:3], "12288"] for row in INVENTORY]
         ):
             self.assertIsNone(GpuLayout.from_env())
+            os.environ["H3_DECODE_GPUS"] = "6,7,5,3"
+            self.assertIsNone(GpuLayout.from_env())
+            os.environ["H3_GPU_MODE"] = "dual"
+            os.environ["H3_SERVE_ENGINE"] = "fl2va_w4a8_8gb"
+            self.assertEqual(GpuLayout.from_env().decode, (6, 7, 5, 3))
         with self.assertRaisesRegex(ValueError, "unavailable"):
             self.layout(H3_GPU_MODE="dual", CUDA_VISIBLE_DEVICES="GPU-7")
 
@@ -59,13 +64,35 @@ class LayoutTest(unittest.TestCase):
                 shutil.copy2(root / name, release / name)
             (release / "scripts/_process.sh").write_text("h3_find_release_server_pids() { :; }\n")
             (release / "scripts/_runtime.sh").write_text("h3_configure_runtime() { :; }\n")
+            smi = release / "nvidia-smi"
+            smi.write_text("#!/bin/sh\nprintf '%s\\n' '6, GPU-6' '7, GPU-7'\n")
+            smi.chmod(0o755)
             (release / "server.py").write_text("import os; print(os.environ['CUDA_VISIBLE_DEVICES'])\n")
             (release / ".env").write_text("H3_GPU_MODE=single\nCUDA_VISIBLE_DEVICES=6\n")
-            output = subprocess.check_output(
-                [str(release / "run.sh")], cwd=release, text=True,
-                env={"PATH": os.environ["PATH"], "H3_SERVE_PYTHON": sys.executable, "CUDA_VISIBLE_DEVICES": "7,6"},
-            )
+            env = {"PATH": f"{tmp}:{os.environ['PATH']}", "H3_SERVE_PYTHON": sys.executable, "CUDA_VISIBLE_DEVICES": "7,6"}
+            output = subprocess.check_output(["./run.sh"], cwd=release, text=True, env=env)
             self.assertEqual(output.strip(), "6")
+            env["CUDA_VISIBLE_DEVICES"] = "7,99,6"
+            blocked = subprocess.run(["./run.sh"], cwd=release, text=True, env=env, capture_output=True)
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertIn("no GPU in the inherited allocation", blocked.stdout + blocked.stderr)
+
+    def test_masks_stop_at_invalid_gpu_in_launcher_and_layout(self):
+        with patch("h3serve.gpu_pool._smi", return_value=[row[:2] for row in INVENTORY]):
+            for mask in ("7,-1,6", "7,99,6", "7,,6", "7,GPU-6", "GPU-7,6"):
+                with self.subTest(mask=mask):
+                    self.assertEqual(restrict_cuda_mask("6,7", mask), "7")
+                    with self.assertRaisesRegex(ValueError, "unavailable"):
+                        self.layout(H3_GPU_MODE="dual", H3_INHERITED_CUDA_MASK=mask,
+                                    H3_DIT_GPUS_FIRST="7", H3_DIT_GPUS_SECOND="6")
+            self.assertEqual(restrict_cuda_mask("7,99,6", "7,6"), "7")
+            with self.assertRaisesRegex(ValueError, "no GPU"):
+                restrict_cuda_mask("6", "7,7,6")
+            self.assertIsNone(self.layout(CUDA_VISIBLE_DEVICES="7,-1,6", H3_INHERITED_CUDA_MASK="__unset__"))
+        with patch("h3serve.gpu_pool._smi", return_value=[["6", "GPU-ab01"], ["7", "GPU-ab12"]]):
+            self.assertEqual(restrict_cuda_mask("7,6", "GPU-ab0"), "6")
+            with self.assertRaisesRegex(ValueError, "no GPU"):
+                restrict_cuda_mask("6", "GPU-ab")
 
     def test_auto_falls_back_before_workers_start_and_dual_reports_budget(self):
         from h3serve.memory_policy import HostMemoryStatus

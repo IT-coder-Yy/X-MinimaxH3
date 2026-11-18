@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,19 +18,34 @@ def _smi(query: str) -> list[list[str]]:
 
 
 def _mask_indices(mask, uuids):
-    tokens = {token.strip() for token in mask.split(",")}
-    return {index for index, uuid in uuids.items() if str(index) in tokens or uuid in tokens}
+    """Physical indices and their input tokens, in CUDA enumeration order."""
+    selected = {}
+    by_uuid = mask.startswith("GPU-")
+    for token in mask.split(","):
+        if by_uuid:
+            matches = [i for i, uuid in uuids.items()
+                       if len(token) > 4 and token.startswith("GPU-") and uuid.lower().startswith(token.lower())]
+            if len(matches) != 1:
+                break
+            index = matches[0]
+        else:
+            number = re.match(r"\s*([+-]?[0-9]+)", token, re.ASCII)
+            index = int(number[1]) if number else -1
+            if index not in uuids:
+                break
+        if index in selected:
+            return {}  # A repeated device invalidates the CUDA allocation.
+        selected[index] = token.strip()
+    return selected
 
 
 def restrict_cuda_mask(local, inherited):
     """Keep the requested CUDA order inside the caller's allocation."""
-    requested = [token.strip() for token in local.split(",") if token.strip()]
-    outer = {token.strip() for token in inherited.split(",")}
-    if all(token in outer for token in requested):
-        return ",".join(requested)
+    if not local:
+        return ""
     uuids = {int(i): uuid for i, uuid in _smi("--query-gpu=index,uuid")}
     allowed = _mask_indices(inherited, uuids)
-    filtered = [token for token in requested if token in outer or _mask_indices(token, uuids) & allowed]
+    filtered = [token for i, token in _mask_indices(local, uuids).items() if i in allowed]
     if not filtered:
         raise ValueError(f"CUDA_VISIBLE_DEVICES={local!r} has no GPU in the inherited allocation {inherited!r}")
     return ",".join(filtered)
@@ -51,7 +67,7 @@ class GpuLayout:
         if mode not in {"auto", "dual"}:
             raise ValueError("H3_GPU_MODE must be auto, dual or single")
         keys = ("H3_QWEN_GPUS", "H3_DIT_GPUS_FIRST", "H3_DIT_GPUS_SECOND", "H3_DECODE_GPUS")
-        explicit = mode == "dual" or any(key in env for key in keys)
+        force_dual = mode == "dual"
 
         def cards(key, default):
             raw = env.get(key, default).split(",")
@@ -74,26 +90,27 @@ class GpuLayout:
             inventory = {int(i): (uuid, capability, int(mib)) for i, uuid, capability, mib in
                          _smi("--query-gpu=index,uuid,compute_cap,memory.total")}
         except (OSError, subprocess.SubprocessError):
-            if explicit:
+            if force_dual:
                 raise ValueError("dual GPU mode requires nvidia-smi to enumerate GPUs") from None
             return None
         from .deployment_profiles import get_resource_backend
 
         budget_mib = get_resource_backend("int8_24gb").planner_budget_gib * 1024
         available = {i for i, (_, cap, mib) in inventory.items()
-                     if cap == "8.9" and (explicit or mib >= budget_mib)}
+                     if cap == "8.9" and (force_dual or mib >= budget_mib)}
         uuids = {i: row[0] for i, row in inventory.items()}
         # run.sh distinguishes an inherited allocation from the old primary-only .env.
         inherited = env.get("H3_INHERITED_CUDA_MASK", env.get("CUDA_VISIBLE_DEVICES"))
         if inherited is not None and inherited != "__unset__":
-            available &= _mask_indices(inherited, uuids)
+            available.intersection_update(_mask_indices(inherited, uuids))
         local_mask = env.get("CUDA_VISIBLE_DEVICES")
-        if not explicit and local_mask is not None:
-            allowed = _mask_indices(local_mask, uuids)
-            if allowed != {first[0]} and not selected <= allowed:
+        if not force_dual and local_mask is not None:
+            allowed = _mask_indices(local_mask, uuids).keys()
+            legacy_primary = "," not in local_mask and allowed == {first[0]}
+            if not legacy_primary and not selected <= allowed:
                 return None
         if not selected <= available:
-            if explicit:
+            if force_dual:
                 raise ValueError(f"selected SM89 GPUs are unavailable: {sorted(selected - available)}")
             return None
         return cls(qwen, (first, second), decode, {i: inventory[i][0] for i in sorted(selected)})
