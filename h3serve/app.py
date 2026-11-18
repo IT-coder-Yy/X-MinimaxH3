@@ -787,39 +787,32 @@ class JobService:
         return round(max(0.0, total - elapsed), 1)
 
     def _queued_eta(self, job_id: str) -> tuple[float | None, float | None]:
-        """Estimate queue wait and completion from the one-GPU FIFO schedule."""
+        """Assign FIFO jobs to the earliest slot with a known release time."""
 
         if job_id not in self.pending:
             return None, None
         now = time.time()
-        seconds = 0.0
-        known = False
-        unknown_active = False
-        for active in self.jobs.values():
-            if active.status not in {"starting_backend", "running", "awaiting_preview"}:
-                continue
-            value = self._dynamic_remaining(active, now)
-            if value is not None:
-                seconds += value
-                known = True
-            else:
-                unknown_active = True
-        if unknown_active:
-            return None, None
-        target = self.jobs[job_id]
-        own = target.estimated_total_seconds
+        running = [
+            self._dynamic_remaining(job, now) for job in self.jobs.values()
+            if job.status in {"starting_backend", "running", "awaiting_preview"}
+        ]
+        slots = len(getattr(self.backend, "slots", (self.backend,)))
+        available = [0.0] * (slots - len(running))
+        available.extend(seconds for seconds in running if seconds is not None)
         for pending_id in self.pending:
+            if not available:
+                break
             pending = self.jobs.get(pending_id)
             if pending is None:
                 continue
+            start = min(available)
+            duration = pending.estimated_total_seconds
+            finish = None if duration is None else start + duration
             if pending_id == job_id:
-                queue_seconds = seconds if known or own is not None else None
-                if own is None:
-                    return queue_seconds, None
-                return queue_seconds, round(seconds + own, 1)
-            if pending.estimated_total_seconds is not None:
-                seconds += pending.estimated_total_seconds
-                known = True
+                return round(start, 1), None if finish is None else round(finish, 1)
+            available.remove(start)
+            if finish is not None:
+                available.append(finish)
         return None, None
 
     def persist(self, job: JobRecord) -> None:

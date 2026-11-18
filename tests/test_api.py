@@ -1174,6 +1174,23 @@ class ApiTest(AioHTTPTestCase):
         self.assertAlmostEqual(second_progress["estimated_queue_seconds"], 50, delta=1)
         self.assertAlmostEqual(second_progress["estimated_completion_seconds"], 75, delta=1)
 
+        service.backend.slots = (service.backend, service.backend)
+        slow = JobRecord(id="slow", spec=spec, status="running", estimated_total_seconds=100,
+                         started_at=running.started_at)
+        third = JobRecord(id="third", spec=spec, estimated_total_seconds=10)
+        service.jobs.update({slow.id: slow, third.id: third})
+        service.pending.append(third.id)
+        second.estimated_total_seconds = 70
+        with patch("h3serve.app.time.time", return_value=running.started_at + 10):
+            self.assertEqual(service._queued_eta(first.id), (30, 50))
+            self.assertEqual(service._queued_eta(second.id), (50, 120))
+            self.assertEqual(service._queued_eta(third.id), (90, 100))
+            slow.started_at = None
+            slow.status = "starting_backend"
+            self.assertEqual(service._queued_eta(first.id), (30, 50))
+            running.status = "succeeded"
+            self.assertEqual(service._queued_eta(first.id), (0, 20))
+
     async def test_eta_history_matches_execution_parameters(self) -> None:
         service = self.app["job_service"]
         sparse = GenerationSpec.from_mapping({

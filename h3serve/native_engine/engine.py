@@ -1120,13 +1120,18 @@ class NativeHotH3Engine:
                                 f"final_decode.{name}": seconds
                                 for name, seconds in decoded.phases.items()
                             })
+                            profile = dict(decoded.execution_profile)
+                            calls = [p["dit_head_parallel_calls"] for p in window_profiles
+                                     if "dit_head_parallel_calls" in p]
+                            if calls:
+                                profile["dit_head_parallel_calls"] = sum(calls)
                             return replace(
                                 decoded,
                                 total_seconds=time.monotonic() - started,
                                 phases=all_phases,
                                 step_seconds=tuple(all_steps),
                                 execution_profile={
-                                    **decoded.execution_profile,
+                                    **profile,
                                     **(
                                         {
                                             "qwen_conditioning_cache": dict(
