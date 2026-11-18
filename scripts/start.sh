@@ -5,6 +5,9 @@ release_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -f "${release_root}/.env.local" ]]; then
   source "${release_root}/.env.local"
 fi
+if [[ "${H3_INHERITED_CUDA_MASK-__unset__}" != "__unset__" ]]; then
+  export CUDA_VISIBLE_DEVICES="${H3_INHERITED_CUDA_MASK}"
+fi
 mkdir -p "${release_root}/runtime/tmp"
 export TMPDIR="${TMPDIR:-${release_root}/runtime/tmp}"
 source "${release_root}/scripts/_process.sh"

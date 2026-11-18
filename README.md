@@ -2,8 +2,7 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-X-MinimaxH3 is a local MiniMax H3 video-generation service optimized for a
-single NVIDIA SM89 GPU. It provides one bilingual Web console and REST API for
+X-MinimaxH3 is a local MiniMax H3 video-generation service for NVIDIA SM89 GPUs. It provides one bilingual Web console and REST API for
 FL2VA and Ref2VA generation, Base/LoRA hot switching, resource-constrained
 execution, checkpoint previews and native H3 second sampling.
 
@@ -24,7 +23,7 @@ execution, checkpoint previews and native H3 second sampling.
 - Multi-reference Ref2VA with images, videos and independent audio references.
 - Larry Turbo and three task-aware LightX2V LoRA profiles.
 - Resumable checkpoints with fixed low-cost previews.
-- Serial GPU queue, cancellation, task history and one-second hardware
+- Single-GPU queue or two concurrent GPU workers, cancellation, task history and one-second hardware
   telemetry.
 - Optional ComfyUI HTTP connector that does not load a second H3 model.
 - English and Simplified Chinese console and documentation.
@@ -131,6 +130,37 @@ Open <http://127.0.0.1:8090>. Stop the service with:
 On WSL2, `./run.sh` automatically mirrors the hot source tree and caches to the
 Linux filesystem, avoiding repeated imports and metadata access through
 `/mnt/c`.
+
+### Two concurrent GPU workers
+
+Run `./run.sh` with the installed runtime and weights. Auto mode enables two
+workers on physical SM89 GPUs 7, 6, 5 and 3 and starts with the 24 GB INT8
+Base launcher. Other installations default to single-GPU serving. Set these
+values in the release-local `.env` to require a particular layout.
+
+```dotenv
+H3_GPU_MODE=dual
+H3_QWEN_GPUS=7,6,5,3
+H3_DIT_GPUS_FIRST=7,6
+H3_DIT_GPUS_SECOND=5,3
+H3_DECODE_GPUS=7,6,5,3
+```
+
+Qwen encodes one job at a time, hosting the encoder on its first GPU and
+splitting attention over 1, 2, 4 or 8 GPUs in list order. Each DiT group has
+its primary first. The groups must be disjoint and their sizes must divide
+56. The 24 GB INT8 Base streamed attention path splits whole heads. Other
+operators use the native primary-device path. A single job takes the first
+available group in priority order. Additional jobs queue once both are busy.
+Late Qwen requests wait for conflicting DiT work. Budget host memory for two
+model sessions.
+
+Final video and audio decode share the first free candidate with no GPU lease
+or external compute process. See `/healthz` for the configured layout and the
+service log for actual assignments. Set `service_family` to submit FL2VA or
+Ref2VA through the same service. An inherited `CUDA_VISIBLE_DEVICES` allocation
+constrains the layout. A legacy primary-only `CUDA_VISIBLE_DEVICES=7` in the
+local `.env` works with auto mode. Set `H3_GPU_MODE=single` for one worker.
 
 ## Validation
 

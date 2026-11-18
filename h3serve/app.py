@@ -1454,16 +1454,34 @@ class JobService:
             )
 
     async def worker(self) -> None:
-        while True:
-            async with self.queue_changed:
-                await self.queue_changed.wait_for(lambda: bool(self.pending))
-                job_id = self.pending.pop(0)
-            job = self.jobs.get(job_id)
-            if job is None or job.status == "cancelled":
-                continue
-            await self._run(job)
+        slots = getattr(self.backend, "slots", (self.backend,))
+        active = {}
 
-    async def _run(self, job: JobRecord) -> None:
+        async def execute(slot, job):
+            try:
+                await self._run(job, slots[slot])
+            finally:
+                async with self.queue_changed:
+                    active.pop(slot)
+                    self.queue_changed.notify_all()
+
+        try:
+            while True:
+                async with self.queue_changed:
+                    await self.queue_changed.wait_for(lambda: self.pending and len(active) < len(slots))
+                    job = self.jobs.get(self.pending.pop(0))
+                    if job is None or job.status != "queued":
+                        continue
+                    slot = next(i for i in range(len(slots)) if i not in active)
+                    active[slot] = asyncio.create_task(execute(slot, job))
+        finally:
+            tasks = list(active.values())
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _run(self, job: JobRecord, backend=None) -> None:
+        backend = self.backend if backend is None else backend
         # Persisted jobs and direct boundary tests created before fork preview
         # do not have an associated control object.  Lazily creating it keeps
         # those records executable while new submissions still allocate it at
@@ -1534,7 +1552,7 @@ class JobService:
             if action == "second_sampling":
                 if job.second_sampling is None or job.source_latents_path is None:
                     raise RuntimeError("second-sampling job is missing its source contract")
-                second_sample = getattr(self.backend, "second_sample", None)
+                second_sample = getattr(backend, "second_sample", None)
                 if not callable(second_sample):
                     raise RuntimeError("the active backend does not support H3 second sampling")
                 job.progress_stage = "second_sampling"
@@ -1581,7 +1599,7 @@ class JobService:
                         preview_kwargs["checkpoint_path"] = (
                             self.data_dir / "checkpoints" / f"{job.id}.pt"
                         )
-                result = await self.backend.generate(*generate_args, **preview_kwargs)
+                result = await backend.generate(*generate_args, **preview_kwargs)
             if isinstance(result, CheckpointResult):
                 job.inference_plan = result.inference_plan
                 job.runtime_key = result.runtime_key
@@ -1657,7 +1675,7 @@ class JobService:
                 if exclusive:
                     job.progress_detail = "释放H3内存，准备独占超分"
                     self.persist(job)
-                    await self.backend.stop()
+                    await backend.stop()
                 try:
                     upscale = await self.upscaler.upscale(
                         job.output_path,
@@ -1673,8 +1691,8 @@ class JobService:
                         job.progress_detail = "超分完成，正在恢复H3热态"
                         self.persist(job)
                         await self.upscaler.stop()
-                        await self.backend.preload(job.spec.runtime_launcher)
-                        if self.backend.warm_state.get("status") != "ready":
+                        await backend.preload(job.spec.runtime_launcher)
+                        if backend.warm_state.get("status") != "ready":
                             raise RuntimeError("H3 failed to recover after exclusive upscaling")
                 job.upscale_elapsed_seconds = (
                     time.monotonic() - upscale_cycle_started
@@ -1755,6 +1773,8 @@ class JobService:
             )
 
     async def close(self) -> None:
+        for event in self.cancel_events.values():
+            event.set()
         if self.warmup_task is not None and not self.warmup_task.done():
             self.warmup_task.cancel()
             try:
@@ -1900,6 +1920,19 @@ def create_app(
     manager = backend if backend is not None else build_native_backend(
         runtime_paths, memory_profile=memory_profile
     )
+    startup_launcher = fixed_launcher
+    if backend is None:
+        from .gpu_pool import DualGpuBackend, GpuLayout
+
+        layout = GpuLayout.from_env()
+        if layout is not None:
+            manager = DualGpuBackend(manager, runtime_paths, memory_profile, layout)
+            if fixed_launcher is None:
+                startup_launcher = normalize_launcher(os.environ.get("H3_SERVE_ENGINE", "first_last"))
+                engine_state.update(active=launcher_family(startup_launcher), launcher=startup_launcher,
+                                    weight_tier=launcher_weight_tier(startup_launcher),
+                                    vram_profile=launcher_vram_profile(startup_launcher))
+            print(f"H3 dual GPU: Qwen {layout.qwen}, DiT {layout.dit}, VAE {layout.decode}", flush=True)
     lora_catalog = _discover_lora_checkpoints(runtime_paths.model_dir)
     initial_family = (
         None if fixed_launcher is None else launcher_family(fixed_launcher)
@@ -2455,7 +2488,11 @@ def create_app(
             "warm_state": getattr(
                 service.backend, "warm_state", {"status": "unsupported"}
             ),
-            "gpu_concurrency": 1,
+            "gpu_concurrency": len(getattr(manager, "slots", (manager,))),
+            "gpu_layout": (
+                {"qwen": manager.layout.qwen, "dit": manager.layout.dit, "decode": manager.layout.decode}
+                if hasattr(manager, "layout") else None
+            ),
             "upscaler": video_upscaler.status(),
             "host_memory": {
                 "active_profile": active_memory_profile.key,
@@ -2595,13 +2632,17 @@ def create_app(
                 requested_engine = payload.get("service_family", payload.get("engine"))
                 if requested_engine in ENGINES:
                     requested_engine = engine_family(str(requested_engine))
+                launcher = active_launcher(required=True)
                 if requested_engine not in (None, "", engine):
                     if fixed_engine is not None:
                         raise ContractError(f"this service is fixed to the {engine} engine")
-                    raise ContractError(f"the active engine is {engine}")
+                    if not hasattr(manager, "slots") or requested_engine not in SERVICE_FAMILIES:
+                        raise ContractError(f"the active engine is {engine}")
+                    engine = requested_engine
+                    launcher = resolve_launcher(engine, engine_state["weight_tier"], engine_state["vram_profile"])
                 payload.pop("engine", None)
                 payload["service_family"] = engine
-                payload["runtime_launcher"] = active_launcher(required=True)
+                payload["runtime_launcher"] = launcher
                 payload["weight_tier"] = engine_state["weight_tier"]
                 payload["vram_profile"] = engine_state["vram_profile"]
                 payload.setdefault("model_variant", engine_state["default_variant"])
@@ -3233,7 +3274,7 @@ def create_app(
         )
 
     async def on_startup(_: web.Application) -> None:
-        await service.start(fixed_launcher, preload=preload)
+        await service.start(startup_launcher, preload=preload)
         # The default compatibility object is a no-op.  Explicitly injected
         # legacy upscalers remain startable for isolated migration tests only.
         if (

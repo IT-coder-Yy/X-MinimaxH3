@@ -2,7 +2,7 @@
 
 [English](README.md) · **简体中文**
 
-X-MinimaxH3 是面向单张 NVIDIA SM89 GPU 优化的 MiniMax H3 本地视频生成服务。
+X-MinimaxH3 是面向 NVIDIA SM89 GPU 的 MiniMax H3 本地视频生成服务。
 项目通过统一的中英文 Web 控制台和 REST API 提供 FL2VA、Ref2VA、Base/LoRA
 热切换、分档显存执行、断点预览以及 H3 原生二次采样。
 
@@ -20,7 +20,7 @@ X-MinimaxH3 是面向单张 NVIDIA SM89 GPU 优化的 MiniMax H3 本地视频生
 - Ref2VA 支持参考图片、参考视频和独立参考音频。
 - 内置 Larry Turbo 与三套任务型 LightX2V LoRA 配置。
 - 可恢复断点任务和固定低成本预览。
-- 串行 GPU 队列、任务取消、历史记录和每秒硬件监控。
+- 单卡队列或双任务 GPU 并发、任务取消、历史记录和每秒硬件监控。
 - 可选 ComfyUI HTTP 连接器，不会在 ComfyUI 中重复加载一套 H3。
 - 控制台和主要用户文档均支持英文与简体中文。
 
@@ -121,6 +121,24 @@ cd X-MinimaxH3
 
 在 WSL2 中，`./run.sh` 会自动把热运行源码与缓存同步到 Linux 文件系统，避免
 服务反复通过 `/mnt/c` 导入大量 Python 文件和访问元数据。
+
+### 双任务多卡部署
+
+使用已安装好的运行时和模型，直接执行 `./run.sh`。当物理卡 7、6、5、3 都是可用的 SM89 时，默认启用两个推理进程，服务可直接接收 24GB INT8 Base 任务。其他机器默认沿用单卡模式。可在根目录的 `.env` 中指定卡号，修改后重启服务生效。
+
+```dotenv
+H3_GPU_MODE=dual
+H3_QWEN_GPUS=7,6,5,3
+H3_DIT_GPUS_FIRST=7,6
+H3_DIT_GPUS_SECOND=5,3
+H3_DECODE_GPUS=7,6,5,3
+```
+
+- 卡号以 `nvidia-smi` 为准。Qwen 在列表首卡运行编码器，各组注意力头按列表顺序计算。Qwen 卡数可以是 1、2、4 或 8，两条任务依次编码。
+- 两组 DiT 的首卡各自承担主计算。可用时优先分配第一组，第三条及后续任务按现有队列顺序等待。24GB INT8 Base 的流式注意力支持按头切分，多卡组大小须整除 56，两组不能重叠。LoRA 或不支持拆分的算子沿用该组主卡上的原生计算。
+- 最终音视频解码共同使用解码列表中第一张空闲卡。服务避开其他任务已占用的卡和有外部计算进程的卡，全部繁忙时等待。运行中的 DiT 与后到任务的 Qwen 用卡重叠时，后者也会等待。两份热会话各自占用主机内存。
+- `GET /healthz` 返回 `gpu_concurrency` 和物理卡布局。执行日志包含每个任务实际使用的卡。双卡组可在同一服务接收 FL2VA 和 Ref2VA，API 请求用 `service_family` 指定模型族。
+- `H3_GPU_MODE=single` 使用原有单卡启动方式。启动前由外层 shell 或作业调度器设置的 `CUDA_VISIBLE_DEVICES` 仍限制可选卡。旧 `.env` 中单独的 `CUDA_VISIBLE_DEVICES=7` 可直接迁移到默认布局。
 
 ## 安装与发布验收
 

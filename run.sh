@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 release_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Preserve a caller's GPU allocation when an older .env selects only the primary.
+export H3_INHERITED_CUDA_MASK="${CUDA_VISIBLE_DEVICES-__unset__}"
 if [[ -f "${release_root}/.env" ]]; then
+  set -a
   # Centralized user configuration (host, port, API key, model paths).
   source "${release_root}/.env"
+  set +a
 fi
 if [[ -f "${release_root}/.env.local" ]]; then
   # Generated only by setup.sh and intentionally excluded from Git.
