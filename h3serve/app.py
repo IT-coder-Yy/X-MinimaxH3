@@ -1848,6 +1848,7 @@ def create_app(
     prompt_enhancer: Any | None = None,
     upscaler: Any | None = None,
     memory_profile: HostMemoryProfile | None = None,
+    requested_memory_profile: str = "auto",
 ) -> web.Application:
     fixed_launcher = (
         None if fixed_engine is None else normalize_launcher(str(fixed_engine))
@@ -1896,7 +1897,21 @@ def create_app(
         return response
 
     app = web.Application(middlewares=[api_auth], client_max_size=640 * 1024 * 1024)
-    memory_profile = memory_profile or HOST_MEMORY_PROFILES["fullspeed"]
+    layout = None
+    if backend is None:
+        from .gpu_pool import DualGpuBackend, resolve_service_resources
+
+        memory_status = detect_host_memory()
+        memory_profile, layout = resolve_service_resources(
+            memory_profile.key if memory_profile else requested_memory_profile, memory_status
+        )
+        print(
+            f"Host memory profile: {memory_profile.label} "
+            f"(effective {memory_status.effective_limit_gib:.1f} GiB, "
+            f"available {memory_status.available_gib:.1f} GiB)", flush=True,
+        )
+    else:
+        memory_profile = memory_profile or HOST_MEMORY_PROFILES["fullspeed"]
     memory_state = {"profile": memory_profile, "changing": False}
     engine_state: dict[str, Any] = {
         "active": fixed_engine,
@@ -1921,18 +1936,14 @@ def create_app(
         runtime_paths, memory_profile=memory_profile
     )
     startup_launcher = fixed_launcher
-    if backend is None:
-        from .gpu_pool import DualGpuBackend, GpuLayout
-
-        layout = GpuLayout.from_env()
-        if layout is not None:
-            manager = DualGpuBackend(manager, runtime_paths, memory_profile, layout)
-            if fixed_launcher is None:
-                startup_launcher = normalize_launcher(os.environ.get("H3_SERVE_ENGINE", "first_last"))
-                engine_state.update(active=launcher_family(startup_launcher), launcher=startup_launcher,
-                                    weight_tier=launcher_weight_tier(startup_launcher),
-                                    vram_profile=launcher_vram_profile(startup_launcher))
-            print(f"H3 dual GPU: Qwen {layout.qwen}, DiT {layout.dit}, VAE {layout.decode}", flush=True)
+    if layout is not None:
+        manager = DualGpuBackend(manager, runtime_paths, memory_profile, layout)
+        if fixed_launcher is None:
+            startup_launcher = normalize_launcher(os.environ.get("H3_SERVE_ENGINE", "first_last"))
+            engine_state.update(active=launcher_family(startup_launcher), launcher=startup_launcher,
+                                weight_tier=launcher_weight_tier(startup_launcher),
+                                vram_profile=launcher_vram_profile(startup_launcher))
+        print(f"H3 dual GPU: Qwen {layout.qwen}, DiT {layout.dit}, VAE {layout.decode}", flush=True)
     lora_catalog = _discover_lora_checkpoints(runtime_paths.model_dir)
     initial_family = engine_state["active"]
     compatible_loras = {
@@ -2558,16 +2569,21 @@ def create_app(
             document = await request.json()
             requested = str(document.get("profile", ""))
             detected = detect_host_memory()
+            slots = getattr(manager, "slots", ())
+            reclaimable = (
+                sum(current_process_pss_gib(slot.pid) for slot in slots if slot.pid)
+                if slots else current_process_pss_gib()
+            )
             reconfiguration_status = HostMemoryStatus(
                 detected.physical_total_gib,
                 detected.effective_limit_gib,
                 min(
                     detected.effective_limit_gib,
-                    detected.available_gib + current_process_pss_gib(),
+                    detected.available_gib + reclaimable,
                 ),
             )
             profile = resolve_host_memory_profile(
-                requested, reconfiguration_status
+                requested, reconfiguration_status, sessions=len(slots) or 1
             )
         except (json.JSONDecodeError, RuntimeError, ValueError) as error:
             raise web.HTTPBadRequest(text=str(error)) from error
@@ -3431,19 +3447,6 @@ def main() -> None:
             ) from None
         raise
     paths = ServicePaths.defaults(args.release_root, data_dir=args.data_dir)
-    memory_status = detect_host_memory()
-    try:
-        memory_profile = resolve_host_memory_profile(
-            args.memory_profile, memory_status
-        )
-    except (RuntimeError, ValueError) as error:
-        raise SystemExit(str(error)) from error
-    print(
-        f"Host memory profile: {memory_profile.label} "
-        f"(effective {memory_status.effective_limit_gib:.1f} GiB, "
-        f"available {memory_status.available_gib:.1f} GiB)",
-        flush=True,
-    )
     try:
         app = create_app(
             paths=paths,
@@ -3452,8 +3455,12 @@ def main() -> None:
             max_queued_jobs=args.max_queued_jobs,
             fixed_engine=None if args.unified_console else args.engine,
             preload=False if args.unified_console else not args.lazy_load,
-            memory_profile=memory_profile,
+            requested_memory_profile=args.memory_profile,
         )
+    except (RuntimeError, ValueError) as error:
+        listen_socket.close()
+        raise SystemExit(str(error)) from error
+    try:
         web.run_app(app, sock=listen_socket)
     finally:
         listen_socket.close()

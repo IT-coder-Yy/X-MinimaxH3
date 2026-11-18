@@ -1279,6 +1279,19 @@ class UnifiedConsoleApiTest(AioHTTPTestCase):
                 self.assertIn("does not support reference", await response.text())
         self.assertFalse(self.app["job_service"].jobs)
 
+    async def test_dual_memory_profile_switch_counts_both_workers(self):
+        from types import SimpleNamespace
+        from h3serve.memory_policy import HostMemoryStatus
+
+        self.backend.slots = (SimpleNamespace(pid=11), SimpleNamespace(pid=12))
+        with patch("h3serve.app.detect_host_memory", return_value=HostMemoryStatus(200, 200, 100)), patch(
+            "h3serve.app.current_process_pss_gib", side_effect=[5.0, 5.0]
+        ) as pss:
+            response = await self.client.put("/api/v1/memory-profile", json={"profile": "fullspeed"})
+            self.assertEqual(response.status, 400, await response.text())
+            self.assertIn("2 session(s)", await response.text())
+            self.assertEqual([call.args for call in pss.call_args_list], [(11,), (12,)])
+
     async def test_enter_exit_and_switch_engine(self) -> None:
         options = await (await self.client.get("/api/v1/options")).json()
         self.assertEqual(options["deployment_mode"], "unified_console")

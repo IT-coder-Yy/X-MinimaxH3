@@ -16,6 +16,25 @@ def _smi(query: str) -> list[list[str]]:
     return [[v.strip() for v in line.split(",")] for line in output.splitlines() if line.strip()]
 
 
+def _mask_indices(mask, uuids):
+    tokens = {token.strip() for token in mask.split(",")}
+    return {index for index, uuid in uuids.items() if str(index) in tokens or uuid in tokens}
+
+
+def restrict_cuda_mask(local, inherited):
+    """Keep the requested CUDA order inside the caller's allocation."""
+    requested = [token.strip() for token in local.split(",") if token.strip()]
+    outer = {token.strip() for token in inherited.split(",")}
+    if all(token in outer for token in requested):
+        return ",".join(requested)
+    uuids = {int(i): uuid for i, uuid in _smi("--query-gpu=index,uuid")}
+    allowed = _mask_indices(inherited, uuids)
+    filtered = [token for token in requested if token in outer or _mask_indices(token, uuids) & allowed]
+    if not filtered:
+        raise ValueError(f"CUDA_VISIBLE_DEVICES={local!r} has no GPU in the inherited allocation {inherited!r}")
+    return ",".join(filtered)
+
+
 @dataclass(frozen=True)
 class GpuLayout:
     qwen: tuple[int, ...]
@@ -63,15 +82,14 @@ class GpuLayout:
         budget_mib = get_resource_backend("int8_24gb").planner_budget_gib * 1024
         available = {i for i, (_, cap, mib) in inventory.items()
                      if cap == "8.9" and (explicit or mib >= budget_mib)}
+        uuids = {i: row[0] for i, row in inventory.items()}
         # run.sh distinguishes an inherited allocation from the old primary-only .env.
         inherited = env.get("H3_INHERITED_CUDA_MASK", env.get("CUDA_VISIBLE_DEVICES"))
         if inherited is not None and inherited != "__unset__":
-            mask = {value.strip() for value in inherited.split(",")}
-            available &= {i for i, (uuid, _, _) in inventory.items() if str(i) in mask or uuid in mask}
+            available &= _mask_indices(inherited, uuids)
         local_mask = env.get("CUDA_VISIBLE_DEVICES")
         if not explicit and local_mask is not None:
-            mask = {value.strip() for value in local_mask.split(",")}
-            allowed = {i for i, (uuid, _, _) in inventory.items() if str(i) in mask or uuid in mask}
+            allowed = _mask_indices(local_mask, uuids)
             if allowed != {first[0]} and not selected <= allowed:
                 return None
         if not selected <= available:
@@ -79,6 +97,25 @@ class GpuLayout:
                 raise ValueError(f"selected SM89 GPUs are unavailable: {sorted(selected - available)}")
             return None
         return cls(qwen, (first, second), decode, {i: inventory[i][0] for i in sorted(selected)})
+
+
+def resolve_service_resources(requested, status):
+    from .memory_policy import resolve_host_memory_profile
+
+    layout = GpuLayout.from_env()
+    if layout is not None:
+        try:
+            profile = resolve_host_memory_profile(requested, status, sessions=len(layout.dit))
+        except RuntimeError as error:
+            if os.environ.get("H3_GPU_MODE") == "dual":
+                raise RuntimeError(f"H3_GPU_MODE=dual: {error}") from error
+            print(f"H3 auto: falling back to one worker: {error}", flush=True)
+            # The native worker uses cuda:0. Keep an explicit local mask or
+            # use the configured primary when the shell did not select one.
+            os.environ.setdefault("CUDA_VISIBLE_DEVICES", layout.uuids[layout.dit[0][0]])
+        else:
+            return profile, layout
+    return resolve_host_memory_profile(requested, status), None
 
 
 class GpuLeases:
@@ -194,3 +231,12 @@ class DualGpuBackend:
 
         self.native.configure_output_root(output_root)
         self.paths = replace(self.paths, output_dir=output_root)
+
+
+if __name__ == "__main__":
+    import sys
+
+    try:
+        print(restrict_cuda_mask(*sys.argv[1:]))
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        sys.exit(str(error))

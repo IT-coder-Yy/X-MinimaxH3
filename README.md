@@ -134,8 +134,8 @@ Linux filesystem, avoiding repeated imports and metadata access through
 ### Two concurrent GPU workers
 
 Run `./run.sh` with the installed runtime and weights. Auto mode enables two
-workers on physical SM89 GPUs 7, 6, 5 and 3 and starts with the 24 GB INT8
-Base launcher. Other installations default to single-GPU serving. Set these
+workers when physical SM89 GPUs 7, 6, 5 and 3 are available and host RAM
+can fit both sessions. It starts with the 24 GB INT8 Base launcher. Other installations default to single-GPU serving. Set these
 values in the release-local `.env` to require a particular layout.
 
 ```dotenv
@@ -162,7 +162,12 @@ or external compute process. See `/healthz` for the configured layout and the
 service log for actual assignments. Set `service_family` to submit FL2VA or
 Ref2VA through the same service. An inherited `CUDA_VISIBLE_DEVICES` allocation
 constrains the layout. A legacy primary-only `CUDA_VISIBLE_DEVICES=7` in the
-local `.env` works with auto mode. Set `H3_GPU_MODE=single` for one worker.
+local `.env` works with auto mode. For a single worker, `.env` can narrow
+the inherited mask (e.g. from `7,6` to `6`). Host RAM admission covers both
+sessions plus one 8 GiB system reserve. Even the compact dual profile needs
+107.86 GiB of effective capacity and 86.78 GiB available at startup.
+`auto` falls back to one worker if RAM is insufficient. Explicit `dual`
+reports the required budget before loading either worker.
 
 ## Validation
 
