@@ -47,6 +47,28 @@ class LayoutTest(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.layout(**options)
 
+    def test_two_visible_auto_gpus_form_one_ordered_group(self):
+        for config in ({}, {"H3_DIT_GPUS_FIRST": "6,5", "H3_DIT_GPUS_SECOND": "6,5"},
+                       {"H3_DIT_GPUS_FIRST": "6", "H3_DIT_GPUS_SECOND": "5"}):
+            with self.subTest(config=config):
+                layout = self.layout(CUDA_VISIBLE_DEVICES="6,5", **config)
+                self.assertEqual((layout.qwen, layout.dit, layout.decode), ((6, 5), ((6, 5),), (6, 5)))
+        self.assertEqual(self.layout(CUDA_VISIBLE_DEVICES="GPU-5,GPU-6").dit, ((5, 6),))
+        self.assertIsNone(self.layout(CUDA_VISIBLE_DEVICES="6,5", H3_INHERITED_CUDA_MASK="6,99,5"))
+        self.assertIsNone(self.layout(CUDA_VISIBLE_DEVICES="6,5", H3_QWEN_GPUS="7,6"))
+        with self.assertRaisesRegex(ValueError, "disjoint"):
+            self.layout(H3_GPU_MODE="dual", H3_DIT_GPUS_FIRST="6,5", H3_DIT_GPUS_SECOND="6,5")
+        from h3serve.memory_policy import HostMemoryStatus
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "6,5"}, clear=True), patch(
+            "h3serve.gpu_pool._smi", return_value=INVENTORY
+        ):
+            profile, layout = resolve_service_resources("auto", HostMemoryStatus(64, 64, 55))
+            self.assertEqual((profile.key, len(layout.dit)), ("compact", 1))
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "6,5"}, clear=True), patch(
+            "h3serve.gpu_pool._smi", return_value=[[*row[:3], "12288"] for row in INVENTORY]
+        ):
+            self.assertIsNone(GpuLayout.from_env())
+
     def test_single_mask_keeps_local_order_and_respects_uuid_allocation(self):
         with patch("h3serve.gpu_pool._smi", return_value=[row[:2] for row in INVENTORY]):
             self.assertEqual(restrict_cuda_mask("5,6,7", "GPU-7,GPU-6"), "6,7")
@@ -126,6 +148,24 @@ class LeaseTest(unittest.IsolatedAsyncioTestCase):
 
     def acquire(self, slot, phase, external=()):
         return self.leases.acquire(slot, phase, self.cancel, lambda: set(external))
+
+    async def test_one_worker_waits_for_its_pair_and_decodes_on_one_free_card(self):
+        self.leases = GpuLeases(GpuLayout((6, 5), ((6, 5),), (6, 5), {}))
+        for phase in ("qwen", "dit"):
+            busy = {5}
+            waiting = asyncio.create_task(self.acquire(0, phase, busy))
+            try:
+                async with self.leases.changed:
+                    await asyncio.wait_for(self.leases.changed.wait_for(
+                        lambda: self.leases.phases.get(0) == "wait_" + phase), 2)
+                    self.assertFalse(waiting.done())
+                    busy.clear()
+                    self.leases.changed.notify_all()
+                self.assertEqual(await asyncio.wait_for(waiting, 2), (6, 5))
+            finally:
+                waiting.cancel()
+                await asyncio.gather(waiting, return_exceptions=True)
+        self.assertEqual(await self.acquire(0, "decode", {6}), (5,))
 
     async def test_dit_runs_while_another_qwen_waits_for_more_gpus(self):
         self.leases = GpuLeases(GpuLayout((7, 6), ((5,), (3,)), (7, 6), {}))
@@ -281,6 +321,44 @@ class DecodeDeviceTest(unittest.TestCase):
 
 
 class QueueTest(unittest.IsolatedAsyncioTestCase):
+    async def test_paired_worker_keeps_second_job_queued_through_decode(self):
+        from h3serve.app import JobService
+        from h3serve.backend import GenerationResult
+        from h3serve.contract import GenerationSpec
+        from h3serve.gpu_pool import DualGpuBackend
+
+        pool = DualGpuBackend(None, None, None, GpuLayout((6, 5), ((6, 5),), (6, 5), {}))
+        self.assertEqual(len(pool.slots), 1)
+        at_decode, finish_first = asyncio.Event(), asyncio.Event()
+        placements = []
+
+        async def generate(spec, job_id, *args):
+            for phase in ("qwen", "dit", "decode"):
+                group = await pool.leases.acquire(0, phase, asyncio.Event(), set)
+                placements.append((spec.seed, group))
+            if spec.seed == 1:
+                at_decode.set()
+                await finish_first.wait()
+            await pool.leases.finish(0)
+            return GenerationResult("test", 1.0, Path(job_id + ".mp4"))
+
+        with tempfile.TemporaryDirectory() as root, patch.object(pool.slots[0], "generate", generate):
+            service = JobService(Path(root), pool)
+            await service.start()
+            try:
+                a, b = [await service.submit(GenerationSpec.from_mapping({"prompt": "test", "seed": n}), {})
+                        for n in (1, 2)]
+                await asyncio.wait_for(at_decode.wait(), 2)
+                self.assertEqual((b.status, service.pending), ("queued", [b.id]))
+                finish_first.set()
+                async with service.queue_changed:
+                    await asyncio.wait_for(service.queue_changed.wait_for(
+                        lambda: a.status == b.status == "succeeded"), 2)
+                self.assertEqual(placements, [(n, group) for n in (1, 2) for group in ((6, 5), (6, 5), (6,))])
+            finally:
+                finish_first.set()
+                await service.close()
+
     async def test_third_job_waits_for_a_slot_and_next_lone_job_prefers_first(self):
         from h3serve.app import JobService
         from h3serve.backend import GenerationResult
