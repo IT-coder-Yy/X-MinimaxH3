@@ -181,8 +181,10 @@ class NativeSessionFactory:
         self,
         paths: NativeSessionPaths,
         memory_profile: HostMemoryProfile | None = None,
+        gpu_runtime=None,
     ) -> None:
         self.paths = paths.resolved()
+        self.gpu_runtime = gpu_runtime
         self.memory_profile = memory_profile or HOST_MEMORY_PROFILES["fullspeed"]
         self._progress_callback = None
         self._lora_checkpoint = (
@@ -444,6 +446,9 @@ class NativeSessionFactory:
                 name for name, ready in preflight["checks"].items() if not ready
             )
             raise RuntimeError(f"native {engine} runtime is incomplete: {missing}")
+        gpu = self.gpu_runtime
+        if gpu is not None:
+            gpu.enter("load")
         if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 9):
             raise RuntimeError("native H3 release requires one RTX 4090 / SM89 GPU")
         runtime_config = RuntimeConfig.for_cuda_device(
@@ -464,11 +469,10 @@ class NativeSessionFactory:
         # custom-kernel workspaces that are visible to NVML but not Torch.
         gc.collect()
         torch.cuda.empty_cache()
-        physical_bytes = int(torch.cuda.get_device_properties(0).total_memory)
-        allocator_fraction = min(
-            1.0, float(runtime_config.max_device_bytes) / physical_bytes
-        )
-        torch.cuda.set_per_process_memory_fraction(allocator_fraction, 0)
+        for device in gpu.devices if gpu is not None else (0,):
+            physical_bytes = torch.cuda.get_device_properties(device).total_memory
+            allocator_fraction = min(1.0, runtime_config.max_device_bytes / physical_bytes)
+            torch.cuda.set_per_process_memory_fraction(allocator_fraction, device)
         kernel_runtime = configure_sm89_runtime(
             quant_backend="cuda",
             smoke_test=True,
@@ -659,6 +663,8 @@ class NativeSessionFactory:
             self.paths.minimax_source / "tokenizer",
             cache_pinned_weights=self.memory_profile.cache_qwen_weights,
             layer_cache_dir=qwen_layer_cache,
+            device=gpu.qwen[0] if gpu else "cuda",
+            attention_devices=gpu.qwen if gpu else (),
         )
         self._progress(18, "model_graphs", "并行装配DiT、VAE与二采模型")
 
@@ -923,6 +929,7 @@ class NativeSessionFactory:
             )
         session = NativeT2AVHotSession(
             engine=base_engine,
+            gpu_runtime=gpu,
             conditioner=conditioner,
             transformer=transformer,
             video_vae=video_vae,

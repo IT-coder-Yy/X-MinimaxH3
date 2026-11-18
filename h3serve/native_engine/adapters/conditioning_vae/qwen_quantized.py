@@ -91,6 +91,7 @@ class PackedQwen3VLT2AVConditioner:
         tokenizer_path: str | Path,
         *,
         device: str | torch.device = "cuda",
+        attention_devices=(),
         dtype: torch.dtype = torch.float32,
         layers: int = 50,
         cache_pinned_weights: bool = False,
@@ -102,6 +103,7 @@ class PackedQwen3VLT2AVConditioner:
         self.checkpoint = Path(checkpoint)
         self.tokenizer_path = Path(tokenizer_path)
         self.device = torch.device(device)
+        self.attention_devices = tuple(attention_devices)
         self.dtype = dtype
         self.layers = int(layers)
         self.cache_pinned_weights = bool(cache_pinned_weights)
@@ -706,14 +708,21 @@ class PackedQwen3VLT2AVConditioner:
         causal_mask = torch.empty(
             (tokens, tokens), device=value.device, dtype=value.dtype
         ).fill_(torch.finfo(value.dtype).min / 4).triu_(1)
-        output = F.scaled_dot_product_attention(
-            q.transpose(0, 1).unsqueeze(0),
-            k.transpose(0, 1).unsqueeze(0),
-            v.transpose(0, 1).unsqueeze(0),
-            attn_mask=causal_mask,
-            is_causal=False,
-            enable_gqa=True,
-        )
+        q, k, v = (t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))
+        devices = self.attention_devices
+        if len(devices) > 1:
+            parts = []
+            for device, qs, ks, vs in zip(devices, *(t.chunk(len(devices), 1) for t in (q, k, v))):
+                with torch.cuda.device(device):
+                    parts.append(F.scaled_dot_product_attention(
+                        qs.to(device), ks.to(device), vs.to(device),
+                        attn_mask=causal_mask.to(device), is_causal=False, enable_gqa=True,
+                    ))
+            output = torch.cat([part.to(q.device) for part in parts], dim=1)
+        else:
+            output = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=causal_mask, is_causal=False, enable_gqa=True,
+            )
         output = output.squeeze(0).transpose(0, 1).reshape(tokens, -1)
         return self._linear(checkpoint, f"{prefix}.o_proj", output)
 

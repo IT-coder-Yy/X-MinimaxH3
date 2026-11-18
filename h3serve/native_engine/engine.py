@@ -67,6 +67,8 @@ def _public_inference_plan(execution_profile: object) -> dict[str, Any] | None:
         return None
     joint = execution_profile.get("joint_acceleration")
     result = dict(joint) if isinstance(joint, dict) else {}
+    if "dit_head_parallel_calls" in execution_profile:
+        result["dit_head_parallel_calls"] = execution_profile["dit_head_parallel_calls"]
     memory_execution = execution_profile.get("memory_execution")
     if isinstance(memory_execution, dict):
         result["memory_execution"] = dict(memory_execution)

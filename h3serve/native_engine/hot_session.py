@@ -14,6 +14,7 @@ import json
 import math
 import os
 import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -887,7 +888,9 @@ class NativeT2AVHotSession:
         lora_profile_id: str = "larry_turbo_v4_step600_ema",
         lora_recommended_steps: tuple[int, ...] = (4, 5, 6, 7, 8),
         lora_default_steps: int = 6,
+        gpu_runtime=None,
     ) -> None:
+        self.gpu_runtime = gpu_runtime
         self.engine = engine
         self.conditioner = conditioner
         self.transformer = transformer
@@ -1048,7 +1051,25 @@ class NativeT2AVHotSession:
             == "w4a8_8gb"
             and int(width) * int(height) > 1280 * 736
         )
+        if enabled and getattr(self, "gpu_runtime", None):
+            return stream_video_vae_decoder_tail(model, enabled=True, device=f"cuda:{torch.cuda.current_device()}")
         return stream_video_vae_decoder_tail(model, enabled=enabled)
+
+    @contextmanager
+    def _decode_device(self):
+        gpu = getattr(self, "gpu_runtime", None)
+        if gpu is None:
+            yield "cuda:0"
+            return
+        from .model.head_parallel import active_head_parallel
+
+        parallel = active_head_parallel.get()
+        if parallel is not None:
+            parallel.shards.clear()
+        torch.cuda.empty_cache()
+        device = gpu.enter("decode")
+        with torch.cuda.device(device):
+            yield str(device)
 
     def generate(
         self, request: HotSessionRequest
@@ -1058,8 +1079,15 @@ class NativeT2AVHotSession:
         torch.cuda.reset_peak_memory_stats()
         telemetry_before = self._attention_telemetry()
         try:
-            result = self._generate_impl(request)
+            from .model.head_parallel import HeadParallel
+
+            gpu = getattr(self, "gpu_runtime", None)
+            parallel = gpu and len(gpu.dit) > 1 and self.runtime_config.resource_profile == "int8_24gb"
+            with HeadParallel(gpu.dit) if parallel else nullcontext() as heads:
+                result = self._generate_impl(request)
             profile = dict(result.execution_profile)
+            if gpu:
+                profile["dit_head_parallel_calls"] = heads.calls if heads else 0
             profile["attention_backend"] = self._telemetry_delta(
                 telemetry_before,
                 self._attention_telemetry(),
@@ -1153,83 +1181,84 @@ class NativeT2AVHotSession:
         raise_if_cancelled()
         execution_plan = request.execution_plan
 
-        progress(90, "video_decode", "解码拼接后的高分辨率视频")
-        self._timed(
-            phases,
-            "video_vae_h2d",
-            lambda: self.video_vae.move_to("cuda:0", non_blocking=True),
-        )
-        if execution_plan is not None and execution_plan.vae_spatial_tile is not None:
-            tile_height, tile_width = execution_plan.vae_spatial_tile
-            if tile_height != tile_width:
-                raise ValueError("the current H3 Video-VAE supports square tiles only")
-            model = self.video_vae.value
-            if not hasattr(model, "decoder_tile_size"):
-                raise TypeError("the H3 Video-VAE does not expose decoder_tile_size")
-            model.decoder_tile_size = tile_height
-        from .adapters.vae_tiling import configure_vae_tile_batching
-        from .adapters.vae_compile import (
-            transformer_block_compile,
-            transformer_block_compile_ready,
-        )
-
-        configure_vae_tile_batching(
-            self.video_vae.value,
-            1 if execution_plan is None else execution_plan.vae_tile_batch_size,
-        )
-        compile_vae_block = bool(
-            execution_plan is not None
-            and execution_plan.vae_transformer_block_compile
-        )
-        if compile_vae_block and not transformer_block_compile_ready(
-            self.video_vae.value
-        ):
-            raise RuntimeError(
-                "execution plan requested VAE TransformerBlock compilation, "
-                "but the session did not prebuild the compiled decoder"
+        with self._decode_device() as decode_device:
+            progress(90, "video_decode", "解码拼接后的高分辨率视频")
+            self._timed(
+                phases,
+                "video_vae_h2d",
+                lambda: self.video_vae.move_to(decode_device, non_blocking=True),
             )
-        with self._video_vae_block_streaming(
-            self.video_vae.value, width=request.width, height=request.height
-        ):
-            with transformer_block_compile(compile_vae_block):
-                decoded_video = self._timed(
-                    phases,
-                    "video_decode",
-                    lambda: self._decode_video_for_plan(
-                        self.video_vae.value,
-                        video.to("cuda:0"),
-                        request.frames,
-                        execution_plan,
-                    ),
-                )
-        del video
-        self._timed(
-            phases,
-            "video_vae_evict",
-            lambda: self.video_vae.move_to("cpu", non_blocking=False),
-        )
-        self._release_device()
-        raise_if_cancelled()
+            if execution_plan is not None and execution_plan.vae_spatial_tile is not None:
+                tile_height, tile_width = execution_plan.vae_spatial_tile
+                if tile_height != tile_width:
+                    raise ValueError("the current H3 Video-VAE supports square tiles only")
+                model = self.video_vae.value
+                if not hasattr(model, "decoder_tile_size"):
+                    raise TypeError("the H3 Video-VAE does not expose decoder_tile_size")
+                model.decoder_tile_size = tile_height
+            from .adapters.vae_tiling import configure_vae_tile_batching
+            from .adapters.vae_compile import (
+                transformer_block_compile,
+                transformer_block_compile_ready,
+            )
 
-        progress(96, "audio_decode", "解码原始音频")
-        self._timed(
-            phases,
-            "audio_vae_h2d",
-            lambda: self.audio_vae.move_to("cuda:0", non_blocking=True),
-        )
-        decoded_audio = self._timed(
-            phases,
-            "audio_decode",
-            lambda: self.decode_audio(self.audio_vae.value, audio.to("cuda:0")),
-        )
-        del audio
-        self._timed(
-            phases,
-            "audio_vae_evict",
-            lambda: self.audio_vae.move_to("cpu", non_blocking=False),
-        )
-        self._release_device()
-        raise_if_cancelled()
+            configure_vae_tile_batching(
+                self.video_vae.value,
+                1 if execution_plan is None else execution_plan.vae_tile_batch_size,
+            )
+            compile_vae_block = bool(
+                execution_plan is not None
+                and execution_plan.vae_transformer_block_compile
+            )
+            if compile_vae_block and not transformer_block_compile_ready(
+                self.video_vae.value
+            ):
+                raise RuntimeError(
+                    "execution plan requested VAE TransformerBlock compilation, "
+                    "but the session did not prebuild the compiled decoder"
+                )
+            with self._video_vae_block_streaming(
+                self.video_vae.value, width=request.width, height=request.height
+            ):
+                with transformer_block_compile(compile_vae_block):
+                    decoded_video = self._timed(
+                        phases,
+                        "video_decode",
+                        lambda: self._decode_video_for_plan(
+                            self.video_vae.value,
+                            video.to(decode_device),
+                            request.frames,
+                            execution_plan,
+                        ),
+                    )
+            del video
+            self._timed(
+                phases,
+                "video_vae_evict",
+                lambda: self.video_vae.move_to("cpu", non_blocking=False),
+            )
+            self._release_device()
+            raise_if_cancelled()
+
+            progress(96, "audio_decode", "解码原始音频")
+            self._timed(
+                phases,
+                "audio_vae_h2d",
+                lambda: self.audio_vae.move_to(decode_device, non_blocking=True),
+            )
+            decoded_audio = self._timed(
+                phases,
+                "audio_decode",
+                lambda: self.decode_audio(self.audio_vae.value, audio.to(decode_device)),
+            )
+            del audio
+            self._timed(
+                phases,
+                "audio_vae_evict",
+                lambda: self.audio_vae.move_to("cpu", non_blocking=False),
+            )
+            self._release_device()
+            raise_if_cancelled()
 
         progress(99, "mux", "封装高分辨率音视频")
         self._timed(
@@ -2657,6 +2686,8 @@ class NativeT2AVHotSession:
                 self._backfill_legacy_conditioning_cache(
                     request, self._last_conditioning_cache_payload
                 )
+                if getattr(self, "gpu_runtime", None):
+                    return host_embeds, host_tags
                 return embeds, tags
             cached_entry = (fingerprint, host_embeds, host_tags)
             if has_frames:
@@ -2666,6 +2697,8 @@ class NativeT2AVHotSession:
         self._last_conditioning_cache_payload = self._conditioning_payload(
             fingerprint, host_embeds, host_tags
         )
+        if getattr(self, "gpu_runtime", None):
+            return host_embeds, host_tags
         device = self.runtime_config.device
         return (
             host_embeds.to(device, non_blocking=True),
@@ -2795,11 +2828,16 @@ class NativeT2AVHotSession:
             getattr(self.conditioner, "vision_cache_hits", 0)
         )
 
-        context_5120, text_tags = self._timed(
-            phases,
-            "text_encode",
-            lambda: self._encode_request(request),
-        )
+        gpu = getattr(self, "gpu_runtime", None)
+        with torch.cuda.device(gpu.enter("qwen")) if gpu else nullcontext():
+            context_5120, text_tags = self._timed(
+                phases, "text_encode", lambda: self._encode_request(request),
+            )
+        if gpu:
+            torch.cuda.empty_cache()
+            primary = gpu.enter("dit")
+            context_5120 = context_5120.to(primary, non_blocking=True)
+            text_tags = text_tags.to(primary, non_blocking=True)
         progress(12, "text", "提示词编码完成")
         raise_if_cancelled()
 
@@ -4880,136 +4918,137 @@ class NativeT2AVHotSession:
                 },
             )
 
-        progress(80, "video_decode", "视频解码")
-        self._timed(
-            phases,
-            "video_vae_h2d",
-            lambda: self.video_vae.move_to("cuda:0", non_blocking=True),
-        )
-        if execution_plan is not None and execution_plan.vae_spatial_tile is not None:
-            tile_height, tile_width = execution_plan.vae_spatial_tile
-            if tile_height != tile_width:
-                raise ValueError("the current H3 Video-VAE supports square tiles only")
-            video_vae_model = self.video_vae.value
-            if not hasattr(video_vae_model, "decoder_tile_size"):
-                raise TypeError("the H3 Video-VAE does not expose decoder_tile_size")
-            video_vae_model.decoder_tile_size = tile_height
-        from .adapters.vae_tiling import configure_vae_tile_batching
-        from .adapters.real_vae import select_uint8_postprocess_frame_chunk
-        from .adapters.vae_compile import (
-            transformer_block_compile,
-            transformer_block_compile_ready,
-        )
-
-        configure_vae_tile_batching(
-            self.video_vae.value,
-            1 if execution_plan is None else execution_plan.vae_tile_batch_size,
-        )
-        uint8_frame_chunk = select_uint8_postprocess_frame_chunk((
-            1,
-            3,
-            request.frames,
-            request.height,
-            request.width,
-        ))
-        execution_profile["video_uint8_postprocess"] = {
-            "mode": (
-                "temporal_streaming_exact"
-                if uint8_frame_chunk is not None
-                else "single_tensor_exact"
-            ),
-            "frame_chunk": uint8_frame_chunk,
-            "routing_inputs": "output_geometry_only",
-        }
-        compile_vae_block = bool(
-            execution_plan is not None
-            and execution_plan.vae_transformer_block_compile
-        )
-        if compile_vae_block and not transformer_block_compile_ready(
-            self.video_vae.value
-        ):
-            raise RuntimeError(
-                "execution plan requested VAE TransformerBlock compilation, "
-                "but the session did not prebuild the compiled decoder"
+        with self._decode_device() as decode_device:
+            progress(80, "video_decode", "视频解码")
+            self._timed(
+                phases,
+                "video_vae_h2d",
+                lambda: self.video_vae.move_to(decode_device, non_blocking=True),
             )
-        with self._video_vae_block_streaming(
-            self.video_vae.value, width=request.width, height=request.height
-        ) as block_policy:
-            with transformer_block_compile(compile_vae_block):
-                decoded_video = self._timed(
-                    phases,
-                    "video_decode",
-                    lambda: self._decode_video_for_plan(
-                        self.video_vae.value,
-                        video,
-                        request.frames,
-                        execution_plan,
-                    ),
+            if execution_plan is not None and execution_plan.vae_spatial_tile is not None:
+                tile_height, tile_width = execution_plan.vae_spatial_tile
+                if tile_height != tile_width:
+                    raise ValueError("the current H3 Video-VAE supports square tiles only")
+                video_vae_model = self.video_vae.value
+                if not hasattr(video_vae_model, "decoder_tile_size"):
+                    raise TypeError("the H3 Video-VAE does not expose decoder_tile_size")
+                video_vae_model.decoder_tile_size = tile_height
+            from .adapters.vae_tiling import configure_vae_tile_batching
+            from .adapters.real_vae import select_uint8_postprocess_frame_chunk
+            from .adapters.vae_compile import (
+                transformer_block_compile,
+                transformer_block_compile_ready,
+            )
+
+            configure_vae_tile_batching(
+                self.video_vae.value,
+                1 if execution_plan is None else execution_plan.vae_tile_batch_size,
+            )
+            uint8_frame_chunk = select_uint8_postprocess_frame_chunk((
+                1,
+                3,
+                request.frames,
+                request.height,
+                request.width,
+            ))
+            execution_profile["video_uint8_postprocess"] = {
+                "mode": (
+                    "temporal_streaming_exact"
+                    if uint8_frame_chunk is not None
+                    else "single_tensor_exact"
+                ),
+                "frame_chunk": uint8_frame_chunk,
+                "routing_inputs": "output_geometry_only",
+            }
+            compile_vae_block = bool(
+                execution_plan is not None
+                and execution_plan.vae_transformer_block_compile
+            )
+            if compile_vae_block and not transformer_block_compile_ready(
+                self.video_vae.value
+            ):
+                raise RuntimeError(
+                    "execution plan requested VAE TransformerBlock compilation, "
+                    "but the session did not prebuild the compiled decoder"
                 )
-                decoded_preview_video = (
-                    None
-                    if preview_latents is None or preview_published
-                    else self._timed(
+            with self._video_vae_block_streaming(
+                self.video_vae.value, width=request.width, height=request.height
+            ) as block_policy:
+                with transformer_block_compile(compile_vae_block):
+                    decoded_video = self._timed(
                         phases,
-                        "preview_video_decode",
+                        "video_decode",
                         lambda: self._decode_video_for_plan(
                             self.video_vae.value,
-                            preview_latents[0].to("cuda:0"),
+                            video.to(decode_device),
                             request.frames,
                             execution_plan,
                         ),
                     )
-                )
-        execution_profile["video_vae_block_streaming"] = block_policy
-        del video
-        self._timed(
-            phases,
-            "video_vae_evict",
-            lambda: self.video_vae.move_to("cpu", non_blocking=False),
-        )
-        self._release_device()
-        self._timed(
-            phases,
-            "video_host_scratch_release",
-            self._release_request_host_scratch,
-        )
-        raise_if_cancelled()
-
-        progress(94, "audio_decode", "音频解码")
-        self._timed(
-            phases,
-            "audio_vae_h2d",
-            lambda: self.audio_vae.move_to("cuda:0", non_blocking=True),
-        )
-        decoded_audio = self._timed(
-            phases,
-            "audio_decode",
-            lambda: self.decode_audio(self.audio_vae.value, audio),
-        )
-        decoded_preview_audio = (
-            None
-            if preview_latents is None or preview_published
-            else self._timed(
+                    decoded_preview_video = (
+                        None
+                        if preview_latents is None or preview_published
+                        else self._timed(
+                            phases,
+                            "preview_video_decode",
+                            lambda: self._decode_video_for_plan(
+                                self.video_vae.value,
+                                preview_latents[0].to(decode_device),
+                                request.frames,
+                                execution_plan,
+                            ),
+                        )
+                    )
+            execution_profile["video_vae_block_streaming"] = block_policy
+            del video
+            self._timed(
                 phases,
-                "preview_audio_decode",
-                lambda: self.decode_audio(
-                    self.audio_vae.value, preview_latents[1].to("cuda:0")
-                ),
+                "video_vae_evict",
+                lambda: self.video_vae.move_to("cpu", non_blocking=False),
             )
-        )
-        preview_latents = None
-        del audio
-        self._timed(
-            phases,
-            "audio_vae_evict",
-            lambda: self.audio_vae.move_to("cpu", non_blocking=False),
-        )
-        self._release_device()
-        self._timed(
-            phases,
-            "audio_host_scratch_release",
-            self._release_request_host_scratch,
-        )
+            self._release_device()
+            self._timed(
+                phases,
+                "video_host_scratch_release",
+                self._release_request_host_scratch,
+            )
+            raise_if_cancelled()
+
+            progress(94, "audio_decode", "音频解码")
+            self._timed(
+                phases,
+                "audio_vae_h2d",
+                lambda: self.audio_vae.move_to(decode_device, non_blocking=True),
+            )
+            decoded_audio = self._timed(
+                phases,
+                "audio_decode",
+                lambda: self.decode_audio(self.audio_vae.value, audio.to(decode_device)),
+            )
+            decoded_preview_audio = (
+                None
+                if preview_latents is None or preview_published
+                else self._timed(
+                    phases,
+                    "preview_audio_decode",
+                    lambda: self.decode_audio(
+                        self.audio_vae.value, preview_latents[1].to(decode_device)
+                    ),
+                )
+            )
+            preview_latents = None
+            del audio
+            self._timed(
+                phases,
+                "audio_vae_evict",
+                lambda: self.audio_vae.move_to("cpu", non_blocking=False),
+            )
+            self._release_device()
+            self._timed(
+                phases,
+                "audio_host_scratch_release",
+                self._release_request_host_scratch,
+            )
 
         progress(98, "mux", "封装音视频")
         def mux():
