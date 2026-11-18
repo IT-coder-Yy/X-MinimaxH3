@@ -1,4 +1,4 @@
-"""Physical GPU configuration and phase ownership for two native workers."""
+"""Physical GPU configuration and phase ownership for native workers."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ def restrict_cuda_mask(local, inherited):
 @dataclass(frozen=True)
 class GpuLayout:
     qwen: tuple[int, ...]
-    dit: tuple[tuple[int, ...], tuple[int, ...]]
+    dit: tuple[tuple[int, ...], ...]
     decode: tuple[int, ...]
     uuids: dict[int, str]
 
@@ -72,7 +72,9 @@ class GpuLayout:
         force_dual = mode == "dual"
 
         def cards(key, default):
-            raw = env.get(key, default).split(",")
+            if key not in env:
+                return default
+            raw = env[key].split(",")
             if any(not v.strip().isdigit() for v in raw):
                 raise ValueError(f"{key} requires comma-separated physical GPU indices")
             group = tuple(int(v) for v in raw)
@@ -80,14 +82,6 @@ class GpuLayout:
                 raise ValueError(f"{key} contains duplicate GPUs")
             return group
 
-        first, second = cards(keys[1], "7,6"), cards(keys[2], "5,3")
-        if set(first) & set(second) or any(56 % len(group) for group in (first, second)):
-            raise ValueError("DiT groups must be disjoint and each size must divide 56 heads")
-        ordered = ",".join(map(str, (*first, *second)))
-        qwen, decode = cards(keys[0], ordered), cards(keys[3], ordered)
-        if len(qwen) > 8:
-            raise ValueError("Qwen supports up to eight GPUs (one per KV head)")
-        selected = set((*first, *second, *qwen, *decode))
         try:
             inventory = {int(i): (uuid, capability, int(mib)) for i, uuid, capability, mib in
                          _smi("--query-gpu=index,uuid,compute_cap,memory.total")}
@@ -103,19 +97,37 @@ class GpuLayout:
         uuids = {i: row[0] for i, row in inventory.items()}
         # run.sh distinguishes an inherited allocation from the old primary-only .env.
         inherited = env.get("H3_INHERITED_CUDA_MASK", env.get("CUDA_VISIBLE_DEVICES"))
-        if inherited is not None and inherited != "__unset__":
-            available.intersection_update(_mask_indices(inherited, uuids))
+        outer = uuids if inherited in (None, "__unset__") else _mask_indices(inherited, uuids)
+        available.intersection_update(outer)
         local_mask = env.get("CUDA_VISIBLE_DEVICES")
+        local = outer if local_mask is None else _mask_indices(local_mask, uuids)
+        visible = tuple(i for i in local if i in outer)
+        paired = not force_dual and len(visible) == 2
+        first = cards(keys[1], visible if paired else (7, 6))
+        second = cards(keys[2], visible if paired else (5, 3))
+        if paired:
+            if not set(first + second).issubset(visible):
+                return None
+            # One worker owns both visible GPUs; the first group's primary stays first.
+            groups = (tuple(dict.fromkeys(first + visible)),)
+        else:
+            groups = (first, second)
+            if set(first) & set(second) or any(56 % len(group) for group in groups):
+                raise ValueError("DiT groups must be disjoint and each size must divide 56 heads")
+        ordered = tuple(i for group in groups for i in group)
+        qwen, decode = cards(keys[0], ordered), cards(keys[3], ordered)
+        if len(qwen) > 8:
+            raise ValueError("Qwen supports up to eight GPUs (one per KV head)")
+        selected = set((*ordered, *qwen, *decode))
         if not force_dual and local_mask is not None:
-            allowed = _mask_indices(local_mask, uuids).keys()
-            legacy_primary = "," not in local_mask and allowed == {first[0]}
-            if not legacy_primary and not selected <= allowed:
+            legacy_primary = "," not in local_mask and local.keys() == {first[0]}
+            if not legacy_primary and not selected <= local.keys():
                 return None
         if not selected <= available:
             if force_dual:
                 raise ValueError(f"selected SM89 GPUs are unavailable: {sorted(selected - available)}")
             return None
-        return cls(qwen, (first, second), decode, {i: inventory[i][0] for i in sorted(selected)})
+        return cls(qwen, groups, decode, {i: inventory[i][0] for i in sorted(selected)})
 
 
 def resolve_service_resources(requested, status):
@@ -128,6 +140,8 @@ def resolve_service_resources(requested, status):
         except RuntimeError as error:
             if os.environ.get("H3_GPU_MODE") == "dual":
                 raise RuntimeError(f"H3_GPU_MODE=dual: {error}") from error
+            if len(layout.dit) == 1:
+                raise
             print(f"H3 auto: falling back to one worker: {error}", flush=True)
             # The native worker uses cuda:0. Keep an explicit local mask or
             # use the configured primary when the shell did not select one.
@@ -152,12 +166,17 @@ class GpuLeases:
 
     async def acquire(self, slot, phase, cancel, external_cards, minimum=1):
         """Swap phase leases atomically; only granted cards are occupied."""
+        paired = len(self.layout.dit) == 1
+        if paired and phase == "qwen":
+            minimum = max(minimum, len(self.layout.qwen))
         async with self.changed:
             self.held.pop(slot, None)
             self.phases[slot] = "wait_" + phase
             self.changed.notify_all()
             while not cancel.is_set():
                 occupied = {card for other, group in self.held.items() if other != slot for card in group}
+                if paired and phase in {"load", "dit"}:
+                    occupied.update(await asyncio.to_thread(external_cards))
                 if phase in {"qwen", "decode"}:
                     pool = self.layout.qwen if phase == "qwen" else self.layout.decode
                     candidates = [card for card in pool if card not in occupied]
@@ -202,7 +221,7 @@ class DualGpuBackend:
         self.paths = paths
         self.profile = memory_profile
         self.lora: Path | None = None
-        self.slots = tuple(WorkerSlot(self, i) for i in range(2))
+        self.slots = tuple(WorkerSlot(self, i) for i in range(len(layout.dit)))
 
     def external_cards(self):
         ours = {w.pid for w in self.slots}
