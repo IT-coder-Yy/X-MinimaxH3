@@ -1309,6 +1309,67 @@ class UnifiedConsoleApiTest(AioHTTPTestCase):
             self.assertIn("2 session(s)", await response.text())
             self.assertEqual([call.args for call in pss.call_args_list], [(11,), (12,)])
 
+    async def test_generation_rejected_until_memory_profile_preload_finishes(self):
+        from h3serve.memory_policy import HostMemoryStatus
+
+        entered, release = asyncio.Event(), asyncio.Event()
+        preload = self.backend.preload
+
+        async def blocked_preload(engine):
+            entered.set()
+            await release.wait()
+            await preload(engine)
+
+        response = await self.client.put("/api/v1/engine", json={"engine": "original"})
+        self.assertEqual(response.status, 200, await response.text())
+        with patch("h3serve.app.detect_host_memory", return_value=HostMemoryStatus(256, 256, 240)), patch.object(
+            self.backend, "configure_memory_profile", create=True
+        ), patch.object(self.backend, "preload", side_effect=blocked_preload):
+            changing = asyncio.create_task(self.client.put("/api/v1/memory-profile", json={"profile": "compact"}))
+            try:
+                await asyncio.wait_for(entered.wait(), 3)
+                response = await asyncio.wait_for(self.client.post("/api/v1/generations", json={"prompt": "busy"}), 2)
+                self.assertEqual(response.status, 409, await response.text())
+                self.assertFalse(self.app["job_service"].jobs)
+            finally:
+                release.set()
+                changed = await changing
+            self.assertEqual(changed.status, 200, await changed.text())
+        response = await self.client.post("/api/v1/generations", json={"prompt": "ready"})
+        self.assertEqual(response.status, 202, await response.text())
+
+    async def test_memory_switch_cannot_overtake_generation_admission(self):
+        from h3serve.memory_policy import HostMemoryStatus
+
+        await self.client.put("/api/v1/engine", json={"engine": "original"})
+        service = self.app["job_service"]
+        service.worker_task.cancel()  # Keep the admitted job queued.
+        await asyncio.gather(service.worker_task, return_exceptions=True)
+        entered, release, inspected = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        submit = service.submit
+
+        async def paused_submit(*args):
+            entered.set()
+            await release.wait()
+            return await submit(*args)
+
+        def capacity():
+            inspected.set()
+            return HostMemoryStatus(256, 256, 240)
+
+        with patch.object(service, "submit", side_effect=paused_submit), patch.object(
+            self.backend, "configure_memory_profile", create=True
+        ), patch("h3serve.app.detect_host_memory", capacity):
+            job = asyncio.create_task(self.client.post("/api/v1/generations", json={"prompt": "admitted first"}))
+            try:
+                await asyncio.wait_for(entered.wait(), 3)
+                change = asyncio.create_task(self.client.put("/api/v1/memory-profile", json={"profile": "compact"}))
+                await asyncio.wait_for(inspected.wait(), 3)
+            finally:
+                release.set()
+            self.assertEqual((await job).status, 202)
+            self.assertEqual((await change).status, 409)
+
     async def test_enter_exit_and_switch_engine(self) -> None:
         options = await (await self.client.get("/api/v1/options")).json()
         self.assertEqual(options["deployment_mode"], "unified_console")

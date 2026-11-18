@@ -2142,6 +2142,10 @@ def create_app(
             }
         return document
 
+    def require_stable_memory_profile() -> None:
+        if memory_state["changing"]:
+            raise web.HTTPConflict(text="host-memory profile is changing")
+
     def service_busy() -> bool:
         return bool(service.pending) or any(
             job.status in {"queued", "starting_backend", "running", "awaiting_preview"}
@@ -2178,9 +2182,8 @@ def create_app(
                 raise ContractError(f"unsupported model variant: {requested_variant}")
         except (ContractError, json.JSONDecodeError) as error:
             raise web.HTTPBadRequest(text=str(error)) from error
-        if memory_state["changing"]:
-            raise web.HTTPConflict(text="host-memory profile is changing")
         async with engine_lock:
+            require_stable_memory_profile()
             require_compatible_lora(requested)
             if service_busy():
                 raise web.HTTPConflict(
@@ -2254,9 +2257,8 @@ def create_app(
     async def exit_engine(_: web.Request) -> web.Response:
         if not engine_state["switchable"]:
             raise web.HTTPConflict(text="this process uses a fixed engine launcher")
-        if memory_state["changing"]:
-            raise web.HTTPConflict(text="host-memory profile is changing")
         async with engine_lock:
+            require_stable_memory_profile()
             if service_busy():
                 raise web.HTTPConflict(
                     text="cancel or finish all running and queued jobs before exiting engine"
@@ -2554,10 +2556,6 @@ def create_app(
         )
 
     async def change_memory_profile(request: web.Request) -> web.Response:
-        if memory_state["changing"]:
-            raise web.HTTPConflict(text="host-memory profile is already changing")
-        if engine_state["switching"]:
-            raise web.HTTPConflict(text="engine is switching")
         try:
             document = await request.json()
             requested = str(document.get("profile", ""))
@@ -2584,23 +2582,29 @@ def create_app(
             raise web.HTTPConflict(
                 text=f"{profile.label} is not release-validated on this build"
             )
-        if service_busy():
-            raise web.HTTPConflict(
-                text="wait for the running and queued jobs before changing host memory profile"
-            )
-        if profile.key == memory_state["profile"].key:
-            return web.json_response({
-                "changed": False, "profile": profile.public(),
-                "warm_state": manager.warm_state,
-            })
+        # Reserve the switch under the same lock used to admit jobs. Release
+        # it before preload so requests can immediately see "changing".
+        async with engine_lock:
+            require_stable_memory_profile()
+            if engine_state["switching"]:
+                raise web.HTTPConflict(text="engine is switching")
+            if service_busy() or (service.warmup_task is not None and not service.warmup_task.done()):
+                raise web.HTTPConflict(
+                    text="wait for model loading and active jobs before changing host memory profile"
+                )
+            if profile.key == memory_state["profile"].key:
+                return web.json_response({
+                    "changed": False, "profile": profile.public(),
+                    "warm_state": manager.warm_state,
+                })
 
-        previous = memory_state["profile"]
-        memory_state["changing"] = True
+            launcher = active_launcher()
+            previous = memory_state["profile"]
+            memory_state["changing"] = True
         try:
             await video_upscaler.stop()
             await manager.stop()
             manager.configure_memory_profile(profile)
-            launcher = active_launcher()
             if launcher is not None:
                 await manager.preload(launcher)
             if launcher is not None and manager.warm_state.get("status") != "ready":
@@ -2636,6 +2640,7 @@ def create_app(
             if engine_state["switching"]:
                 raise ContractError("engine is switching; wait until it is ready")
             async with engine_lock:
+                require_stable_memory_profile()
                 engine = active_engine(required=True)
                 if engine_state["switching"]:
                     raise ContractError("engine is switching; wait until it is ready")
@@ -3176,8 +3181,9 @@ def create_app(
         return web.json_response(service.serialize(job))
 
     def continuation_launcher(spec: GenerationSpec) -> str:
+        require_stable_memory_profile()
         launcher = active_launcher()
-        if launcher is None or engine_state["switching"] or memory_state["changing"]:
+        if launcher is None or engine_state["switching"]:
             raise web.HTTPConflict(text="select and finish loading a service family first")
         if spec.service_family != active_engine():
             if fixed_engine is not None or not hasattr(manager, "slots"):
