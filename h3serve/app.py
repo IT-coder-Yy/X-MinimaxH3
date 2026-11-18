@@ -1934,9 +1934,7 @@ def create_app(
                                     vram_profile=launcher_vram_profile(startup_launcher))
             print(f"H3 dual GPU: Qwen {layout.qwen}, DiT {layout.dit}, VAE {layout.decode}", flush=True)
     lora_catalog = _discover_lora_checkpoints(runtime_paths.model_dir)
-    initial_family = (
-        None if fixed_launcher is None else launcher_family(fixed_launcher)
-    )
+    initial_family = engine_state["active"]
     compatible_loras = {
         item["id"]
         for item in lora_catalog
@@ -2005,6 +2003,18 @@ def create_app(
         if required and launcher is None:
             raise ContractError("select a model weight before submitting a generation")
         return launcher
+
+    def require_compatible_lora(family: str) -> None:
+        selected_checkpoint = lora_state.get("selected")
+        if selected_checkpoint:
+            selected_profile = resolve_lora_profile(selected_checkpoint)
+            if family not in selected_profile.task_families:
+                raise web.HTTPConflict(
+                    text=(
+                        f"selected LoRA {selected_profile.display_name!r} does not "
+                        f"support {family}; choose a compatible LoRA in settings first"
+                    )
+                )
 
     def engine_options() -> dict[str, Any]:
         engine = active_engine()
@@ -2166,17 +2176,8 @@ def create_app(
             raise web.HTTPBadRequest(text=str(error)) from error
         if memory_state["changing"]:
             raise web.HTTPConflict(text="host-memory profile is changing")
-        selected_checkpoint = lora_state.get("selected")
-        if selected_checkpoint:
-            selected_profile = resolve_lora_profile(selected_checkpoint)
-            if requested not in selected_profile.task_families:
-                raise web.HTTPConflict(
-                    text=(
-                        f"selected LoRA {selected_profile.display_name!r} does not "
-                        f"support {requested}; choose a compatible LoRA in settings first"
-                    )
-                )
         async with engine_lock:
+            require_compatible_lora(requested)
             if service_busy():
                 raise web.HTTPConflict(
                     text="cancel or finish all running and queued jobs before switching service family"
@@ -2640,6 +2641,7 @@ def create_app(
                         raise ContractError(f"the active engine is {engine}")
                     engine = requested_engine
                     launcher = resolve_launcher(engine, engine_state["weight_tier"], engine_state["vram_profile"])
+                require_compatible_lora(engine)
                 payload.pop("engine", None)
                 payload["service_family"] = engine
                 payload["runtime_launcher"] = launcher
@@ -3164,69 +3166,55 @@ def create_app(
         await service.cancel(job.id)
         return web.json_response(service.serialize(job))
 
+    def continuation_launcher(spec: GenerationSpec) -> str:
+        launcher = active_launcher()
+        if launcher is None or engine_state["switching"] or memory_state["changing"]:
+            raise web.HTTPConflict(text="select and finish loading a service family first")
+        if spec.service_family != active_engine():
+            if fixed_engine is not None or not hasattr(manager, "slots"):
+                raise web.HTTPConflict(text=f"switch back to the {spec.service_family} service family first")
+            launcher = resolve_launcher(
+                spec.service_family, engine_state["weight_tier"], engine_state["vram_profile"]
+            )
+        require_compatible_lora(spec.service_family)
+        return launcher
+
     async def resume_job(request: web.Request) -> web.Response:
         job = require_job(request)
-        engine = active_engine()
-        if engine is None:
-            raise web.HTTPConflict(
-                text="select and finish loading a service family before resuming"
-            )
-        if job.spec.service_family != engine:
-            raise web.HTTPConflict(
-                text=(
-                    "the checkpoint belongs to the "
-                    f"{job.spec.service_family} service family; switch back before resuming"
-                )
-            )
-        if job.spec.runtime_launcher != active_launcher():
-            raise web.HTTPConflict(
-                text=(
-                    "the checkpoint belongs to the "
-                    f"{job.spec.runtime_launcher} weight launcher; switch back first"
-                )
-            )
-        try:
-            await service.resume(job.id)
-        except ContractError as error:
-            raise web.HTTPConflict(text=str(error)) from error
+        async with engine_lock:
+            if job.spec.runtime_launcher != continuation_launcher(job.spec):
+                raise web.HTTPConflict(text=f"switch back to the {job.spec.runtime_launcher} weight launcher first")
+            try:
+                await service.resume(job.id)
+            except ContractError as error:
+                raise web.HTTPConflict(text=str(error)) from error
         return web.json_response(service.serialize(job), status=202)
 
     async def second_sample_job(request: web.Request) -> web.Response:
         source = require_job(request)
-        engine = active_engine()
-        if engine is None:
-            raise web.HTTPConflict(
-                text="select and finish loading a service family before second sampling"
-            )
-        if source.spec.service_family != engine:
-            raise web.HTTPConflict(
-                text=(
-                    "the source card belongs to the "
-                    f"{source.spec.service_family} service family; switch back first"
-                )
-            )
-        if source.spec.weight_tier != engine_state["weight_tier"]:
-            raise web.HTTPConflict(
-                text="the source card weight tier does not match the active launcher"
-            )
         try:
             document = await request.json()
             if not isinstance(document, dict):
                 raise ContractError("request body must be a JSON object")
-            second_sampling = SecondSamplingSpec.from_mapping(
-                document, source=source.spec
-            )
-            allowed_levels = {
-                "24gb": {"720p", "1080p", "2k"},
-                "16gb": {"720p", "1080p", "2k"},
-                "8gb": {"720p", "1080p"},
-            }[str(engine_state["vram_profile"])]
-            if second_sampling.resolution not in allowed_levels:
-                raise ContractError(
-                    f"the {engine_state['vram_profile']} backend does not support "
-                    f"{second_sampling.resolution} second sampling"
-                )
-            job = await service.submit_second_sampling(source, second_sampling)
+            async with engine_lock:
+                launcher = continuation_launcher(source.spec)
+                if source.spec.weight_tier != launcher_weight_tier(launcher):
+                    raise web.HTTPConflict(text="the source card weight tier does not match the active launcher")
+                if hasattr(manager, "slots") and source.spec.runtime_launcher != launcher:
+                    raise web.HTTPConflict(text=f"switch back to the {source.spec.runtime_launcher} weight launcher first")
+                second_sampling = SecondSamplingSpec.from_mapping(document, source=source.spec)
+                vram_profile = launcher_vram_profile(launcher)
+                allowed_levels = {
+                    "24gb": {"720p", "1080p", "2k"},
+                    "16gb": {"720p", "1080p", "2k"},
+                    "8gb": {"720p", "1080p"},
+                }[vram_profile]
+                if second_sampling.resolution not in allowed_levels:
+                    raise ContractError(
+                        f"the {vram_profile} backend does not support "
+                        f"{second_sampling.resolution} second sampling"
+                    )
+                job = await service.submit_second_sampling(source, second_sampling)
         except (ContractError, json.JSONDecodeError) as error:
             raise web.HTTPBadRequest(text=str(error)) from error
         return web.json_response(service.serialize(job), status=202)

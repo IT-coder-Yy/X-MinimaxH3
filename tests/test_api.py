@@ -8,6 +8,7 @@ import time
 import unittest
 import io
 import wave
+from unittest.mock import patch
 from pathlib import Path
 import aiohttp
 import av
@@ -1218,6 +1219,65 @@ class UnifiedConsoleApiTest(AioHTTPTestCase):
     async def asyncTearDown(self) -> None:
         await super().asyncTearDown()
         shutil.rmtree(self.temporary, ignore_errors=True)
+
+    async def test_dual_reference_checkpoint_and_second_sampling_follow_source_launcher(self):
+        self.backend.slots = (self.backend, FakeBackend(self.video))
+        service = self.app["job_service"]
+        response = await self.client.put("/api/v1/engine", json={"launcher": "fl2va_int8_24gb"})
+        self.assertEqual(response.status, 200, await response.text())
+        image = io.BytesIO()
+        Image.new("RGB", (32, 32)).save(image, "PNG")
+        form = aiohttp.FormData()
+        for key, value in {
+            "prompt": "cross-family checkpoint", "service_family": "reference",
+            "execution_mode": "checkpoint", "checkpoint_step": "3", "checkpoint_retain": "true",
+        }.items():
+            form.add_field(key, value)
+        form.add_field("reference_image_1", image.getvalue(), filename="ref.png", content_type="image/png")
+        response = await self.client.post("/api/v1/generations", data=form)
+        self.assertEqual(response.status, 202, await response.text())
+        source = service.jobs[(await response.json())["id"]]
+
+        async def wait_for(status):
+            async with service.queue_changed:
+                await asyncio.wait_for(service.queue_changed.wait_for(lambda: source.status == status), 5)
+
+        await wait_for("checkpointed")
+        await self.client.put("/api/v1/engine", json={"launcher": "fl2va_int8_16gb"})
+        response = await self.client.post(f"/api/v1/jobs/{source.id}/resume")
+        self.assertEqual(response.status, 409, await response.text())
+        await self.client.put("/api/v1/engine", json={"launcher": "fl2va_int8_24gb"})
+        response = await self.client.post(f"/api/v1/jobs/{source.id}/resume")
+        self.assertEqual(response.status, 202, await response.text())
+        await wait_for("succeeded")
+        url = f"/api/v1/jobs/{source.id}/second-sampling"
+        payload = {"resolution": "720p", "steps": 1, "strength": "preserve"}
+        await self.client.put("/api/v1/engine", json={"launcher": "fl2va_int8_16gb"})
+        response = await self.client.post(url, json=payload)
+        self.assertEqual(response.status, 409, await response.text())
+        await self.client.put("/api/v1/engine", json={"launcher": "fl2va_int8_24gb"})
+        response = await self.client.post(url, json=payload)
+        self.assertEqual(response.status, 202, await response.text())
+        child = service.jobs[(await response.json())["id"]]
+        self.assertEqual(child.spec.runtime_launcher, "ref2va_int8_24gb")
+        self.assertEqual(self.backend.preloaded, "fl2va_int8_24gb")
+
+    async def test_dual_rejects_incompatible_lora_before_enqueue(self):
+        self.backend.slots = (self.backend, FakeBackend(self.video))
+        name = "minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors"
+        catalog = [{"id": name, "compatible": True, "profile": {"task_families": ["first_last"]}}]
+        with patch("h3serve.app._discover_lora_checkpoints", return_value=catalog):
+            response = await self.client.put("/api/v1/engine", json={"launcher": "fl2va_int8_24gb"})
+            self.assertEqual(response.status, 200, await response.text())
+            response = await self.client.put("/api/v1/settings/lora", json={"checkpoint": name})
+            self.assertEqual(response.status, 200, await response.text())
+            for variant in ("base", "lora"):
+                response = await self.client.post("/api/v1/generations", json={
+                    "service_family": "reference", "prompt": "incompatible", "model_variant": variant,
+                })
+                self.assertEqual(response.status, 409, await response.text())
+                self.assertIn("does not support reference", await response.text())
+        self.assertFalse(self.app["job_service"].jobs)
 
     async def test_enter_exit_and_switch_engine(self) -> None:
         options = await (await self.client.get("/api/v1/options")).json()
