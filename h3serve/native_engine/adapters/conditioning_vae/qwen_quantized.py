@@ -75,12 +75,21 @@ def _sharded_attention(q, k, v, mask, devices):
     kv_heads = k.size(1)
     per_gpu, extra = divmod(kv_heads, len(devices))
     queries_per_kv = q.size(1) // kv_heads
+    sizes = [per_gpu + (rank < extra) for rank in range(len(devices))]
+    # Queue every transfer before starting attention on the source GPU.
+    # Otherwise its default stream makes the other GPUs wait for its SDPA.
+    shards = [
+        (qs.to(device, non_blocking=True), ks.to(device, non_blocking=True),
+         vs.to(device, non_blocking=True), mask.to(device, non_blocking=True))
+        for device, qs, ks, vs in zip(
+            devices, q.split([size * queries_per_kv for size in sizes], 1),
+            k.split(sizes, 1), v.split(sizes, 1),
+        )
+    ]
     parts = []
-    offset = 0
-    for rank, device in enumerate(devices):
-        count = per_gpu + (rank < extra)
-        end = offset + count
-        local_mask = mask.to(device, non_blocking=True)
+    for qs, ks, vs, local_mask in shards:
+        end = count = ks.size(1)
+        offset = 0
         # Large reference images can exceed one card's scratch space. A KV
         # group is independent, so a smaller slice needs no approximation.
         while offset < end:
@@ -88,9 +97,8 @@ def _sharded_attention(q, k, v, mask, devices):
             stop = offset + count
             try:
                 part = F.scaled_dot_product_attention(
-                    q[:, offset * queries_per_kv:stop * queries_per_kv].to(device, non_blocking=True),
-                    k[:, offset:stop].to(device, non_blocking=True),
-                    v[:, offset:stop].to(device, non_blocking=True),
+                    qs[:, offset * queries_per_kv:stop * queries_per_kv],
+                    ks[:, offset:stop], vs[:, offset:stop],
                     attn_mask=local_mask, enable_gqa=True,
                 )
             except torch.cuda.OutOfMemoryError:
@@ -100,6 +108,8 @@ def _sharded_attention(q, k, v, mask, devices):
                 continue
             parts.append(part)
             offset = stop
+    if len(parts) == 1:
+        return parts[0]
     return torch.cat([part.to(q.device, non_blocking=True) for part in parts], dim=1)
 
 
