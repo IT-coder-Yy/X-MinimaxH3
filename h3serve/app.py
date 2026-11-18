@@ -787,39 +787,32 @@ class JobService:
         return round(max(0.0, total - elapsed), 1)
 
     def _queued_eta(self, job_id: str) -> tuple[float | None, float | None]:
-        """Estimate queue wait and completion from the one-GPU FIFO schedule."""
+        """Assign FIFO jobs to the earliest slot with a known release time."""
 
         if job_id not in self.pending:
             return None, None
         now = time.time()
-        seconds = 0.0
-        known = False
-        unknown_active = False
-        for active in self.jobs.values():
-            if active.status not in {"starting_backend", "running", "awaiting_preview"}:
-                continue
-            value = self._dynamic_remaining(active, now)
-            if value is not None:
-                seconds += value
-                known = True
-            else:
-                unknown_active = True
-        if unknown_active:
-            return None, None
-        target = self.jobs[job_id]
-        own = target.estimated_total_seconds
+        running = [
+            self._dynamic_remaining(job, now) for job in self.jobs.values()
+            if job.status in {"starting_backend", "running", "awaiting_preview"}
+        ]
+        slots = len(getattr(self.backend, "slots", (self.backend,)))
+        available = [0.0] * (slots - len(running))
+        available.extend(seconds for seconds in running if seconds is not None)
         for pending_id in self.pending:
+            if not available:
+                break
             pending = self.jobs.get(pending_id)
             if pending is None:
                 continue
+            start = min(available)
+            duration = pending.estimated_total_seconds
+            finish = None if duration is None else start + duration
             if pending_id == job_id:
-                queue_seconds = seconds if known or own is not None else None
-                if own is None:
-                    return queue_seconds, None
-                return queue_seconds, round(seconds + own, 1)
-            if pending.estimated_total_seconds is not None:
-                seconds += pending.estimated_total_seconds
-                known = True
+                return round(start, 1), None if finish is None else round(finish, 1)
+            available.remove(start)
+            if finish is not None:
+                available.append(finish)
         return None, None
 
     def persist(self, job: JobRecord) -> None:
@@ -1454,16 +1447,34 @@ class JobService:
             )
 
     async def worker(self) -> None:
-        while True:
-            async with self.queue_changed:
-                await self.queue_changed.wait_for(lambda: bool(self.pending))
-                job_id = self.pending.pop(0)
-            job = self.jobs.get(job_id)
-            if job is None or job.status == "cancelled":
-                continue
-            await self._run(job)
+        slots = getattr(self.backend, "slots", (self.backend,))
+        active = {}
 
-    async def _run(self, job: JobRecord) -> None:
+        async def execute(slot, job):
+            try:
+                await self._run(job, slots[slot])
+            finally:
+                async with self.queue_changed:
+                    active.pop(slot)
+                    self.queue_changed.notify_all()
+
+        try:
+            while True:
+                async with self.queue_changed:
+                    await self.queue_changed.wait_for(lambda: self.pending and len(active) < len(slots))
+                    job = self.jobs.get(self.pending.pop(0))
+                    if job is None or job.status != "queued":
+                        continue
+                    slot = next(i for i in range(len(slots)) if i not in active)
+                    active[slot] = asyncio.create_task(execute(slot, job))
+        finally:
+            tasks = list(active.values())
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _run(self, job: JobRecord, backend=None) -> None:
+        backend = self.backend if backend is None else backend
         # Persisted jobs and direct boundary tests created before fork preview
         # do not have an associated control object.  Lazily creating it keeps
         # those records executable while new submissions still allocate it at
@@ -1534,7 +1545,7 @@ class JobService:
             if action == "second_sampling":
                 if job.second_sampling is None or job.source_latents_path is None:
                     raise RuntimeError("second-sampling job is missing its source contract")
-                second_sample = getattr(self.backend, "second_sample", None)
+                second_sample = getattr(backend, "second_sample", None)
                 if not callable(second_sample):
                     raise RuntimeError("the active backend does not support H3 second sampling")
                 job.progress_stage = "second_sampling"
@@ -1581,7 +1592,7 @@ class JobService:
                         preview_kwargs["checkpoint_path"] = (
                             self.data_dir / "checkpoints" / f"{job.id}.pt"
                         )
-                result = await self.backend.generate(*generate_args, **preview_kwargs)
+                result = await backend.generate(*generate_args, **preview_kwargs)
             if isinstance(result, CheckpointResult):
                 job.inference_plan = result.inference_plan
                 job.runtime_key = result.runtime_key
@@ -1657,7 +1668,7 @@ class JobService:
                 if exclusive:
                     job.progress_detail = "释放H3内存，准备独占超分"
                     self.persist(job)
-                    await self.backend.stop()
+                    await backend.stop()
                 try:
                     upscale = await self.upscaler.upscale(
                         job.output_path,
@@ -1673,8 +1684,8 @@ class JobService:
                         job.progress_detail = "超分完成，正在恢复H3热态"
                         self.persist(job)
                         await self.upscaler.stop()
-                        await self.backend.preload(job.spec.runtime_launcher)
-                        if self.backend.warm_state.get("status") != "ready":
+                        await backend.preload(job.spec.runtime_launcher)
+                        if backend.warm_state.get("status") != "ready":
                             raise RuntimeError("H3 failed to recover after exclusive upscaling")
                 job.upscale_elapsed_seconds = (
                     time.monotonic() - upscale_cycle_started
@@ -1755,6 +1766,8 @@ class JobService:
             )
 
     async def close(self) -> None:
+        for event in self.cancel_events.values():
+            event.set()
         if self.warmup_task is not None and not self.warmup_task.done():
             self.warmup_task.cancel()
             try:
@@ -1828,6 +1841,7 @@ def create_app(
     prompt_enhancer: Any | None = None,
     upscaler: Any | None = None,
     memory_profile: HostMemoryProfile | None = None,
+    requested_memory_profile: str = "auto",
 ) -> web.Application:
     fixed_launcher = (
         None if fixed_engine is None else normalize_launcher(str(fixed_engine))
@@ -1876,7 +1890,21 @@ def create_app(
         return response
 
     app = web.Application(middlewares=[api_auth], client_max_size=640 * 1024 * 1024)
-    memory_profile = memory_profile or HOST_MEMORY_PROFILES["fullspeed"]
+    layout = None
+    if backend is None:
+        from .gpu_pool import DualGpuBackend, resolve_service_resources
+
+        memory_status = detect_host_memory()
+        memory_profile, layout = resolve_service_resources(
+            memory_profile.key if memory_profile else requested_memory_profile, memory_status
+        )
+        print(
+            f"Host memory profile: {memory_profile.label} "
+            f"(effective {memory_status.effective_limit_gib:.1f} GiB, "
+            f"available {memory_status.available_gib:.1f} GiB)", flush=True,
+        )
+    else:
+        memory_profile = memory_profile or HOST_MEMORY_PROFILES["fullspeed"]
     memory_state = {"profile": memory_profile, "changing": False}
     engine_state: dict[str, Any] = {
         "active": fixed_engine,
@@ -1900,10 +1928,17 @@ def create_app(
     manager = backend if backend is not None else build_native_backend(
         runtime_paths, memory_profile=memory_profile
     )
+    startup_launcher = fixed_launcher
+    if layout is not None:
+        manager = DualGpuBackend(manager, runtime_paths, memory_profile, layout)
+        if fixed_launcher is None:
+            startup_launcher = normalize_launcher(os.environ.get("H3_SERVE_ENGINE", "first_last"))
+            engine_state.update(active=launcher_family(startup_launcher), launcher=startup_launcher,
+                                weight_tier=launcher_weight_tier(startup_launcher),
+                                vram_profile=launcher_vram_profile(startup_launcher))
+        print(f"H3 dual GPU: Qwen {layout.qwen}, DiT {layout.dit}, VAE {layout.decode}", flush=True)
     lora_catalog = _discover_lora_checkpoints(runtime_paths.model_dir)
-    initial_family = (
-        None if fixed_launcher is None else launcher_family(fixed_launcher)
-    )
+    initial_family = engine_state["active"]
     compatible_loras = {
         item["id"]
         for item in lora_catalog
@@ -1972,6 +2007,18 @@ def create_app(
         if required and launcher is None:
             raise ContractError("select a model weight before submitting a generation")
         return launcher
+
+    def require_compatible_lora(family: str) -> None:
+        selected_checkpoint = lora_state.get("selected")
+        if selected_checkpoint:
+            selected_profile = resolve_lora_profile(selected_checkpoint)
+            if family not in selected_profile.task_families:
+                raise web.HTTPConflict(
+                    text=(
+                        f"selected LoRA {selected_profile.display_name!r} does not "
+                        f"support {family}; choose a compatible LoRA in settings first"
+                    )
+                )
 
     def engine_options() -> dict[str, Any]:
         engine = active_engine()
@@ -2095,6 +2142,10 @@ def create_app(
             }
         return document
 
+    def require_stable_memory_profile() -> None:
+        if memory_state["changing"]:
+            raise web.HTTPConflict(text="host-memory profile is changing")
+
     def service_busy() -> bool:
         return bool(service.pending) or any(
             job.status in {"queued", "starting_backend", "running", "awaiting_preview"}
@@ -2131,19 +2182,9 @@ def create_app(
                 raise ContractError(f"unsupported model variant: {requested_variant}")
         except (ContractError, json.JSONDecodeError) as error:
             raise web.HTTPBadRequest(text=str(error)) from error
-        if memory_state["changing"]:
-            raise web.HTTPConflict(text="host-memory profile is changing")
-        selected_checkpoint = lora_state.get("selected")
-        if selected_checkpoint:
-            selected_profile = resolve_lora_profile(selected_checkpoint)
-            if requested not in selected_profile.task_families:
-                raise web.HTTPConflict(
-                    text=(
-                        f"selected LoRA {selected_profile.display_name!r} does not "
-                        f"support {requested}; choose a compatible LoRA in settings first"
-                    )
-                )
         async with engine_lock:
+            require_stable_memory_profile()
+            require_compatible_lora(requested)
             if service_busy():
                 raise web.HTTPConflict(
                     text="cancel or finish all running and queued jobs before switching service family"
@@ -2216,9 +2257,8 @@ def create_app(
     async def exit_engine(_: web.Request) -> web.Response:
         if not engine_state["switchable"]:
             raise web.HTTPConflict(text="this process uses a fixed engine launcher")
-        if memory_state["changing"]:
-            raise web.HTTPConflict(text="host-memory profile is changing")
         async with engine_lock:
+            require_stable_memory_profile()
             if service_busy():
                 raise web.HTTPConflict(
                     text="cancel or finish all running and queued jobs before exiting engine"
@@ -2455,7 +2495,11 @@ def create_app(
             "warm_state": getattr(
                 service.backend, "warm_state", {"status": "unsupported"}
             ),
-            "gpu_concurrency": 1,
+            "gpu_concurrency": len(getattr(manager, "slots", (manager,))),
+            "gpu_layout": (
+                {"qwen": manager.layout.qwen, "dit": manager.layout.dit, "decode": manager.layout.decode}
+                if hasattr(manager, "layout") else None
+            ),
             "upscaler": video_upscaler.status(),
             "host_memory": {
                 "active_profile": active_memory_profile.key,
@@ -2512,24 +2556,25 @@ def create_app(
         )
 
     async def change_memory_profile(request: web.Request) -> web.Response:
-        if memory_state["changing"]:
-            raise web.HTTPConflict(text="host-memory profile is already changing")
-        if engine_state["switching"]:
-            raise web.HTTPConflict(text="engine is switching")
         try:
             document = await request.json()
             requested = str(document.get("profile", ""))
             detected = detect_host_memory()
+            slots = getattr(manager, "slots", ())
+            reclaimable = (
+                sum(current_process_pss_gib(slot.pid) for slot in slots if slot.pid)
+                if slots else current_process_pss_gib()
+            )
             reconfiguration_status = HostMemoryStatus(
                 detected.physical_total_gib,
                 detected.effective_limit_gib,
                 min(
                     detected.effective_limit_gib,
-                    detected.available_gib + current_process_pss_gib(),
+                    detected.available_gib + reclaimable,
                 ),
             )
             profile = resolve_host_memory_profile(
-                requested, reconfiguration_status
+                requested, reconfiguration_status, sessions=len(slots) or 1
             )
         except (json.JSONDecodeError, RuntimeError, ValueError) as error:
             raise web.HTTPBadRequest(text=str(error)) from error
@@ -2537,23 +2582,29 @@ def create_app(
             raise web.HTTPConflict(
                 text=f"{profile.label} is not release-validated on this build"
             )
-        if service_busy():
-            raise web.HTTPConflict(
-                text="wait for the running and queued jobs before changing host memory profile"
-            )
-        if profile.key == memory_state["profile"].key:
-            return web.json_response({
-                "changed": False, "profile": profile.public(),
-                "warm_state": manager.warm_state,
-            })
+        # Reserve the switch under the same lock used to admit jobs. Release
+        # it before preload so requests can immediately see "changing".
+        async with engine_lock:
+            require_stable_memory_profile()
+            if engine_state["switching"]:
+                raise web.HTTPConflict(text="engine is switching")
+            if service_busy() or (service.warmup_task is not None and not service.warmup_task.done()):
+                raise web.HTTPConflict(
+                    text="wait for model loading and active jobs before changing host memory profile"
+                )
+            if profile.key == memory_state["profile"].key:
+                return web.json_response({
+                    "changed": False, "profile": profile.public(),
+                    "warm_state": manager.warm_state,
+                })
 
-        previous = memory_state["profile"]
-        memory_state["changing"] = True
+            launcher = active_launcher()
+            previous = memory_state["profile"]
+            memory_state["changing"] = True
         try:
             await video_upscaler.stop()
             await manager.stop()
             manager.configure_memory_profile(profile)
-            launcher = active_launcher()
             if launcher is not None:
                 await manager.preload(launcher)
             if launcher is not None and manager.warm_state.get("status") != "ready":
@@ -2589,19 +2640,25 @@ def create_app(
             if engine_state["switching"]:
                 raise ContractError("engine is switching; wait until it is ready")
             async with engine_lock:
+                require_stable_memory_profile()
                 engine = active_engine(required=True)
                 if engine_state["switching"]:
                     raise ContractError("engine is switching; wait until it is ready")
                 requested_engine = payload.get("service_family", payload.get("engine"))
                 if requested_engine in ENGINES:
                     requested_engine = engine_family(str(requested_engine))
+                launcher = active_launcher(required=True)
                 if requested_engine not in (None, "", engine):
                     if fixed_engine is not None:
                         raise ContractError(f"this service is fixed to the {engine} engine")
-                    raise ContractError(f"the active engine is {engine}")
+                    if not hasattr(manager, "slots") or requested_engine not in SERVICE_FAMILIES:
+                        raise ContractError(f"the active engine is {engine}")
+                    engine = requested_engine
+                    launcher = resolve_launcher(engine, engine_state["weight_tier"], engine_state["vram_profile"])
+                require_compatible_lora(engine)
                 payload.pop("engine", None)
                 payload["service_family"] = engine
-                payload["runtime_launcher"] = active_launcher(required=True)
+                payload["runtime_launcher"] = launcher
                 payload["weight_tier"] = engine_state["weight_tier"]
                 payload["vram_profile"] = engine_state["vram_profile"]
                 payload.setdefault("model_variant", engine_state["default_variant"])
@@ -3123,69 +3180,56 @@ def create_app(
         await service.cancel(job.id)
         return web.json_response(service.serialize(job))
 
+    def continuation_launcher(spec: GenerationSpec) -> str:
+        require_stable_memory_profile()
+        launcher = active_launcher()
+        if launcher is None or engine_state["switching"]:
+            raise web.HTTPConflict(text="select and finish loading a service family first")
+        if spec.service_family != active_engine():
+            if fixed_engine is not None or not hasattr(manager, "slots"):
+                raise web.HTTPConflict(text=f"switch back to the {spec.service_family} service family first")
+            launcher = resolve_launcher(
+                spec.service_family, engine_state["weight_tier"], engine_state["vram_profile"]
+            )
+        require_compatible_lora(spec.service_family)
+        return launcher
+
     async def resume_job(request: web.Request) -> web.Response:
         job = require_job(request)
-        engine = active_engine()
-        if engine is None:
-            raise web.HTTPConflict(
-                text="select and finish loading a service family before resuming"
-            )
-        if job.spec.service_family != engine:
-            raise web.HTTPConflict(
-                text=(
-                    "the checkpoint belongs to the "
-                    f"{job.spec.service_family} service family; switch back before resuming"
-                )
-            )
-        if job.spec.runtime_launcher != active_launcher():
-            raise web.HTTPConflict(
-                text=(
-                    "the checkpoint belongs to the "
-                    f"{job.spec.runtime_launcher} weight launcher; switch back first"
-                )
-            )
-        try:
-            await service.resume(job.id)
-        except ContractError as error:
-            raise web.HTTPConflict(text=str(error)) from error
+        async with engine_lock:
+            if job.spec.runtime_launcher != continuation_launcher(job.spec):
+                raise web.HTTPConflict(text=f"switch back to the {job.spec.runtime_launcher} weight launcher first")
+            try:
+                await service.resume(job.id)
+            except ContractError as error:
+                raise web.HTTPConflict(text=str(error)) from error
         return web.json_response(service.serialize(job), status=202)
 
     async def second_sample_job(request: web.Request) -> web.Response:
         source = require_job(request)
-        engine = active_engine()
-        if engine is None:
-            raise web.HTTPConflict(
-                text="select and finish loading a service family before second sampling"
-            )
-        if source.spec.service_family != engine:
-            raise web.HTTPConflict(
-                text=(
-                    "the source card belongs to the "
-                    f"{source.spec.service_family} service family; switch back first"
-                )
-            )
-        if source.spec.weight_tier != engine_state["weight_tier"]:
-            raise web.HTTPConflict(
-                text="the source card weight tier does not match the active launcher"
-            )
         try:
             document = await request.json()
             if not isinstance(document, dict):
                 raise ContractError("request body must be a JSON object")
-            second_sampling = SecondSamplingSpec.from_mapping(
-                document, source=source.spec
-            )
-            allowed_levels = {
-                "24gb": {"720p", "1080p", "2k"},
-                "16gb": {"720p", "1080p", "2k"},
-                "8gb": {"720p", "1080p"},
-            }[str(engine_state["vram_profile"])]
-            if second_sampling.resolution not in allowed_levels:
-                raise ContractError(
-                    f"the {engine_state['vram_profile']} backend does not support "
-                    f"{second_sampling.resolution} second sampling"
-                )
-            job = await service.submit_second_sampling(source, second_sampling)
+            async with engine_lock:
+                launcher = continuation_launcher(source.spec)
+                if source.spec.weight_tier != launcher_weight_tier(launcher):
+                    raise web.HTTPConflict(text="the source card weight tier does not match the active launcher")
+                if hasattr(manager, "slots") and source.spec.runtime_launcher != launcher:
+                    raise web.HTTPConflict(text=f"switch back to the {source.spec.runtime_launcher} weight launcher first")
+                second_sampling = SecondSamplingSpec.from_mapping(document, source=source.spec)
+                vram_profile = launcher_vram_profile(launcher)
+                allowed_levels = {
+                    "24gb": {"720p", "1080p", "2k"},
+                    "16gb": {"720p", "1080p", "2k"},
+                    "8gb": {"720p", "1080p"},
+                }[vram_profile]
+                if second_sampling.resolution not in allowed_levels:
+                    raise ContractError(
+                        f"the {vram_profile} backend does not support "
+                        f"{second_sampling.resolution} second sampling"
+                    )
+                job = await service.submit_second_sampling(source, second_sampling)
         except (ContractError, json.JSONDecodeError) as error:
             raise web.HTTPBadRequest(text=str(error)) from error
         return web.json_response(service.serialize(job), status=202)
@@ -3233,7 +3277,7 @@ def create_app(
         )
 
     async def on_startup(_: web.Application) -> None:
-        await service.start(fixed_launcher, preload=preload)
+        await service.start(startup_launcher, preload=preload)
         # The default compatibility object is a no-op.  Explicitly injected
         # legacy upscalers remain startable for isolated migration tests only.
         if (
@@ -3402,19 +3446,6 @@ def main() -> None:
             ) from None
         raise
     paths = ServicePaths.defaults(args.release_root, data_dir=args.data_dir)
-    memory_status = detect_host_memory()
-    try:
-        memory_profile = resolve_host_memory_profile(
-            args.memory_profile, memory_status
-        )
-    except (RuntimeError, ValueError) as error:
-        raise SystemExit(str(error)) from error
-    print(
-        f"Host memory profile: {memory_profile.label} "
-        f"(effective {memory_status.effective_limit_gib:.1f} GiB, "
-        f"available {memory_status.available_gib:.1f} GiB)",
-        flush=True,
-    )
     try:
         app = create_app(
             paths=paths,
@@ -3423,8 +3454,12 @@ def main() -> None:
             max_queued_jobs=args.max_queued_jobs,
             fixed_engine=None if args.unified_console else args.engine,
             preload=False if args.unified_console else not args.lazy_load,
-            memory_profile=memory_profile,
+            requested_memory_profile=args.memory_profile,
         )
+    except (RuntimeError, ValueError) as error:
+        listen_socket.close()
+        raise SystemExit(str(error)) from error
+    try:
         web.run_app(app, sock=listen_socket)
     finally:
         listen_socket.close()

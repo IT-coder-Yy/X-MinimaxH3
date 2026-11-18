@@ -8,6 +8,7 @@ import time
 import unittest
 import io
 import wave
+from unittest.mock import patch
 from pathlib import Path
 import aiohttp
 import av
@@ -1173,6 +1174,23 @@ class ApiTest(AioHTTPTestCase):
         self.assertAlmostEqual(second_progress["estimated_queue_seconds"], 50, delta=1)
         self.assertAlmostEqual(second_progress["estimated_completion_seconds"], 75, delta=1)
 
+        service.backend.slots = (service.backend, service.backend)
+        slow = JobRecord(id="slow", spec=spec, status="running", estimated_total_seconds=100,
+                         started_at=running.started_at)
+        third = JobRecord(id="third", spec=spec, estimated_total_seconds=10)
+        service.jobs.update({slow.id: slow, third.id: third})
+        service.pending.append(third.id)
+        second.estimated_total_seconds = 70
+        with patch("h3serve.app.time.time", return_value=running.started_at + 10):
+            self.assertEqual(service._queued_eta(first.id), (30, 50))
+            self.assertEqual(service._queued_eta(second.id), (50, 120))
+            self.assertEqual(service._queued_eta(third.id), (90, 100))
+            slow.started_at = None
+            slow.status = "starting_backend"
+            self.assertEqual(service._queued_eta(first.id), (30, 50))
+            running.status = "succeeded"
+            self.assertEqual(service._queued_eta(first.id), (0, 20))
+
     async def test_eta_history_matches_execution_parameters(self) -> None:
         service = self.app["job_service"]
         sparse = GenerationSpec.from_mapping({
@@ -1218,6 +1236,139 @@ class UnifiedConsoleApiTest(AioHTTPTestCase):
     async def asyncTearDown(self) -> None:
         await super().asyncTearDown()
         shutil.rmtree(self.temporary, ignore_errors=True)
+
+    async def test_dual_reference_checkpoint_and_second_sampling_follow_source_launcher(self):
+        self.backend.slots = (self.backend, FakeBackend(self.video))
+        service = self.app["job_service"]
+        response = await self.client.put("/api/v1/engine", json={"launcher": "fl2va_int8_24gb"})
+        self.assertEqual(response.status, 200, await response.text())
+        image = io.BytesIO()
+        Image.new("RGB", (32, 32)).save(image, "PNG")
+        form = aiohttp.FormData()
+        for key, value in {
+            "prompt": "cross-family checkpoint", "service_family": "reference",
+            "execution_mode": "checkpoint", "checkpoint_step": "3", "checkpoint_retain": "true",
+        }.items():
+            form.add_field(key, value)
+        form.add_field("reference_image_1", image.getvalue(), filename="ref.png", content_type="image/png")
+        response = await self.client.post("/api/v1/generations", data=form)
+        self.assertEqual(response.status, 202, await response.text())
+        source = service.jobs[(await response.json())["id"]]
+
+        async def wait_for(status):
+            async with service.queue_changed:
+                await asyncio.wait_for(service.queue_changed.wait_for(lambda: source.status == status), 5)
+
+        await wait_for("checkpointed")
+        await self.client.put("/api/v1/engine", json={"launcher": "fl2va_int8_16gb"})
+        response = await self.client.post(f"/api/v1/jobs/{source.id}/resume")
+        self.assertEqual(response.status, 409, await response.text())
+        await self.client.put("/api/v1/engine", json={"launcher": "fl2va_int8_24gb"})
+        response = await self.client.post(f"/api/v1/jobs/{source.id}/resume")
+        self.assertEqual(response.status, 202, await response.text())
+        await wait_for("succeeded")
+        url = f"/api/v1/jobs/{source.id}/second-sampling"
+        payload = {"resolution": "720p", "steps": 1, "strength": "preserve"}
+        await self.client.put("/api/v1/engine", json={"launcher": "fl2va_int8_16gb"})
+        response = await self.client.post(url, json=payload)
+        self.assertEqual(response.status, 409, await response.text())
+        await self.client.put("/api/v1/engine", json={"launcher": "fl2va_int8_24gb"})
+        response = await self.client.post(url, json=payload)
+        self.assertEqual(response.status, 202, await response.text())
+        child = service.jobs[(await response.json())["id"]]
+        self.assertEqual(child.spec.runtime_launcher, "ref2va_int8_24gb")
+        self.assertEqual(self.backend.preloaded, "fl2va_int8_24gb")
+
+    async def test_dual_rejects_incompatible_lora_before_enqueue(self):
+        self.backend.slots = (self.backend, FakeBackend(self.video))
+        name = "minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors"
+        catalog = [{"id": name, "compatible": True, "profile": {"task_families": ["first_last"]}}]
+        with patch("h3serve.app._discover_lora_checkpoints", return_value=catalog):
+            response = await self.client.put("/api/v1/engine", json={"launcher": "fl2va_int8_24gb"})
+            self.assertEqual(response.status, 200, await response.text())
+            response = await self.client.put("/api/v1/settings/lora", json={"checkpoint": name})
+            self.assertEqual(response.status, 200, await response.text())
+            for variant in ("base", "lora"):
+                response = await self.client.post("/api/v1/generations", json={
+                    "service_family": "reference", "prompt": "incompatible", "model_variant": variant,
+                })
+                self.assertEqual(response.status, 409, await response.text())
+                self.assertIn("does not support reference", await response.text())
+        self.assertFalse(self.app["job_service"].jobs)
+
+    async def test_dual_memory_profile_switch_counts_both_workers(self):
+        from types import SimpleNamespace
+        from h3serve.memory_policy import HostMemoryStatus
+
+        self.backend.slots = (SimpleNamespace(pid=11), SimpleNamespace(pid=12))
+        with patch("h3serve.app.detect_host_memory", return_value=HostMemoryStatus(200, 200, 100)), patch(
+            "h3serve.app.current_process_pss_gib", side_effect=[5.0, 5.0]
+        ) as pss:
+            response = await self.client.put("/api/v1/memory-profile", json={"profile": "fullspeed"})
+            self.assertEqual(response.status, 400, await response.text())
+            self.assertIn("2 session(s)", await response.text())
+            self.assertEqual([call.args for call in pss.call_args_list], [(11,), (12,)])
+
+    async def test_generation_rejected_until_memory_profile_preload_finishes(self):
+        from h3serve.memory_policy import HostMemoryStatus
+
+        entered, release = asyncio.Event(), asyncio.Event()
+        preload = self.backend.preload
+
+        async def blocked_preload(engine):
+            entered.set()
+            await release.wait()
+            await preload(engine)
+
+        response = await self.client.put("/api/v1/engine", json={"engine": "original"})
+        self.assertEqual(response.status, 200, await response.text())
+        with patch("h3serve.app.detect_host_memory", return_value=HostMemoryStatus(256, 256, 240)), patch.object(
+            self.backend, "configure_memory_profile", create=True
+        ), patch.object(self.backend, "preload", side_effect=blocked_preload):
+            changing = asyncio.create_task(self.client.put("/api/v1/memory-profile", json={"profile": "compact"}))
+            try:
+                await asyncio.wait_for(entered.wait(), 3)
+                response = await asyncio.wait_for(self.client.post("/api/v1/generations", json={"prompt": "busy"}), 2)
+                self.assertEqual(response.status, 409, await response.text())
+                self.assertFalse(self.app["job_service"].jobs)
+            finally:
+                release.set()
+                changed = await changing
+            self.assertEqual(changed.status, 200, await changed.text())
+        response = await self.client.post("/api/v1/generations", json={"prompt": "ready"})
+        self.assertEqual(response.status, 202, await response.text())
+
+    async def test_memory_switch_cannot_overtake_generation_admission(self):
+        from h3serve.memory_policy import HostMemoryStatus
+
+        await self.client.put("/api/v1/engine", json={"engine": "original"})
+        service = self.app["job_service"]
+        service.worker_task.cancel()  # Keep the admitted job queued.
+        await asyncio.gather(service.worker_task, return_exceptions=True)
+        entered, release, inspected = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        submit = service.submit
+
+        async def paused_submit(*args):
+            entered.set()
+            await release.wait()
+            return await submit(*args)
+
+        def capacity():
+            inspected.set()
+            return HostMemoryStatus(256, 256, 240)
+
+        with patch.object(service, "submit", side_effect=paused_submit), patch.object(
+            self.backend, "configure_memory_profile", create=True
+        ), patch("h3serve.app.detect_host_memory", capacity):
+            job = asyncio.create_task(self.client.post("/api/v1/generations", json={"prompt": "admitted first"}))
+            try:
+                await asyncio.wait_for(entered.wait(), 3)
+                change = asyncio.create_task(self.client.put("/api/v1/memory-profile", json={"profile": "compact"}))
+                await asyncio.wait_for(inspected.wait(), 3)
+            finally:
+                release.set()
+            self.assertEqual((await job).status, 202)
+            self.assertEqual((await change).status, 409)
 
     async def test_enter_exit_and_switch_engine(self) -> None:
         options = await (await self.client.get("/api/v1/options")).json()

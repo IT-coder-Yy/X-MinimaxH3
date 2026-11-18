@@ -4,6 +4,7 @@ import unittest
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, call, patch
 
 import av
 import numpy as np
@@ -24,6 +25,27 @@ from h3serve.native_engine.hot_session import HotSessionRequest, NativeT2AVHotSe
 
 
 class Ref2VAContractTest(unittest.TestCase):
+    def test_partial_vision_encoder_migration_is_rolled_back_on_oom(self):
+        conditioner = Mock(spec=PackedQwen3VLT2AVConditioner)
+        conditioner.cache_vision_features = False
+        conditioner.vision_cache_misses = 0
+        conditioner.device = torch.device("cuda:0")
+        tokenizer = conditioner._load_tokenizer.return_value
+        tokenizer.return_value = {"input_ids": [1]}
+        tokenizer.convert_tokens_to_ids.return_value = 1
+        processor = conditioner._load_processor.return_value
+        processor.image_processor.merge_size = 2
+        processor.image_processor.return_value = {"image_grid_thw": torch.tensor([[1, 2, 2]])}
+        processor.create_mm_token_type_ids.return_value = [[0]]
+        encoder = conditioner._load_vision_encoder.return_value
+        encoder.to.side_effect = [torch.cuda.OutOfMemoryError("partial migration"), encoder]
+        with patch(
+            "h3serve.native_engine.adapters.conditioning_vae.qwen_quantized.prepare_keyframes",
+            return_value=[SimpleNamespace(image=object())],
+        ), self.assertRaises(torch.cuda.OutOfMemoryError):
+            PackedQwen3VLT2AVConditioner._prepare_multimodal(conditioner, SimpleNamespace(prompt="test"))
+        self.assertEqual(encoder.to.call_args_list, [call(conditioner.device), call("cpu")])
+
     def test_qwen_vision_cache_key_is_content_and_geometry_addressed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "person.png"

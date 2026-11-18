@@ -1,9 +1,9 @@
-"""Lightweight single-GPU H3 transformer layers.
+"""H3 transformer layers with optional head-parallel streamed attention.
 
 The fused-QKV graph, indexed AdaLN formulation and partial 3-D RoPE are adapted
 from SGLang's Apache-2.0 MiniMax H3 implementation, rewritten here using only
 PyTorch primitives and injected linear/attention backends. Modified for a
-batch-one, no-TP, no-distributed serving target.
+batch-one serving.
 """
 
 from __future__ import annotations
@@ -16,6 +16,8 @@ from typing import Callable, TypeAlias
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .head_parallel import active_head_parallel
 
 AttentionBackend = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 ModulationSegment: TypeAlias = tuple[int, int, int]
@@ -309,6 +311,7 @@ class FusedQKVAttention(nn.Module):
         *,
         query_chunk_tokens: int,
         projection_chunk_tokens: int = 8192,
+        collect: Callable | None = None,
     ) -> bool:
         """Run one memory-bounded fixed-TopK layer and update ``residual``.
 
@@ -338,6 +341,12 @@ class FusedQKVAttention(nn.Module):
         )
         if physical is None:
             return False
+        parallel = active_head_parallel.get()
+        if collect is None and parallel is not None and parallel.run(
+            self, physical, residual, hidden, frequencies, gate, modulation_segments,
+            {"query_chunk_tokens": query_chunk_tokens, "projection_chunk_tokens": projection_chunk_tokens},
+        ):
+            return True
         prepare_values = getattr(physical, "prepare_long_sequence_values", None)
         prepare_keys = getattr(physical, "prepare_long_sequence_keys", None)
         prefix_attention = getattr(
@@ -828,6 +837,9 @@ class FusedQKVAttention(nn.Module):
 
         def commit(start: int, stop: int, attended: torch.Tensor) -> None:
             flattened = attended.reshape(stop - start, self.inner_width)
+            if collect is not None:
+                collect((start, stop, flattened))
+                return
             with _profile_region("h3_long_out_projection"):
                 projected = self.out_proj(flattened)
             with _profile_region("h3_long_attention_residual"):

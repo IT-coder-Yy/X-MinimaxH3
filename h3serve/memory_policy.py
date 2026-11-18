@@ -188,11 +188,11 @@ def detect_host_memory() -> HostMemoryStatus:
     return HostMemoryStatus(total / GIB, effective / GIB, available / GIB)
 
 
-def current_process_pss_gib() -> float:
-    """Physical pages reclaimed when the current hot session is rebuilt."""
+def current_process_pss_gib(pid: int | str = "self") -> float:
+    """Proportional resident pages of a process whose hot session will stop."""
 
     try:
-        for line in Path("/proc/self/smaps_rollup").read_text().splitlines():
+        for line in Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines():
             if line.startswith("Pss:"):
                 return int(line.split()[1]) * 1024 / GIB
     except (OSError, ValueError, IndexError):
@@ -203,6 +203,8 @@ def current_process_pss_gib() -> float:
 def resolve_host_memory_profile(
     requested: str,
     status: HostMemoryStatus | None = None,
+    *,
+    sessions: int = 1,
 ) -> HostMemoryProfile:
     status = detect_host_memory() if status is None else status
     # A retail 48/64 GiB installation reports less usable RAM to Linux/WSL
@@ -223,11 +225,11 @@ def resolve_host_memory_profile(
     def fits(profile: HostMemoryProfile) -> bool:
         # Use measured full-product peaks plus 8GiB rather than assuming that
         # Linux/WSL exposes the retail DIMM label verbatim.
-        effective_capacity_floor = measured_peak_targets[profile.key] + 8.0
+        effective_capacity_floor = measured_peak_targets[profile.key] * sessions + 8.0
         capacity_ok = status.effective_limit_gib >= effective_capacity_floor
         # At startup the process itself is still small, so MemAvailable must
         # cover the measured construction peak plus an 8GiB OS reserve.
-        available_ok = status.available_gib >= cold_build_targets[profile.key] + 8.0
+        available_ok = status.available_gib >= cold_build_targets[profile.key] * sessions + 8.0
         return capacity_ok and available_ok
 
     if requested == "auto":
@@ -235,20 +237,24 @@ def resolve_host_memory_profile(
             profile for profile in HOST_MEMORY_PROFILES.values()
             if fits(profile)
         ]
-        if not eligible:
+        if eligible:
+            return max(eligible, key=lambda profile: profile.minimum_ram_gib)
+        if sessions == 1:
             raise RuntimeError(
                 f"effective host RAM {status.effective_limit_gib:.1f} GiB is below "
                 "the 64 GiB supported minimum"
             )
-        return max(eligible, key=lambda profile: profile.minimum_ram_gib)
+        requested = "compact"
     try:
         profile = HOST_MEMORY_PROFILES[requested]
     except KeyError as error:
         raise ValueError(f"unknown host-memory profile: {requested}") from error
     if not fits(profile):
         raise RuntimeError(
-            f"{profile.label} requires a {profile.minimum_ram_gib} GiB class host "
-            f"and enough free RAM; effective limit is {status.effective_limit_gib:.1f} "
+            f"{profile.label} with {sessions} session(s) requires "
+            f"{measured_peak_targets[profile.key] * sessions + 8:.2f} GiB capacity and "
+            f"{cold_build_targets[profile.key] * sessions + 8:.2f} GiB available; "
+            f"effective limit is {status.effective_limit_gib:.1f} "
             f"GiB and currently available is {status.available_gib:.1f} GiB"
         )
     return profile

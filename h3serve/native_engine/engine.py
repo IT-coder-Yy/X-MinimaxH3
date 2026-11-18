@@ -67,6 +67,8 @@ def _public_inference_plan(execution_profile: object) -> dict[str, Any] | None:
         return None
     joint = execution_profile.get("joint_acceleration")
     result = dict(joint) if isinstance(joint, dict) else {}
+    if "dit_head_parallel_calls" in execution_profile:
+        result["dit_head_parallel_calls"] = execution_profile["dit_head_parallel_calls"]
     memory_execution = execution_profile.get("memory_execution")
     if isinstance(memory_execution, dict):
         result["memory_execution"] = dict(memory_execution)
@@ -297,6 +299,10 @@ class NativeHotH3Engine:
                 "progress_stage": "ready",
                 "progress_detail": "模型引擎已就绪",
             }
+        except NativeGenerationCancelled:
+            # A cancelled build never installed a session.
+            self._warm_state = {"status": "cold", "progress_stage": "cold"}
+            raise
         except Exception as error:
             import traceback
             traceback.print_exc()
@@ -1118,13 +1124,18 @@ class NativeHotH3Engine:
                                 f"final_decode.{name}": seconds
                                 for name, seconds in decoded.phases.items()
                             })
+                            profile = dict(decoded.execution_profile)
+                            calls = [p["dit_head_parallel_calls"] for p in window_profiles
+                                     if "dit_head_parallel_calls" in p]
+                            if calls:
+                                profile["dit_head_parallel_calls"] = sum(calls)
                             return replace(
                                 decoded,
                                 total_seconds=time.monotonic() - started,
                                 phases=all_phases,
                                 step_seconds=tuple(all_steps),
                                 execution_profile={
-                                    **decoded.execution_profile,
+                                    **profile,
                                     **(
                                         {
                                             "qwen_conditioning_cache": dict(

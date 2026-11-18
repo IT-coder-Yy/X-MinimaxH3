@@ -5,6 +5,11 @@ release_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -f "${release_root}/.env.local" ]]; then
   source "${release_root}/.env.local"
 fi
+if [[ "${H3_INHERITED_CUDA_MASK-__unset__}" != "__unset__" && "${CUDA_VISIBLE_DEVICES-__unset__}" != "${H3_INHERITED_CUDA_MASK}" ]]; then
+  CUDA_VISIBLE_DEVICES="$("${H3_SERVE_PYTHON:-python3}" "${release_root}/h3serve/gpu_pool.py" \
+    "${CUDA_VISIBLE_DEVICES-${H3_INHERITED_CUDA_MASK}}" "${H3_INHERITED_CUDA_MASK}")"
+  export CUDA_VISIBLE_DEVICES
+fi
 mkdir -p "${release_root}/runtime/tmp"
 export TMPDIR="${TMPDIR:-${release_root}/runtime/tmp}"
 source "${release_root}/scripts/_process.sh"

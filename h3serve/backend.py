@@ -199,7 +199,7 @@ class NativeBackendManager:
         configure(output_root)
 
 
-def build_native_backend(paths: ServicePaths, *, memory_profile: Any = None) -> NativeBackendManager:
+def build_native_backend(paths: ServicePaths, *, memory_profile: Any = None, gpu_runtime=None) -> NativeBackendManager:
     """Construct the production backend without loading large weights yet."""
 
     from .native_engine import NativeHotH3Engine
@@ -213,7 +213,7 @@ def build_native_backend(paths: ServicePaths, *, memory_profile: Any = None) -> 
             turbo_curve=paths.turbo_curve_path,
             output_root=paths.output_dir,
         ),
-        memory_profile=memory_profile,
+        memory_profile=memory_profile, gpu_runtime=gpu_runtime,
     )
     return NativeBackendManager(
         NativeHotH3Engine(factory, output_root=paths.output_dir)

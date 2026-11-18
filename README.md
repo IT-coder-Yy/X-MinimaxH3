@@ -2,8 +2,7 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-X-MinimaxH3 is a local MiniMax H3 video-generation service optimized for a
-single NVIDIA SM89 GPU. It provides one bilingual Web console and REST API for
+X-MinimaxH3 is a local MiniMax H3 video-generation service for NVIDIA SM89 GPUs. It provides one bilingual Web console and REST API for
 FL2VA and Ref2VA generation, Base/LoRA hot switching, resource-constrained
 execution, checkpoint previews and native H3 second sampling.
 
@@ -24,7 +23,7 @@ execution, checkpoint previews and native H3 second sampling.
 - Multi-reference Ref2VA with images, videos and independent audio references.
 - Larry Turbo and three task-aware LightX2V LoRA profiles.
 - Resumable checkpoints with fixed low-cost previews.
-- Serial GPU queue, cancellation, task history and one-second hardware
+- Single-GPU queue or two concurrent GPU workers, cancellation, task history and one-second hardware
   telemetry.
 - Optional ComfyUI HTTP connector that does not load a second H3 model.
 - English and Simplified Chinese console and documentation.
@@ -131,6 +130,44 @@ Open <http://127.0.0.1:8090>. Stop the service with:
 On WSL2, `./run.sh` automatically mirrors the hot source tree and caches to the
 Linux filesystem, avoiding repeated imports and metadata access through
 `/mnt/c`.
+
+### Two concurrent GPU workers
+
+Run `./run.sh` with the installed runtime and weights. Auto mode enables two
+workers when physical SM89 GPUs 7, 6, 5 and 3 are available and host RAM
+can fit both sessions. It starts with the 24 GB INT8 Base launcher. Other installations default to single-GPU serving. Set these
+values in the release-local `.env` to require a particular layout.
+
+```dotenv
+H3_GPU_MODE=dual
+H3_QWEN_GPUS=7,6,5,3
+H3_DIT_GPUS_FIRST=7,6
+H3_DIT_GPUS_SECOND=5,3
+H3_DECODE_GPUS=7,6,5,3
+```
+
+Qwen encodes one job at a time. Configure 1–8 candidates in priority order.
+It uses the free candidates, hosts the encoder on the first one and assigns
+whole KV heads across them (three GPUs receive 3, 3 and 2 KV heads). Each DiT group has
+its primary first. The groups must be disjoint and their sizes must divide
+56. The 24 GB INT8 Base streamed attention path splits whole heads. Other
+operators use the native primary-device path. A single job takes the first
+available group in priority order. Additional jobs queue once both are busy.
+Qwen skips GPUs leased by other jobs or occupied by external compute processes.
+If all candidates are busy it waits. Under memory pressure it tries smaller
+attention slices, then waits for more configured GPUs if available.
+
+Final video and audio decode share the first free candidate with no GPU lease
+or external compute process. See `/healthz` for the configured layout and the
+service log for actual assignments. Set `service_family` to submit FL2VA or
+Ref2VA through the same service. An inherited `CUDA_VISIBLE_DEVICES` allocation
+constrains the layout. A legacy primary-only `CUDA_VISIBLE_DEVICES=7` in the
+local `.env` works with auto mode. For a single worker, `.env` can narrow
+the inherited mask (e.g. from `7,6` to `6`). Host RAM admission covers both
+sessions plus one 8 GiB system reserve. Even the compact dual profile needs
+107.86 GiB of effective capacity and 86.78 GiB available at startup.
+`auto` falls back to one worker if RAM is insufficient. Explicit `dual`
+reports the required budget before loading either worker.
 
 ## Validation
 

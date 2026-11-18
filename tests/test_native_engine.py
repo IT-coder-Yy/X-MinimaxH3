@@ -515,6 +515,7 @@ class NativeEngineBoundaryTest(unittest.IsolatedAsyncioTestCase):
                     forecast_profile={"mode": "disabled"},
                     execution_profile={
                         "window": request.frames,
+                        "dit_head_parallel_calls": len(self.requests),
                         "qwen_conditioning_cache": {
                             "schema_version": 1,
                             "status": "hot_session_hit",
@@ -620,6 +621,7 @@ class NativeEngineBoundaryTest(unittest.IsolatedAsyncioTestCase):
                 [request.frames for request in session.requests],
                 [136, 136, 124],
             )
+            self.assertEqual(result.inference_plan["dit_head_parallel_calls"], 6)
             self.assertTrue(all(request.latent_only for request in session.requests))
             self.assertTrue(all(
                 request.conditioning_cache_source_path == source_latent.resolve()
