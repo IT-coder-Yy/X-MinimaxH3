@@ -23,8 +23,10 @@ def _mask_indices(mask, uuids):
     by_uuid = mask.startswith("GPU-")
     for token in mask.split(","):
         if by_uuid:
+            # CUDA ignores trailing characters once a complete UUID has matched.
             matches = [i for i, uuid in uuids.items()
-                       if len(token) > 4 and token.startswith("GPU-") and uuid.lower().startswith(token.lower())]
+                       if len(token) > 4 and token.startswith("GPU-")
+                       and uuid.lower().startswith(token[:len(uuid)].lower())]
             if len(matches) != 1:
                 break
             index = matches[0]

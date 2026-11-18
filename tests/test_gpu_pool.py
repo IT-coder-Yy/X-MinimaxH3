@@ -62,20 +62,28 @@ class LayoutTest(unittest.TestCase):
             for name in ("run.sh", "scripts/start.sh", "h3serve/gpu_pool.py"):
                 (release / name).parent.mkdir(exist_ok=True)
                 shutil.copy2(root / name, release / name)
-            (release / "scripts/_process.sh").write_text("h3_find_release_server_pids() { :; }\n")
+            (release / "scripts/_process.sh").write_text(
+                "h3_find_release_server_pids() { :; }\nh3_is_release_server_pid() { return 1; }\n"
+            )
             (release / "scripts/_runtime.sh").write_text("h3_configure_runtime() { :; }\n")
             smi = release / "nvidia-smi"
-            smi.write_text("#!/bin/sh\nprintf '%s\\n' '6, GPU-6' '7, GPU-7'\n")
+            gpu_uuid = "GPU-12345678-1234-4321-8765-123456789abc"
+            smi.write_text(f"#!/bin/sh\nprintf '%s\\n' '6, {gpu_uuid}' '7, GPU-7'\n")
             smi.chmod(0o755)
             (release / "server.py").write_text("import os; print(os.environ['CUDA_VISIBLE_DEVICES'])\n")
             (release / ".env").write_text("H3_GPU_MODE=single\nCUDA_VISIBLE_DEVICES=6\n")
-            env = {"PATH": f"{tmp}:{os.environ['PATH']}", "H3_SERVE_PYTHON": sys.executable, "CUDA_VISIBLE_DEVICES": "7,6"}
-            output = subprocess.check_output(["./run.sh"], cwd=release, text=True, env=env)
-            self.assertEqual(output.strip(), "6")
-            env["CUDA_VISIBLE_DEVICES"] = "7,99,6"
-            blocked = subprocess.run(["./run.sh"], cwd=release, text=True, env=env, capture_output=True)
-            self.assertNotEqual(blocked.returncode, 0)
-            self.assertIn("no GPU in the inherited allocation", blocked.stdout + blocked.stderr)
+            env = {"PATH": f"{tmp}:{os.environ['PATH']}", "H3_SERVE_PYTHON": sys.executable}
+            for mask in ("7,6", f"{gpu_uuid} "):
+                with self.subTest(mask=mask):
+                    env["CUDA_VISIBLE_DEVICES"] = mask
+                    output = subprocess.check_output(["./run.sh"], cwd=release, text=True, env=env)
+                    self.assertEqual(output.strip(), "6")
+            for mask in ("7,99,6", f"{gpu_uuid},{gpu_uuid} ", f"{gpu_uuid[:12]} "):
+                with self.subTest(mask=mask):
+                    env["CUDA_VISIBLE_DEVICES"] = mask
+                    blocked = subprocess.run(["./run.sh"], cwd=release, text=True, env=env, capture_output=True)
+                    self.assertNotEqual(blocked.returncode, 0)
+                    self.assertIn("no GPU in the inherited allocation", blocked.stdout + blocked.stderr)
 
     def test_masks_stop_at_invalid_gpu_in_launcher_and_layout(self):
         with patch("h3serve.gpu_pool._smi", return_value=[row[:2] for row in INVENTORY]):
