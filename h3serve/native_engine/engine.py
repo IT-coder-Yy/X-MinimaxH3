@@ -299,6 +299,10 @@ class NativeHotH3Engine:
                 "progress_stage": "ready",
                 "progress_detail": "模型引擎已就绪",
             }
+        except NativeGenerationCancelled:
+            # A cancelled build never installed a session.
+            self._warm_state = {"status": "cold", "progress_stage": "cold"}
+            raise
         except Exception as error:
             import traceback
             traceback.print_exc()

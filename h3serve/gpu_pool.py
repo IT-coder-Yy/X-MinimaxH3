@@ -149,7 +149,7 @@ class GpuLeases:
             self.changed.notify_all()
 
     async def acquire(self, slot, phase, cancel, external_cards, minimum=1):
-        """Swap leases atomically. An admitted second encoder precedes the first DiT."""
+        """Swap phase leases atomically; only granted cards are occupied."""
         async with self.changed:
             self.held.pop(slot, None)
             self.phases[slot] = "wait_" + phase
@@ -174,9 +174,6 @@ class GpuLeases:
                                 break
                 elif phase == "dit":
                     group = self.layout.dit[slot]
-                    if any(other != slot and p in {"starting", "wait_load", "load", "wait_qwen", "qwen"}
-                           for other, p in self.phases.items()):
-                        group = ()
                 elif phase == "load":
                     group = self.layout.dit[slot][:1]
                 else:

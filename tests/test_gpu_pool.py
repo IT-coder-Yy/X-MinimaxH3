@@ -119,17 +119,77 @@ class LeaseTest(unittest.IsolatedAsyncioTestCase):
     def acquire(self, slot, phase, external=()):
         return self.leases.acquire(slot, phase, self.cancel, lambda: set(external))
 
+    async def test_dit_runs_while_another_qwen_waits_for_more_gpus(self):
+        self.leases = GpuLeases(GpuLayout((7, 6), ((5,), (3,)), (7, 6), {}))
+        busy = {7}
+        self.assertEqual(await self.acquire(1, "qwen", busy), (6,))
+        retry = asyncio.create_task(self.leases.acquire(1, "qwen", self.cancel, busy.copy, 2))
+        try:
+            async with self.leases.changed:
+                await asyncio.wait_for(self.leases.changed.wait_for(
+                    lambda: self.leases.phases[1] == "wait_qwen"), 2)
+            self.assertEqual(await asyncio.wait_for(self.acquire(0, "dit"), 2), (5,))
+            self.assertFalse(retry.done())
+            async with self.leases.changed:
+                busy.clear()
+                self.leases.changed.notify_all()
+            self.assertEqual(await asyncio.wait_for(retry, 2), (7, 6))
+        finally:
+            self.cancel.set()
+            await self.leases.finish(0)
+            await retry
+
+    async def test_cancel_waiting_for_load_reports_cold_worker_and_ready_pool(self):
+        import multiprocessing
+        import threading
+        from types import SimpleNamespace
+        from h3serve.backend import JobCancelled, NativeBackendManager
+        from h3serve.contract import GenerationSpec
+        from h3serve.gpu_pool import DualGpuBackend
+        from h3serve.gpu_worker import _serve
+        from h3serve.native_engine.engine import NativeHotH3Engine
+
+        layout = GpuLayout((7, 6), ((7,), (6,)), (7, 6), {7: "GPU-7", 6: "GPU-6"})
+        pool = DualGpuBackend(None, None, None, layout)
+        slot, other = pool.slots
+        other.warm_state = {"status": "ready"}
+        pool.leases.held[1] = (7,)
+        parent, child = multiprocessing.Pipe()
+        slot.process, slot.connection, slot.cancel = object(), parent, threading.Event()
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ):
+            def native(paths, *, memory_profile, gpu_runtime):
+                factory = SimpleNamespace(build=lambda launcher: gpu_runtime.enter("load"))
+                return NativeBackendManager(NativeHotH3Engine(factory, Path(tmp)))
+
+            with patch("h3serve.backend.build_native_backend", side_effect=native):
+                spec = GenerationSpec.from_mapping({"prompt": "cancel at load", "sampling_steps": 20, "acceleration": 0})
+                worker = asyncio.create_task(asyncio.to_thread(_serve, child, slot.cancel, layout, 0, None, None, None))
+                job = asyncio.create_task(slot.generate(spec, "cancel-load", None, None, (), (), (), self.cancel))
+                try:
+                    async with pool.leases.changed:
+                        await asyncio.wait_for(pool.leases.changed.wait_for(
+                            lambda: pool.leases.phases.get(0) == "wait_load"), 10)
+                    self.assertEqual(pool.warm_state["status"], "loading")
+                    self.cancel.set()
+                    with self.assertRaises(JobCancelled):
+                        await asyncio.wait_for(job, 4)
+                    self.assertEqual(slot.warm_state["status"], "cold")
+                    self.assertEqual(pool.warm_state["status"], "ready")
+                finally:
+                    slot.cancel.set()
+                    parent.send(None)
+                    await asyncio.wait_for(worker, 5)
+                    parent.close()
+
     async def test_serial_qwen_parallel_dit_and_idle_decoder(self):
         self.leases.phases.update({0: "starting", 1: "starting"})
         second = asyncio.create_task(self.acquire(1, "qwen"))
         await asyncio.sleep(0)
         self.assertFalse(second.done())
         self.assertEqual(await self.acquire(0, "qwen"), self.layout.qwen)
-        dit = asyncio.create_task(self.acquire(0, "dit"))
-        self.assertEqual(await asyncio.wait_for(second, 1), self.layout.qwen)
-        self.assertFalse(dit.done())
+        self.assertEqual(await self.acquire(0, "dit"), (7, 6))
+        self.assertEqual(await asyncio.wait_for(second, 1), (5, 3))
         self.assertEqual(await self.acquire(1, "dit"), (5, 3))
-        self.assertEqual(await asyncio.wait_for(dit, 1), (7, 6))
         self.assertEqual(await self.acquire(1, "decode", external=(5,)), (3,))
         self.assertEqual(await self.acquire(0, "decode", external=(7,)), (6,))
 
@@ -143,6 +203,16 @@ class LeaseTest(unittest.IsolatedAsyncioTestCase):
         self.cancel.set()
         await self.leases.finish(1)
         self.assertEqual(await asyncio.wait_for(wait_decode, 1), ())
+
+    async def test_dit_waits_for_a_gpu_held_by_active_qwen(self):
+        self.assertEqual(await self.acquire(1, "qwen", external=(7, 5, 3)), (6,))
+        dit = asyncio.create_task(self.acquire(0, "dit"))
+        async with self.leases.changed:
+            await asyncio.wait_for(self.leases.changed.wait_for(
+                lambda: self.leases.phases.get(0) == "wait_dit"), 2)
+        self.assertFalse(dit.done())
+        await self.leases.finish(1)
+        self.assertEqual(await asyncio.wait_for(dit, 2), (7, 6))
 
     async def test_qwen_waits_for_minimum_and_keeps_configured_order(self):
         self.leases.held[1] = (7, 6)

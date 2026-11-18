@@ -17,6 +17,7 @@ def _serve(connection, cancel, layout, slot, paths, profile, lora):
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(layout.uuids[card] for card in order)
     import torch
     from .backend import build_native_backend
+    from .native_engine.engine import NativeGenerationCancelled
 
     class Placement:
         devices = tuple(torch.device("cuda", i) for i in range(len(order)))
@@ -29,7 +30,7 @@ def _serve(connection, cancel, layout, slot, paths, profile, lora):
             connection.send(("phase", (phase, minimum)))
             group = connection.recv()
             if not group:
-                raise JobCancelled("cancelled waiting for GPUs")
+                raise NativeGenerationCancelled("cancelled waiting for GPUs")
             devices = tuple(self.devices[order.index(card)] for card in group)
             return devices if phase == "qwen" else devices[0]
 
@@ -58,7 +59,7 @@ def _serve(connection, cancel, layout, slot, paths, profile, lora):
                 result = loop.run_until_complete(getattr(backend, method)(*args, **kwargs))
                 connection.send(("done", (result, backend.warm_state, backend.key)))
             except JobCancelled as exc:
-                connection.send(("cancelled", str(exc)))
+                connection.send(("cancelled", (str(exc), backend.warm_state)))
             except Exception:
                 connection.send(("error", traceback.format_exc()))
     except (EOFError, BrokenPipeError):
@@ -137,7 +138,8 @@ class WorkerSlot:
                         })
                     return result
                 if kind == "cancelled":
-                    raise JobCancelled(value)
+                    reason, self.warm_state = value
+                    raise JobCancelled(reason)
                 if kind == "error":
                     raise BackendError(value)
                 if kind == "phase":
