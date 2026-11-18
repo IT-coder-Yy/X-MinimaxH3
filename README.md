@@ -146,14 +146,16 @@ H3_DIT_GPUS_SECOND=5,3
 H3_DECODE_GPUS=7,6,5,3
 ```
 
-Qwen encodes one job at a time, hosting the encoder on its first GPU and
-splitting attention over 1, 2, 4 or 8 GPUs in list order. Each DiT group has
+Qwen encodes one job at a time. Configure 1–8 candidates in priority order.
+It uses the free candidates, hosts the encoder on the first one and assigns
+whole KV heads across them (three GPUs receive 3, 3 and 2 KV heads). Each DiT group has
 its primary first. The groups must be disjoint and their sizes must divide
 56. The 24 GB INT8 Base streamed attention path splits whole heads. Other
 operators use the native primary-device path. A single job takes the first
 available group in priority order. Additional jobs queue once both are busy.
-Late Qwen requests wait for conflicting DiT work. Budget host memory for two
-model sessions.
+Qwen skips GPUs leased by other jobs or occupied by external compute processes.
+If all candidates are busy it waits. Under memory pressure it tries smaller
+attention slices, then waits for more configured GPUs if available.
 
 Final video and audio decode share the first free candidate with no GPU lease
 or external compute process. See `/healthz` for the configured layout and the

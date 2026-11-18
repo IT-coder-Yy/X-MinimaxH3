@@ -48,8 +48,8 @@ class GpuLayout:
             raise ValueError("DiT groups must be disjoint and each size must divide 56 heads")
         ordered = ",".join(map(str, (*first, *second)))
         qwen, decode = cards(keys[0], ordered), cards(keys[3], ordered)
-        if 8 % len(qwen):
-            raise ValueError("Qwen GPU count must divide its eight KV heads")
+        if len(qwen) > 8:
+            raise ValueError("Qwen supports up to eight GPUs (one per KV head)")
         selected = set((*first, *second, *qwen, *decode))
         try:
             inventory = {int(i): (uuid, capability, int(mib)) for i, uuid, capability, mib in
@@ -94,7 +94,7 @@ class GpuLeases:
             self.held.pop(slot, None)
             self.changed.notify_all()
 
-    async def acquire(self, slot, phase, cancel, external_cards):
+    async def acquire(self, slot, phase, cancel, external_cards, minimum=1):
         """Swap leases atomically. An admitted second encoder precedes the first DiT."""
         async with self.changed:
             self.held.pop(slot, None)
@@ -102,20 +102,22 @@ class GpuLeases:
             self.changed.notify_all()
             while not cancel.is_set():
                 occupied = {card for other, group in self.held.items() if other != slot for card in group}
-                if phase == "decode":
-                    candidates = [card for card in self.layout.decode if card not in occupied]
+                if phase in {"qwen", "decode"}:
+                    pool = self.layout.qwen if phase == "qwen" else self.layout.decode
+                    candidates = [card for card in pool if card not in occupied]
                     if candidates:
                         external = await asyncio.to_thread(external_cards)
                         candidates = [card for card in candidates if card not in external]
-                    group = tuple(candidates[:1])
-                elif phase == "qwen":
-                    group = self.layout.qwen
-                    for earlier, state in self.phases.items():
-                        if earlier == slot:
-                            break
-                        if state in {"starting", "wait_load", "load", "wait_qwen"}:
+                    group = tuple(candidates[:1] if phase == "decode" else candidates)
+                    if phase == "qwen":
+                        if len(group) < minimum or "qwen" in self.phases.values():
                             group = ()
-                            break
+                        for earlier, state in self.phases.items():
+                            if earlier == slot:
+                                break
+                            if state in {"starting", "wait_load", "load", "wait_qwen"}:
+                                group = ()
+                                break
                 elif phase == "dit":
                     group = self.layout.dit[slot]
                     if any(other != slot and p in {"starting", "wait_load", "load", "wait_qwen", "qwen"}

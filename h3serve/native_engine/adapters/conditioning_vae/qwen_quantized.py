@@ -69,6 +69,40 @@ def _rms_norm(value: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> t
     )
 
 
+def _sharded_attention(q, k, v, mask, devices):
+    # Each KV head owns a consecutive group of query heads. Keep those groups
+    # intact even when the device count does not divide the KV head count.
+    kv_heads = k.size(1)
+    per_gpu, extra = divmod(kv_heads, len(devices))
+    queries_per_kv = q.size(1) // kv_heads
+    parts = []
+    offset = 0
+    for rank, device in enumerate(devices):
+        count = per_gpu + (rank < extra)
+        end = offset + count
+        local_mask = mask.to(device, non_blocking=True)
+        # Large reference images can exceed one card's scratch space. A KV
+        # group is independent, so a smaller slice needs no approximation.
+        while offset < end:
+            count = min(count, end - offset)
+            stop = offset + count
+            try:
+                part = F.scaled_dot_product_attention(
+                    q[:, offset * queries_per_kv:stop * queries_per_kv].to(device, non_blocking=True),
+                    k[:, offset:stop].to(device, non_blocking=True),
+                    v[:, offset:stop].to(device, non_blocking=True),
+                    attn_mask=local_mask, enable_gqa=True,
+                )
+            except torch.cuda.OutOfMemoryError:
+                if count == 1:
+                    raise
+                count //= 2
+                continue
+            parts.append(part)
+            offset = stop
+    return torch.cat([part.to(q.device, non_blocking=True) for part in parts], dim=1)
+
+
 class PackedQwen3VLT2AVConditioner:
     """Block-streamed text and keyframe conditioner for one RTX 4090."""
 
@@ -710,15 +744,8 @@ class PackedQwen3VLT2AVConditioner:
         ).fill_(torch.finfo(value.dtype).min / 4).triu_(1)
         q, k, v = (t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))
         devices = self.attention_devices
-        if len(devices) > 1:
-            parts = []
-            for device, qs, ks, vs in zip(devices, *(t.chunk(len(devices), 1) for t in (q, k, v))):
-                with torch.cuda.device(device):
-                    parts.append(F.scaled_dot_product_attention(
-                        qs.to(device), ks.to(device), vs.to(device),
-                        attn_mask=causal_mask.to(device), is_causal=False, enable_gqa=True,
-                    ))
-            output = torch.cat([part.to(q.device) for part in parts], dim=1)
+        if devices:
+            output = _sharded_attention(q, k, v, causal_mask, devices)
         else:
             output = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=causal_mask, is_causal=False, enable_gqa=True,

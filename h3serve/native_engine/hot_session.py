@@ -2829,15 +2829,32 @@ class NativeT2AVHotSession:
         )
 
         gpu = getattr(self, "gpu_runtime", None)
-        with torch.cuda.device(gpu.enter("qwen")) if gpu else nullcontext():
-            context_5120, text_tags = self._timed(
-                phases, "text_encode", lambda: self._encode_request(request),
-            )
         if gpu:
+            minimum = 1
+            while True:
+                group = gpu.enter("qwen", minimum)
+                self.conditioner.device = group[0]
+                self.conditioner.attention_devices = group
+                with torch.cuda.device(group[0]):
+                    try:
+                        context_5120, text_tags = self._timed(
+                            phases, "text_encode", lambda: self._encode_request(request)
+                        )
+                        break
+                    except torch.cuda.OutOfMemoryError:
+                        if len(group) == len(gpu.qwen):
+                            raise
+                # Drop the failed attempt's traceback/tensors before waiting for more GPUs.
+                torch.cuda.empty_cache()
+                minimum = len(group) + 1
             torch.cuda.empty_cache()
             primary = gpu.enter("dit")
             context_5120 = context_5120.to(primary, non_blocking=True)
             text_tags = text_tags.to(primary, non_blocking=True)
+        else:
+            context_5120, text_tags = self._timed(
+                phases, "text_encode", lambda: self._encode_request(request)
+            )
         progress(12, "text", "提示词编码完成")
         raise_if_cancelled()
 

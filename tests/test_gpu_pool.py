@@ -33,7 +33,8 @@ class LayoutTest(unittest.TestCase):
         layout = self.layout(H3_QWEN_GPUS="6,7", H3_DIT_GPUS_FIRST="7",
                              H3_DIT_GPUS_SECOND="3,5", H3_DECODE_GPUS="3,6")
         self.assertEqual((layout.qwen, layout.dit, layout.decode), ((6, 7), ((7,), (3, 5)), (3, 6)))
-        for options in [dict(H3_QWEN_GPUS="7,6,5"), dict(H3_DIT_GPUS_SECOND="6,3"),
+        self.assertEqual(self.layout(H3_QWEN_GPUS="7,6,5").qwen, (7, 6, 5))
+        for options in [dict(H3_QWEN_GPUS="0,1,2,3,4,5,6,7,8"), dict(H3_DIT_GPUS_SECOND="6,3"),
                         dict(H3_DECODE_GPUS="2,2"), dict(H3_QWEN_GPUS="7,,5")]:
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.layout(**options)
@@ -65,16 +66,53 @@ class LeaseTest(unittest.IsolatedAsyncioTestCase):
     async def test_lone_job_late_arrival_and_cancel(self):
         await self.acquire(0, "qwen")
         self.assertEqual(await self.acquire(0, "dit"), (7, 6))
-        late = asyncio.create_task(self.acquire(1, "qwen"))
-        await asyncio.sleep(0)
-        self.assertFalse(late.done())
+        self.assertEqual(await self.acquire(1, "qwen", external=(5,)), (3,))
         await self.leases.finish(0)
-        self.assertEqual(await asyncio.wait_for(late, 1), self.layout.qwen)
         wait_decode = asyncio.create_task(self.acquire(0, "decode", external=self.layout.decode))
         await asyncio.sleep(0)
         self.cancel.set()
         await self.leases.finish(1)
         self.assertEqual(await asyncio.wait_for(wait_decode, 1), ())
+
+    async def test_qwen_waits_for_minimum_and_keeps_configured_order(self):
+        self.leases.held[1] = (7, 6)
+        waiting = asyncio.create_task(self.leases.acquire(0, "qwen", self.cancel, lambda: {5}, 2))
+        await asyncio.sleep(0)
+        self.assertFalse(waiting.done())
+        await self.leases.finish(1)
+        self.assertEqual(await asyncio.wait_for(waiting, 2), (7, 6, 3))
+        second = asyncio.create_task(self.acquire(1, "qwen"))
+        await asyncio.sleep(0)
+        self.assertFalse(second.done())
+        await self.leases.finish(0)
+        self.assertEqual(await asyncio.wait_for(second, 2), self.layout.qwen)
+
+
+class QwenAttentionTest(unittest.TestCase):
+    def test_one_to_eight_gpus_preserve_kv_groups_and_result(self):
+        import torch
+        import torch.nn.functional as F
+        from h3serve.native_engine.adapters.conditioning_vae.qwen_quantized import _sharded_attention
+
+        rng = torch.Generator().manual_seed(73)
+        q, k, v = [torch.randn(1, heads, 11, 8, generator=rng) for heads in (64, 8, 8)]
+        mask = torch.full((11, 11), -1000.0).triu_(1)
+        sdpa = F.scaled_dot_product_attention
+        expected = sdpa(q, k, v, attn_mask=mask, enable_gqa=True)
+        for n in range(1, 9):
+            with self.subTest(n=n), patch.object(F, "scaled_dot_product_attention", wraps=sdpa) as call:
+                actual = _sharded_attention(q, k, v, mask, ["cpu"] * n)
+                sizes = [args.args[1].size(1) for args in call.call_args_list]
+                self.assertEqual(sizes, [8 // n + (i < 8 % n) for i in range(n)])
+                torch.testing.assert_close(actual, expected)
+
+        def limited(q, k, v, **kwargs):
+            if k.size(1) > 2:
+                raise torch.cuda.OutOfMemoryError("test attention scratch limit")
+            return sdpa(q, k, v, **kwargs)
+
+        with patch.object(F, "scaled_dot_product_attention", side_effect=limited):
+            torch.testing.assert_close(_sharded_attention(q, k, v, mask, ["cpu"]), expected)
 
 
 class DecodeDeviceTest(unittest.TestCase):

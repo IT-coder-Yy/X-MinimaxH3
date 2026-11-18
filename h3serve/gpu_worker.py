@@ -23,14 +23,15 @@ def _serve(connection, cancel, layout, slot, paths, profile, lora):
         dit = tuple(torch.device("cuda", order.index(card)) for card in layout.dit[slot])
         qwen = tuple(torch.device("cuda", order.index(card)) for card in layout.qwen)
 
-        def enter(self, phase):
+        def enter(self, phase, minimum=1):
             if phase == "qwen":
                 connection.send(("warm", backend.warm_state))
-            connection.send(("phase", phase))
+            connection.send(("phase", (phase, minimum)))
             group = connection.recv()
             if not group:
                 raise JobCancelled("cancelled waiting for GPUs")
-            return self.devices[order.index(group[0])]
+            devices = tuple(self.devices[order.index(card)] for card in group)
+            return devices if phase == "qwen" else devices[0]
 
     backend = build_native_backend(paths, memory_profile=profile, gpu_runtime=Placement())
     if lora is not None:
@@ -140,10 +141,11 @@ class WorkerSlot:
                 if kind == "error":
                     raise BackendError(value)
                 if kind == "phase":
+                    value, minimum = value
                     if value == "load":
                         self.warm_state = {"status": "loading"}
                     group = await self.pool.leases.acquire(
-                        self.index, value, self.cancel, self.pool.external_cards
+                        self.index, value, self.cancel, self.pool.external_cards, minimum
                     )
                     if group:
                         placement[value] = list(group)
