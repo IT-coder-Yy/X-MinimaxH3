@@ -131,12 +131,17 @@ On WSL2, `./run.sh` automatically mirrors the hot source tree and caches to the
 Linux filesystem, avoiding repeated imports and metadata access through
 `/mnt/c`.
 
-### Two concurrent GPU workers
+### Multi-GPU serving
 
 Run `./run.sh` with the installed runtime and weights. Auto mode enables two
 workers when physical SM89 GPUs 7, 6, 5 and 3 are available and host RAM
-can fit both sessions. It starts with the 24 GB INT8 Base launcher. Other installations default to single-GPU serving. Set these
-values in the release-local `.env` to require a particular layout.
+can fit both sessions. It starts with the 24 GB INT8 Base launcher.
+
+With `H3_GPU_MODE=auto` and exactly two visible 24 GB SM89 GPUs (for example,
+`CUDA_VISIBLE_DEVICES=6,5`), one worker uses both GPUs for the head job's Qwen and
+24 GB INT8 Base DiT attention. Video and audio decode on one free GPU. Later jobs
+stay queued until the worker finishes. Both DiT lists may name the same pair.
+Set the following values in the release-local `.env` for two concurrent workers.
 
 ```dotenv
 H3_GPU_MODE=dual
